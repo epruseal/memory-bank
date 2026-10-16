@@ -5,7 +5,7 @@
  * Why: int8 uses 4× less storage and ~2× faster KNN with no measured recall@10
  * loss (50K-exchange benchmark: 73.6MB→18.4MB, KNN p50 19.1ms→8.7ms, recall
  * identical). Distances scale ×127 — all readers already normalize via
- * getVecDtype()/normalizeVecDistance() (search.ts / repeat-detector.ts).
+ * getVecQuant()/normalizeVecDistance() (search.ts / repeat-detector.ts).
  *
  * Safety:
  *  - refuses to run while reembed-worker is active (its lockfile pid is alive)
@@ -41,7 +41,7 @@ import * as sqliteVec from 'sqlite-vec';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { embeddingToVecBlob } from '../dist/db.js';
+import { embeddingToVecBlob, VEC_INT8_SCALE } from '../dist/db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -50,7 +50,9 @@ const REPO = path.resolve(__dirname, '..');
 // in src/db.ts). A hardcoded copy here would silently corrupt the vector space
 // if the live-insert scale is ever tuned — the migration would re-quantize on a
 // different scale than every subsequent write.
-const quant = (f32) => embeddingToVecBlob(Array.from(f32), 'int8');
+// vec_exchanges never records a scale, so its int8 scale is the legacy
+// VEC_INT8_SCALE (getVecQuant reads the same constant when no row exists).
+const quant = (f32) => embeddingToVecBlob(Array.from(f32), { dtype: 'int8', scale: VEC_INT8_SCALE });
 
 function pidAlive(lockPath) {
   try {
@@ -222,11 +224,19 @@ export async function migrateVecInt8(dbPath, opts = {}) {
 const isDirectRun = process.argv[1] &&
   path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isDirectRun) {
-  const dbArg = process.argv.indexOf('--db');
-  if (dbArg > -1) process.env.MEMORY_BANK_DB_PATH = path.resolve(process.argv[dbArg + 1]);
+  // Strict: `--db=PATH` or a typo like `--dryrun` must fail, not run against the live DB.
+  const { parseCliArgs } = await import(path.join(REPO, 'dist/cli-args.js'));
+  let args;
+  try {
+    args = parseCliArgs(process.argv.slice(2), { values: ['--db'], flags: ['--dry-run'] });
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+  if (args.values['--db']) process.env.MEMORY_BANK_DB_PATH = path.resolve(args.values['--db']);
   const { getDbPath } = await import(path.join(REPO, 'dist/paths.js'));
   try {
-    await migrateVecInt8(getDbPath(), { dryRun: process.argv.includes('--dry-run') });
+    await migrateVecInt8(getDbPath(), { dryRun: args.flags.has('--dry-run') });
   } catch (e) {
     console.error('🛑', e.message);
     process.exit(2);

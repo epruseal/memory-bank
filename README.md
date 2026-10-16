@@ -324,6 +324,31 @@ export BACKFILL_RELATIONS=0           # 1 = also detect relations during backfil
 # showed only 72% top-1 agreement at sim>=0.93; opt in after re-measuring
 # with scripts/measure-det-gate.mjs)
 # export MEMORY_BANK_ONTOLOGY_DET_GATE=0.94
+
+# Session-start maintenance (pending-work probes + fact-vector compaction):
+# at most once per this many minutes (default 360; 0 = every session start).
+# A run where a step failed retries after 60 minutes instead.
+# Each run is logged to ~/.config/superpowers/conversation-index/logs/maintenance.jsonl
+export MEMORY_BANK_MAINTENANCE_INTERVAL_MIN=360
+
+# Node binary for hooks when the default `node` was built for a different ABI
+# than the installed better-sqlite3 (error: "NODE_MODULE_VERSION … requires …").
+# Hooks find a matching node on PATH / Homebrew / nvm / volta / fnm / asdf on their own;
+# set this only when none is found.
+# export MEMORY_BANK_NODE=/opt/homebrew/opt/node@22/bin/node
+
+# Time budget (ms) of the UserPromptSubmit injection hook, used to bound that
+# re-run. Default 30000 = Claude Code's default for this hook; set it to match
+# if you give the hook a different timeout.
+# export MEMORY_BANK_INJECT_HOOK_BUDGET_MS=30000
+```
+
+Maintenance scripts (run by hand, never automatically):
+
+```bash
+node scripts/compact-vec-tables.mjs [--db PATH] [--min-ratio 0.8] [--dry-run]   # drop deleted slots from the fact vector tables
+node scripts/migrate-vec-facts-int8.mjs --dry-run                              # fact vectors float32 → int8 (scale 600); see the script header
+node scripts/migrate-vec-facts-int8.mjs --restore BACKUP.jsonl.gz              # back to float32 from its verified backup
 ```
 
 ## 3D Knowledge Graph

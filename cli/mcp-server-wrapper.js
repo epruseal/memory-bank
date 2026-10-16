@@ -34,6 +34,7 @@ import {
   decideSwap,
   abortedRequestError,
 } from '../dist/wrapper-core.js';
+import { compatibleNodeFor } from '../dist/node-abi.js';
 
 /** Map a signal name to its conventional exit code (128 + signum). */
 function signalExitCode(signal) {
@@ -109,7 +110,11 @@ function startChild({ replay, resendInitialize }) {
   replaying = replay && state.canReplay();
   holdInput = replaying;
 
-  child = spawn(process.execPath, [SERVER_PATH], { stdio: ['pipe', 'pipe', 'pipe'] });
+  // The server loads better-sqlite3: run it under a node whose ABI matches the
+  // installed addon, not blindly this wrapper's (dist/node-abi.js). Checked per
+  // spawn — a rescue npm install may have rebuilt the addon since — and in a
+  // child process, so this long-lived wrapper never maps the addon itself.
+  child = spawn(compatibleNodeFor(PLUGIN_ROOT, 'memory-bank wrapper') ?? process.execPath, [SERVER_PATH], { stdio: ['pipe', 'pipe', 'pipe'] });
 
   if (replaying) {
     // Re-run the handshake privately; its traffic is swallowed below.

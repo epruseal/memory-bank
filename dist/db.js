@@ -5,17 +5,21 @@ import * as sqliteVec from 'sqlite-vec';
 import { getDbPath } from './paths.js';
 import { autoHealScopeProjects } from './project-canon.js';
 import { EMBEDDING_VERSION } from './embedding-version.js';
+/** Legacy scale: vec_exchanges, and any int8 table with no recorded scale. */
 export const VEC_INT8_SCALE = 127;
-/**
- * Authoritative vector dtype for vec_exchanges.
- *
- * Derived from the ACTUAL table schema in sqlite_master — not a metadata flag.
- * A flag can diverge from the real schema (missing/corrupt flag on an int8
- * table would silently send float32 params against int8 storage); parsing the
- * declared column type cannot. Absent table ⇒ 'int8' (that is what
- * initDatabase creates for fresh DBs).
- */
-const VEC_TABLES = new Set(['vec_exchanges', 'vec_facts', 'vec_facts_kr', 'vec_categories']);
+/** Scale scripts/migrate-vec-facts-int8.mjs records for the fact-side tables it converts. */
+export const FACT_VEC_INT8_SCALE = 600;
+/** Per-table scale record. A missing row means the legacy 127. */
+export const VEC_INT8_SCALE_TABLE = 'vec_int8_scale';
+/** The fact-side vec0 tables (per-table scale, compaction, int8 migration). */
+export const FACT_VEC_TABLES = ['vec_facts', 'vec_facts_kr', 'vec_categories'];
+const MAX_INT8_SCALE = 10_000;
+/** CREATE statement of a fact-side vec0 table — the one shape initDatabase, the
+ * migration and compaction all produce. */
+export function factVecTableDdl(table, type, opts = {}) {
+    return `CREATE VIRTUAL TABLE ${opts.ifNotExists ? 'IF NOT EXISTS ' : ''}${table} USING vec0(id TEXT PRIMARY KEY, embedding ${type}[384])`;
+}
+const VEC_TABLES = new Set(['vec_exchanges', ...FACT_VEC_TABLES]);
 /** Authoritative dtype of any vec0 table — read from the ACTUAL schema in
  * sqlite_master (never a flag), so readers/writers can never disagree with a
  * migration swap. Unknown/absent table defaults to int8 (the fresh-DB DDL). */
@@ -27,27 +31,49 @@ export function getVecTableDtype(db, table) {
         return 'int8';
     return /int8\s*\[/i.test(row.sql) ? 'int8' : 'float32';
 }
-export function getVecDtype(db) {
-    return getVecTableDtype(db, 'vec_exchanges');
+/**
+ * dtype + scale of a vec0 table. The dtype comes from the schema; the int8
+ * scale from vec_int8_scale, which only the fact-vector int8 migration writes,
+ * in the SAME transaction that swaps the table — so the two can only change
+ * together. No row (or no record table at all) = 127: every int8 table before
+ * per-table scales existed, and every table a fresh DB creates (what ≤1.7.6
+ * creates too, so older processes sharing the DB read it right).
+ * A recorded value outside (0, 10000] is corruption and throws: decoding with
+ * a guessed scale would silently skew every similarity gate.
+ */
+export function getVecQuant(db, table) {
+    const dtype = getVecTableDtype(db, table);
+    if (dtype === 'float32')
+        return { dtype, scale: 1 };
+    const hasRecord = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(VEC_INT8_SCALE_TABLE);
+    if (!hasRecord)
+        return { dtype, scale: VEC_INT8_SCALE };
+    const row = db.prepare(`SELECT scale FROM ${VEC_INT8_SCALE_TABLE} WHERE table_name = ?`).get(table);
+    if (!row)
+        return { dtype, scale: VEC_INT8_SCALE };
+    if (!Number.isFinite(row.scale) || row.scale <= 0 || row.scale > MAX_INT8_SCALE) {
+        throw new Error(`${VEC_INT8_SCALE_TABLE}: invalid scale ${row.scale} for ${table}`);
+    }
+    return { dtype, scale: row.scale };
 }
-/** Convert a float embedding to the blob matching the table dtype. */
-export function embeddingToVecBlob(embedding, dtype) {
-    if (dtype === 'int8') {
+/** Convert a float embedding to the blob matching the table's dtype + scale. */
+export function embeddingToVecBlob(embedding, quant) {
+    if (quant.dtype === 'int8') {
         const q = new Int8Array(embedding.length);
         for (let i = 0; i < embedding.length; i++) {
-            q[i] = Math.max(-127, Math.min(127, Math.round(embedding[i] * VEC_INT8_SCALE)));
+            q[i] = Math.max(-127, Math.min(127, Math.round(embedding[i] * quant.scale)));
         }
         return Buffer.from(q.buffer);
     }
     return Buffer.from(new Float32Array(embedding).buffer);
 }
-/** SQL placeholder for a vec_exchanges MATCH/INSERT param under the dtype. */
-export function vecParamSql(dtype) {
-    return dtype === 'int8' ? 'vec_int8(?)' : '?';
+/** SQL placeholder for a vec0 MATCH/INSERT param under the table's dtype. */
+export function vecParamSql(quant) {
+    return quant.dtype === 'int8' ? 'vec_int8(?)' : '?';
 }
-/** Normalize a vec KNN distance back to float32 scale (int8 distances are ×127). */
-export function normalizeVecDistance(distance, dtype) {
-    return dtype === 'int8' ? distance / VEC_INT8_SCALE : distance;
+/** Normalize a vec KNN distance back to float32 scale (int8 distances are ×scale). */
+export function normalizeVecDistance(distance, quant) {
+    return quant.dtype === 'int8' ? distance / quant.scale : distance;
 }
 /**
  * Convert a (float32-scale) L2 distance between UNIT vectors to cosine
@@ -177,7 +203,7 @@ export function initDatabase() {
     // no recall@10 loss (measured on a 50K-exchange benchmark: 73.6MB→18.4MB,
     // p50 19.1ms→8.7ms, recall identical). Fresh DBs are created int8; existing
     // float32 DBs keep float32 until scripts/migrate-vec-int8.mjs converts them.
-    // The authoritative dtype is the ACTUAL schema in sqlite_master (getVecDtype)
+    // The authoritative dtype is the ACTUAL schema in sqlite_master (getVecQuant)
     // — float32 and int8 blobs are not interchangeable, and deriving from the
     // real schema (not a flag) makes flag/schema divergence impossible.
     db.exec(`
@@ -321,34 +347,31 @@ export function initDatabase() {
     db.exec(`
     CREATE INDEX IF NOT EXISTS idx_revisions_fact ON fact_revisions(fact_id)
   `);
-    // vec_facts virtual table (sqlite-vec)
+    // Per-table int8 scale record (see getVecQuant). Only the int8 migration
+    // writes a row, in the transaction that swaps the table; no row = 127.
     db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
-      id TEXT PRIMARY KEY,
-      embedding int8[384]
+    CREATE TABLE IF NOT EXISTS ${VEC_INT8_SCALE_TABLE} (
+      table_name TEXT PRIMARY KEY,
+      scale REAL NOT NULL
     )
   `);
-    // Korean-text vector index: facts are embedded twice (fact / fact_kr) because
-    // multilingual models match same-language pairs far better than cross-language.
-    // Queries search both tables and take the best score per fact id.
-    db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts_kr USING vec0(
-      id TEXT PRIMARY KEY,
-      embedding int8[384]
-    )
-  `);
-    // Category embedding index: lets the ontology classifier retrieve the top-K
-    // most-similar existing categories for a fact instead of dumping ALL
-    // categories into the LLM prompt (measured 1,612 categories ≈ 95K tokens per
-    // classify call). Embeddings (category name + description, 'passage' mode) are
-    // written on createCategory; existing rows are backfilled by
-    // scripts/backfill-category-embeddings.mjs.
-    db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_categories USING vec0(
-      id TEXT PRIMARY KEY,
-      embedding int8[384]
-    )
-  `);
+    // Fact-side vector indexes, created int8 with NO scale record (= 127, exactly
+    // what 1.7.6 creates — so a 1.7.6 process sharing a fresh DB decodes it right):
+    //  - vec_facts: the fact text.
+    //  - vec_facts_kr: Korean-text index. Facts are embedded twice (fact / fact_kr)
+    //    because multilingual models match same-language pairs far better than
+    //    cross-language; queries search both tables and take the best score per id.
+    //  - vec_categories: lets the ontology classifier retrieve the top-K
+    //    most-similar existing categories for a fact instead of dumping ALL
+    //    categories into the LLM prompt (measured 1,612 categories ≈ 95K tokens per
+    //    classify call). Embeddings (category name + description, 'passage' mode)
+    //    are written on createCategory; existing rows are backfilled by
+    //    scripts/backfill-category-embeddings.mjs.
+    // FACT_VEC_INT8_SCALE is recorded only by scripts/migrate-vec-facts-int8.mjs,
+    // which first refuses while older-version code holds the DB. An existing
+    // table is never touched here.
+    for (const table of FACT_VEC_TABLES)
+        db.exec(factVecTableDdl(table, 'int8', { ifNotExists: true }));
     // === Ontology Schema ===
     db.exec(`
     CREATE TABLE IF NOT EXISTS ontology_domains (
@@ -554,10 +577,10 @@ export function insertExchange(db, exchange, embedding, _toolNames) {
         // worker must not redo freshly indexed rows.
         EMBEDDING_VERSION);
         // Vector upsert: DELETE+INSERT since virtual tables don't support REPLACE.
-        const vecDtype = getVecDtype(db);
+        const vecQuant = getVecQuant(db, 'vec_exchanges');
         db.prepare('DELETE FROM vec_exchanges WHERE id = ?').run(exchange.id);
-        db.prepare(`INSERT INTO vec_exchanges (id, embedding) VALUES (?, ${vecParamSql(vecDtype)})`)
-            .run(exchange.id, embeddingToVecBlob(embedding, vecDtype));
+        db.prepare(`INSERT INTO vec_exchanges (id, embedding) VALUES (?, ${vecParamSql(vecQuant)})`)
+            .run(exchange.id, embeddingToVecBlob(embedding, vecQuant));
         if (exchange.toolCalls && exchange.toolCalls.length > 0) {
             const toolStmt = db.prepare(`
         INSERT OR REPLACE INTO tool_calls

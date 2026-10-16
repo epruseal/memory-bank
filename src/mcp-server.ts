@@ -524,8 +524,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           try {
             const knowledgeCtx = await getKnowledgeContext(params.query, null, 3);
             resultText += formatKnowledgeContext(knowledgeCtx);
-          } catch {
-            // Knowledge context is best-effort, don't fail the search
+          } catch (error) {
+            // Knowledge context must not fail the search — but a missing section
+            // has to be visible, not silently absent (stderr + one result line).
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`memory-bank search: related knowledge unavailable: ${message}`);
+            resultText += `\n---\n_Related knowledge unavailable: ${message}_\n`;
           }
         }
       }

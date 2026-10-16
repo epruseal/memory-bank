@@ -12,9 +12,9 @@ const check = (name, ok) => { console.log((ok?'✅':'❌'), name); ok?pass++:fai
 // === Fix3 (MEDIUM): dtype는 sqlite_master 실스키마에서 파생 ===
 {
   process.env.MEMORY_BANK_DB_PATH = path.join(tmp, 'dtype.sqlite');
-  const { initDatabase, getVecDtype } = await import(REPO + '/dist/db.js');
+  const { initDatabase, getVecQuant } = await import(REPO + '/dist/db.js');
   const db = initDatabase(); // fresh → int8
-  check('fresh DB → int8 (flag 없이 스키마 파생)', getVecDtype(db) === 'int8');
+  check('fresh DB → int8 (flag 없이 스키마 파생)', getVecQuant(db, 'vec_exchanges').dtype === 'int8');
   db.close();
   // 레거시 float 테이블 시뮬레이션
   const p2 = path.join(tmp, 'legacy.sqlite');
@@ -23,7 +23,7 @@ const check = (name, ok) => { console.log((ok?'✅':'❌'), name); ok?pass++:fai
   raw.close();
   process.env.MEMORY_BANK_DB_PATH = p2;
   const db2 = initDatabase(); // 기존 float 테이블 → IF NOT EXISTS 스킵
-  check('레거시 float 테이블 → float32 감지 (스키마 보존)', getVecDtype(db2) === 'float32');
+  check('레거시 float 테이블 → float32 감지 (스키마 보존)', getVecQuant(db2, 'vec_exchanges').dtype === 'float32');
   db2.close();
 }
 
@@ -118,7 +118,7 @@ const check = (name, ok) => { console.log((ok?'✅':'❌'), name); ok?pass++:fai
 {
   const src = fs.readFileSync(REPO + '/scripts/reembed-worker.js', 'utf-8');
   check('reembed: migrate 락 확인(migrationActive) 존재', src.includes('migrationActive') && src.includes('migrate-vec-int8.lock'));
-  check('reembed: dtype 읽기가 트랜잭션 내부', /db\.transaction\(\(\) => \{\s*\n\s*const vecDtype = getVecDtype/.test(src));
+  check('reembed: dtype 읽기가 트랜잭션 내부', /db\.transaction\(\(\) => \{\s*\n\s*const vecQuant = getVecQuant\(db, 'vec_exchanges'\)/.test(src));
   const msrc = fs.readFileSync(REPO + '/scripts/migrate-vec-int8.mjs', 'utf-8');
   check('migration: reembed 락 생존 확인 후 거부', msrc.includes('REEMBED_LOCK') && msrc.includes('pidAlive(REEMBED_LOCK)'));
 }

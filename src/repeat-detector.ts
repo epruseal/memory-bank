@@ -1,5 +1,5 @@
 import { generateEmbedding, initEmbeddings, EMBEDDING_VERSION } from './embeddings.js';
-import { initDatabase, getVecDtype, embeddingToVecBlob, vecParamSql, normalizeVecDistance, l2DistanceToSimilarity } from './db.js';
+import { initDatabase, getVecQuant, embeddingToVecBlob, vecParamSql, normalizeVecDistance, l2DistanceToSimilarity } from './db.js';
 import { exchangeProjectKeys } from './project-canon.js';
 
 export interface RepeatMatch {
@@ -44,16 +44,16 @@ export async function detectRepeat(
 
   try {
     // Vector search against past user messages (dtype-aware: int8 tables need
-    // quantized query blobs and return ×127-scaled distances)
-    const vecDtype = getVecDtype(db);
+    // quantized query blobs and return ×scale distances)
+    const vecQuant = getVecQuant(db, 'vec_exchanges');
     const vecResults = db.prepare(`
       SELECT id, distance
       FROM vec_exchanges
-      WHERE embedding MATCH ${vecParamSql(vecDtype)}
+      WHERE embedding MATCH ${vecParamSql(vecQuant)}
       ORDER BY distance
       LIMIT ?
     `).all(
-      embeddingToVecBlob(embedding, vecDtype),
+      embeddingToVecBlob(embedding, vecQuant),
       // The KNN is global (vec0 has no project column) and the project filter
       // runs afterwards, so a project-scoped call needs a wider pool or the
       // nearest rows from other projects crowd out every in-project match.
@@ -63,7 +63,7 @@ export async function detectRepeat(
     const matches: RepeatMatch[] = [];
 
     for (const vr of vecResults) {
-      const d = normalizeVecDistance(vr.distance, vecDtype);
+      const d = normalizeVecDistance(vr.distance, vecQuant);
       const similarity = l2DistanceToSimilarity(d);
       if (similarity < threshold) continue;
 

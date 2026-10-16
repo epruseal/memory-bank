@@ -51553,7 +51553,13 @@ var EMBEDDING_VERSION = modelVersion(EMBEDDING_MODEL);
 
 // src/db.ts
 var VEC_INT8_SCALE = 127;
-var VEC_TABLES = /* @__PURE__ */ new Set(["vec_exchanges", "vec_facts", "vec_facts_kr", "vec_categories"]);
+var VEC_INT8_SCALE_TABLE = "vec_int8_scale";
+var FACT_VEC_TABLES = ["vec_facts", "vec_facts_kr", "vec_categories"];
+var MAX_INT8_SCALE = 1e4;
+function factVecTableDdl(table, type, opts = {}) {
+  return `CREATE VIRTUAL TABLE ${opts.ifNotExists ? "IF NOT EXISTS " : ""}${table} USING vec0(id TEXT PRIMARY KEY, embedding ${type}[384])`;
+}
+var VEC_TABLES = /* @__PURE__ */ new Set(["vec_exchanges", ...FACT_VEC_TABLES]);
 function getVecTableDtype(db, table) {
   if (!VEC_TABLES.has(table)) throw new Error(`not a vec table: ${table}`);
   const row = db.prepare(
@@ -51562,24 +51568,37 @@ function getVecTableDtype(db, table) {
   if (!row?.sql) return "int8";
   return /int8\s*\[/i.test(row.sql) ? "int8" : "float32";
 }
-function getVecDtype(db) {
-  return getVecTableDtype(db, "vec_exchanges");
+function getVecQuant(db, table) {
+  const dtype = getVecTableDtype(db, table);
+  if (dtype === "float32") return { dtype, scale: 1 };
+  const hasRecord = db.prepare(
+    `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`
+  ).get(VEC_INT8_SCALE_TABLE);
+  if (!hasRecord) return { dtype, scale: VEC_INT8_SCALE };
+  const row = db.prepare(
+    `SELECT scale FROM ${VEC_INT8_SCALE_TABLE} WHERE table_name = ?`
+  ).get(table);
+  if (!row) return { dtype, scale: VEC_INT8_SCALE };
+  if (!Number.isFinite(row.scale) || row.scale <= 0 || row.scale > MAX_INT8_SCALE) {
+    throw new Error(`${VEC_INT8_SCALE_TABLE}: invalid scale ${row.scale} for ${table}`);
+  }
+  return { dtype, scale: row.scale };
 }
-function embeddingToVecBlob(embedding, dtype) {
-  if (dtype === "int8") {
+function embeddingToVecBlob(embedding, quant) {
+  if (quant.dtype === "int8") {
     const q2 = new Int8Array(embedding.length);
     for (let i = 0; i < embedding.length; i++) {
-      q2[i] = Math.max(-127, Math.min(127, Math.round(embedding[i] * VEC_INT8_SCALE)));
+      q2[i] = Math.max(-127, Math.min(127, Math.round(embedding[i] * quant.scale)));
     }
     return Buffer.from(q2.buffer);
   }
   return Buffer.from(new Float32Array(embedding).buffer);
 }
-function vecParamSql(dtype) {
-  return dtype === "int8" ? "vec_int8(?)" : "?";
+function vecParamSql(quant) {
+  return quant.dtype === "int8" ? "vec_int8(?)" : "?";
 }
-function normalizeVecDistance(distance, dtype) {
-  return dtype === "int8" ? distance / VEC_INT8_SCALE : distance;
+function normalizeVecDistance(distance, quant) {
+  return quant.dtype === "int8" ? distance / quant.scale : distance;
 }
 function l2DistanceToSimilarity(distance) {
   return 1 - distance * distance / 2;
@@ -51768,23 +51787,12 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_revisions_fact ON fact_revisions(fact_id)
   `);
   db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
-      id TEXT PRIMARY KEY,
-      embedding int8[384]
+    CREATE TABLE IF NOT EXISTS ${VEC_INT8_SCALE_TABLE} (
+      table_name TEXT PRIMARY KEY,
+      scale REAL NOT NULL
     )
   `);
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts_kr USING vec0(
-      id TEXT PRIMARY KEY,
-      embedding int8[384]
-    )
-  `);
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_categories USING vec0(
-      id TEXT PRIMARY KEY,
-      embedding int8[384]
-    )
-  `);
+  for (const table of FACT_VEC_TABLES) db.exec(factVecTableDdl(table, "int8", { ifNotExists: true }));
   db.exec(`
     CREATE TABLE IF NOT EXISTS ontology_domains (
       id TEXT PRIMARY KEY,
@@ -52009,8 +52017,16 @@ async function queryBaseline(queryEmbedding) {
 
 // src/fact-db.ts
 function vecParamFor(db, table, embedding) {
-  const dt = getVecTableDtype(db, table);
-  return { sql: vecParamSql(dt), blob: embeddingToVecBlob(embedding, dt), dt };
+  const q2 = getVecQuant(db, table);
+  return { sql: vecParamSql(q2), blob: embeddingToVecBlob(embedding, q2), q: q2 };
+}
+function factKnn(table, run, empty) {
+  try {
+    return run();
+  } catch (e) {
+    if (/no such table/i.test(e instanceof Error ? e.message : String(e))) return empty;
+    return run();
+  }
 }
 function getRevisions(db, factId) {
   return db.prepare(
@@ -52020,21 +52036,17 @@ function getRevisions(db, factId) {
 function searchSimilarFacts(db, embedding, project, limit2 = 5, threshold = 0.85) {
   const canonProject = project ? canonicalizeProject(db, project) : project;
   const candidateFetch = Math.max(limit2 * 2, 50);
-  const fetch2 = (table) => {
-    try {
-      const p = vecParamFor(db, table, embedding);
-      const rows = db.prepare(`
-        SELECT id, distance FROM ${table}
-        WHERE embedding MATCH ${p.sql}
-        ORDER BY distance
-        LIMIT ?
-      `).all(p.blob, candidateFetch);
-      for (const r of rows) r.distance = normalizeVecDistance(r.distance, p.dt);
-      return rows;
-    } catch {
-      return [];
-    }
-  };
+  const fetch2 = (table) => factKnn(table, () => {
+    const p = vecParamFor(db, table, embedding);
+    const rows = db.prepare(`
+      SELECT id, distance FROM ${table}
+      WHERE embedding MATCH ${p.sql}
+      ORDER BY distance
+      LIMIT ?
+    `).all(p.blob, candidateFetch);
+    for (const r of rows) r.distance = normalizeVecDistance(r.distance, p.q);
+    return rows;
+  }, []);
   const best = /* @__PURE__ */ new Map();
   for (const vr of [...fetch2("vec_facts"), ...fetch2("vec_facts_kr")]) {
     const cur = best.get(vr.id);
@@ -52057,15 +52069,18 @@ function searchSimilarFacts(db, embedding, project, limit2 = 5, threshold = 0.85
   return results;
 }
 function searchAllFacts(db, embedding, limit2 = 10, threshold = 0.6) {
-  const pAll = vecParamFor(db, "vec_facts", embedding);
-  const vecResults = db.prepare(`
-    SELECT id, distance
-    FROM vec_facts
-    WHERE embedding MATCH ${pAll.sql}
-    ORDER BY distance
-    LIMIT ?
-  `).all(pAll.blob, limit2 * 2);
-  for (const r of vecResults) r.distance = normalizeVecDistance(r.distance, pAll.dt);
+  const vecResults = factKnn("vec_facts", () => {
+    const pAll = vecParamFor(db, "vec_facts", embedding);
+    const rows = db.prepare(`
+      SELECT id, distance
+      FROM vec_facts
+      WHERE embedding MATCH ${pAll.sql}
+      ORDER BY distance
+      LIMIT ?
+    `).all(pAll.blob, limit2 * 2);
+    for (const r of rows) r.distance = normalizeVecDistance(r.distance, pAll.q);
+    return rows;
+  }, []);
   const results = [];
   for (const vr of vecResults) {
     const similarity = l2DistanceToSimilarity(vr.distance);
@@ -52553,7 +52568,7 @@ async function searchConversations(query2, options = {}) {
     if (mode === "vector" || mode === "both") {
       await initEmbeddings();
       const queryEmbedding = await generateEmbedding(query2, "query");
-      const vecQuery = (vecDtype2) => {
+      const vecQuery = (vecQuant2) => {
         const stmt = db.prepare(`
           SELECT
             e.id,
@@ -52568,29 +52583,29 @@ async function searchConversations(query2, options = {}) {
             vec.distance
           FROM vec_exchanges AS vec
           JOIN exchanges AS e ON vec.id = e.id
-          WHERE vec.embedding MATCH ${vecParamSql(vecDtype2)}
+          WHERE vec.embedding MATCH ${vecParamSql(vecQuant2)}
             AND k = ?
             AND e.embedding_version = ?
             ${timeClause}
           ORDER BY vec.distance ASC
         `);
         const rows = stmt.all(
-          embeddingToVecBlob(queryEmbedding, vecDtype2),
+          embeddingToVecBlob(queryEmbedding, vecQuant2),
           limit2,
           EMBEDDING_VERSION,
           ...timeParams
         );
-        for (const r of rows) r.distance = normalizeVecDistance(r.distance, vecDtype2);
+        for (const r of rows) r.distance = normalizeVecDistance(r.distance, vecQuant2);
         return rows;
       };
-      let vecDtype = getVecDtype(db);
+      let vecQuant = getVecQuant(db, "vec_exchanges");
       try {
-        results = vecQuery(vecDtype);
+        results = vecQuery(vecQuant);
       } catch (e) {
-        const fresh = getVecDtype(db);
-        if (fresh === vecDtype) throw e;
-        vecDtype = fresh;
-        results = vecQuery(vecDtype);
+        const fresh = getVecQuant(db, "vec_exchanges");
+        if (fresh.dtype === vecQuant.dtype && fresh.scale === vecQuant.scale) throw e;
+        vecQuant = fresh;
+        results = vecQuery(vecQuant);
       }
     }
     if (mode === "text" || mode === "both") {
@@ -52920,41 +52935,38 @@ async function searchMultipleConcepts(concepts, options = {}) {
 }
 async function getKnowledgeContext(query2, project, limit2 = 5) {
   await initEmbeddings();
-  const db = initDatabase();
-  try {
-    const queryEmbedding = await generateEmbedding(query2, "query");
-    const factResults = searchSimilarFacts(db, queryEmbedding, project ?? null, limit2, 0.6);
-    if (factResults.length === 0) {
-      return { facts: [] };
-    }
-    const domains = listDomains(db);
-    const categories = listCategories(db);
-    const domainMap = new Map(domains.map((d2) => [d2.id, d2.name]));
-    const categoryMap = new Map(categories.map((c) => [c.id, { name: c.name, domainId: c.domain_id }]));
-    const enrichedFacts = [];
-    for (const { fact, distance } of factResults) {
-      const similarity = parseFloat(l2DistanceToSimilarity(distance).toFixed(3));
-      const catInfo = fact.ontology_category_id ? categoryMap.get(fact.ontology_category_id) : void 0;
-      const domainName = catInfo ? domainMap.get(catInfo.domainId) ?? "Unclassified" : "Unclassified";
-      const catName = catInfo ? catInfo.name : "Unclassified";
-      const related = getRelatedFacts(db, fact.id, 1);
-      const relatedFacts = related.map(({ fact: relFact, relation }) => ({
-        fact: relFact.fact,
-        relationType: relation.relation_type
-      }));
-      enrichedFacts.push({
-        fact: fact.fact,
-        category: fact.category,
-        domain: domainName,
-        categoryName: catName,
-        similarity,
-        relatedFacts
-      });
-    }
-    return { facts: enrichedFacts };
-  } finally {
-    db.close();
+  const db = getSearchDb();
+  const queryEmbedding = await generateEmbedding(query2, "query");
+  const factResults = searchSimilarFacts(db, queryEmbedding, project ?? null, limit2, 0.6);
+  if (factResults.length === 0) {
+    return { facts: [] };
   }
+  const categoryStmt = db.prepare(`
+    SELECT c.name AS categoryName, d.name AS domainName
+    FROM ontology_categories c LEFT JOIN ontology_domains d ON d.id = c.domain_id
+    WHERE c.id = ?
+  `);
+  const enrichedFacts = [];
+  for (const { fact, distance } of factResults) {
+    const similarity = parseFloat(l2DistanceToSimilarity(distance).toFixed(3));
+    const catInfo = fact.ontology_category_id ? categoryStmt.get(fact.ontology_category_id) : void 0;
+    const domainName = catInfo ? catInfo.domainName ?? "Unclassified" : "Unclassified";
+    const catName = catInfo ? catInfo.categoryName : "Unclassified";
+    const related = getRelatedFacts(db, fact.id, 1);
+    const relatedFacts = related.map(({ fact: relFact, relation }) => ({
+      fact: relFact.fact,
+      relationType: relation.relation_type
+    }));
+    enrichedFacts.push({
+      fact: fact.fact,
+      category: fact.category,
+      domain: domainName,
+      categoryName: catName,
+      similarity,
+      relatedFacts
+    });
+  }
+  return { facts: enrichedFacts };
 }
 function formatKnowledgeContext(context) {
   if (context.facts.length === 0) return "";
@@ -53017,15 +53029,15 @@ async function detectRepeat(prompt, project, limit2 = 3, threshold = 0.82, opts 
   const db = opts.db ?? initDatabase();
   const projectKeys = project ? exchangeProjectKeys(project) : null;
   try {
-    const vecDtype = getVecDtype(db);
+    const vecQuant = getVecQuant(db, "vec_exchanges");
     const vecResults = db.prepare(`
       SELECT id, distance
       FROM vec_exchanges
-      WHERE embedding MATCH ${vecParamSql(vecDtype)}
+      WHERE embedding MATCH ${vecParamSql(vecQuant)}
       ORDER BY distance
       LIMIT ?
     `).all(
-      embeddingToVecBlob(embedding, vecDtype),
+      embeddingToVecBlob(embedding, vecQuant),
       // The KNN is global (vec0 has no project column) and the project filter
       // runs afterwards, so a project-scoped call needs a wider pool or the
       // nearest rows from other projects crowd out every in-project match.
@@ -53033,7 +53045,7 @@ async function detectRepeat(prompt, project, limit2 = 3, threshold = 0.82, opts 
     );
     const matches = [];
     for (const vr of vecResults) {
-      const d2 = normalizeVecDistance(vr.distance, vecDtype);
+      const d2 = normalizeVecDistance(vr.distance, vecQuant);
       const similarity = l2DistanceToSimilarity(d2);
       if (similarity < threshold) continue;
       const row = db.prepare(`
@@ -55670,7 +55682,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           try {
             const knowledgeCtx = await getKnowledgeContext(params.query, null, 3);
             resultText += formatKnowledgeContext(knowledgeCtx);
-          } catch {
+          } catch (error62) {
+            const message = error62 instanceof Error ? error62.message : String(error62);
+            console.error(`memory-bank search: related knowledge unavailable: ${message}`);
+            resultText += `
+---
+_Related knowledge unavailable: ${message}_
+`;
           }
         }
       }

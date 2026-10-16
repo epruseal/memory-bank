@@ -15,6 +15,7 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { ensureNativeAbi } from '../dist/node-abi.js';
 
 function readStdin(timeoutMs = 3000) {
   return new Promise((resolve) => {
@@ -29,6 +30,8 @@ function readStdin(timeoutMs = 3000) {
 }
 
 async function main() {
+  // Before stdin: the worker inherits this node (process.execPath) — see node-abi.ts.
+  ensureNativeAbi('fact-extract');
   const raw = await readStdin();
   let input = {};
   try { input = JSON.parse(raw); } catch { /* not JSON — fall back to env */ }

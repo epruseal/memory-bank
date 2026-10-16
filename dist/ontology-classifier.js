@@ -161,15 +161,16 @@ function categoryEmbeddingText(name, description) {
  * no LLM cost; stops at the first failure (runtime still down).
  */
 async function healCategoryIndex(db, limit = 100) {
+    const why = (e) => (e instanceof Error ? e.message : String(e));
     let indexed;
     try {
         indexed = new Set(db.prepare('SELECT id FROM vec_categories').all().map((r) => r.id));
     }
-    catch {
+    catch (e) {
         // vec table unusable — nothing to heal here; report full missingness so
         // the caller refuses rather than classifying candidate-starved.
         const live = db.prepare('SELECT COUNT(*) AS n FROM ontology_categories').get().n;
-        return { added: 0, purged: 0, missingRemaining: live, staleRemaining: 0, blocked: 'scan' };
+        return { added: 0, purged: 0, missingRemaining: live, staleRemaining: 0, blocked: 'scan', cause: why(e) };
     }
     const liveRows = db.prepare('SELECT id, name, description FROM ontology_categories').all();
     const liveIds = new Set(liveRows.map((r) => r.id));
@@ -183,13 +184,15 @@ async function healCategoryIndex(db, limit = 100) {
     const staleAll = [...indexed].filter((id) => !liveIds.has(id));
     let purged = 0;
     let blocked = null;
+    let cause;
     for (const id of staleAll) {
         try {
             db.prepare('DELETE FROM vec_categories WHERE id = ?').run(id);
             purged++;
         }
-        catch {
+        catch (e) {
             blocked = 'purge'; // vec table write-broken mid-way — stop, guard decides
+            cause = why(e);
             break;
         }
         if (purged >= limit)
@@ -212,10 +215,11 @@ async function healCategoryIndex(db, limit = 100) {
             upsertCategoryEmbedding(db, c.id, emb);
             added++;
         }
-        catch {
+        catch (e) {
             // vec INSERT rejected while the table scans: index corruption, NOT an
             // embedding-runtime problem — must escalate hard, not loop transient.
             blocked = 'write';
+            cause = why(e);
             break;
         }
     }
@@ -223,7 +227,7 @@ async function healCategoryIndex(db, limit = 100) {
     // (embed failures AND beyond-limit backlog): purge success must never be
     // mistaken for repair success — an incomplete candidate index means
     // classification would run with some live categories invisible.
-    return { added, purged, missingRemaining: missingAll.length - added, staleRemaining: staleAll.length - purged, blocked };
+    return { added, purged, missingRemaining: missingAll.length - added, staleRemaining: staleAll.length - purged, blocked, cause };
 }
 /**
  * Top-K category hits for a fact (empty only when the index is empty).
@@ -283,7 +287,22 @@ async function categoryHits(db, fact, k) {
             }
         }
     }
-    let hits = searchSimilarCategories(db, embedding, k);
+    // A lookup failure other than an absent table (bad scale record, wrong
+    // schema) is kept, not swallowed: the heal below may still repair the index,
+    // but if retrieval stays empty it surfaces as IndexRepairError with its
+    // cause — never as a transient that re-selects the fact on every run.
+    let lookupError = null;
+    const lookup = () => {
+        try {
+            lookupError = null;
+            return searchSimilarCategories(db, embedding, k);
+        }
+        catch (e) {
+            lookupError = e;
+            return [];
+        }
+    };
+    let hits = lookup();
     const catCount = db.prepare('SELECT COUNT(*) AS n FROM ontology_categories').get().n;
     if (catCount > 0) {
         // Index-coverage self-heal — triggered by EXACT id-set reconciliation,
@@ -306,7 +325,7 @@ async function categoryHits(db, fact, k) {
                     break;
                 }
             }
-            needHeal = missingExists || staleExists;
+            needHeal = missingExists || staleExists || lookupError !== null;
         }
         catch {
             needHeal = true; // vec table unusable — heal reports full missingness → refusal
@@ -329,12 +348,12 @@ async function categoryHits(db, fact, k) {
                 //   ledgers it) instead of silently re-selecting forever.
                 const progress = heal.added + heal.purged;
                 if (progress === 0 && (heal.blocked === 'purge' || heal.blocked === 'scan' || heal.blocked === 'write')) {
-                    throw new IndexRepairError(`ontology category index repair FAILED (${heal.blocked}: vec_categories unwritable/unscannable; missing ${heal.missingRemaining}, stale ${heal.staleRemaining}) — manual repair required (fact ${fact.id})`);
+                    throw new IndexRepairError(`ontology category index repair FAILED (${heal.blocked}: vec_categories unwritable/unscannable${heal.cause ? ` — ${heal.cause}` : ''}; missing ${heal.missingRemaining}, stale ${heal.staleRemaining}) — manual repair required (fact ${fact.id})`);
                 }
                 throw new TransientLlmError(`category index incomplete after heal (missing ${heal.missingRemaining}, stale ${heal.staleRemaining}) — refusing candidate-starved classification (fact ${fact.id})`);
             }
             if (heal.added + heal.purged > 0) {
-                hits = searchSimilarCategories(db, embedding, k); // re-rank with reconciled index
+                hits = lookup(); // re-rank with reconciled index
             }
         };
         if (needHeal) {
@@ -350,9 +369,12 @@ async function categoryHits(db, fact, k) {
             // yields nothing usable do we refuse below.
             await healAndRefresh();
         }
+        if (hits.length === 0 && lookupError !== null) {
+            const cause = lookupError instanceof Error ? lookupError.message : String(lookupError);
+            throw new IndexRepairError(`ontology category index unreadable (${cause}) — the heal found nothing to rewrite; manual repair required (fact ${fact.id})`);
+        }
         if (hits.length === 0) {
-            // Starvation guard: searchSimilarCategories swallows vec-table errors
-            // into [] and an empty/unusable index also yields [] — classifying
+            // Starvation guard: an absent or empty index yields [] — classifying
             // with zero candidates while categories EXIST would let the LLM
             // persist duplicate taxonomy. (vec0 MATCH returns nearest rows
             // regardless of distance, so a non-empty usable index cannot yield 0.)

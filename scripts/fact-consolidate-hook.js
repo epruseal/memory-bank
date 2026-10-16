@@ -45,6 +45,7 @@ import { getTopFacts } from '../dist/fact-db.js';
 import { factTextKey, truncateFact } from '../dist/fact-text.js';
 import { loadLedger, appendLedger } from '../dist/inject-ledger.js';
 import { readHookInput } from '../dist/hook-stdin.js';
+import { ensureNativeAbi } from '../dist/node-abi.js';
 
 /** Upper bound for the whole block (10 facts × 160 chars cap ≈ 1,700 worst case). */
 const BLOCK_CHAR_BUDGET = 1500;
@@ -64,6 +65,8 @@ function writeOut(text) {
 }
 
 async function main() {
+  // Before stdin: re-runs under a node that can load better-sqlite3 (node-abi.ts).
+  ensureNativeAbi('fact-consolidate');
   const raw = await readHookInput(process.stdin, 3000);
   let input = {};
   try { input = JSON.parse(raw); } catch { /* not JSON — fall back to env */ }

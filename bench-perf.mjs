@@ -73,8 +73,8 @@ async function main() {
   for (const q of QUERIES) qEmb.push(Buffer.from(new Float32Array(await generateEmbedding(q, 'query')).buffer));
 
   // --- 2. vector search on exchanges (k=10, version-filtered JOIN — real search.ts path) ---
-  const { getVecDtype, embeddingToVecBlob, vecParamSql } = await import('./dist/db.js');
-  const exDt = getVecDtype(db);
+  const { getVecQuant, embeddingToVecBlob, vecParamSql } = await import('./dist/db.js');
+  const exDt = getVecQuant(db, 'vec_exchanges');
   const vecStmt = db.prepare(`
     SELECT e.id, vec.distance FROM vec_exchanges AS vec
     JOIN exchanges AS e ON vec.id = e.id
@@ -140,8 +140,7 @@ async function main() {
   let candChars = 0, candCount = 0;
   if (sampleFact?.embedding) {
     // dtype-aware: facts.embedding column is canonical float32; the vec table may be int8.
-    const { getVecTableDtype } = await import('./dist/db.js');
-    const catDt = getVecTableDtype(db, 'vec_categories');
+    const catDt = getVecQuant(db, 'vec_categories');
     const f32 = new Float32Array(sampleFact.embedding.buffer, sampleFact.embedding.byteOffset, 384);
     const hits = db.prepare(`SELECT id, distance FROM vec_categories WHERE embedding MATCH ${vecParamSql(catDt)} ORDER BY distance LIMIT 20`)
       .all(embeddingToVecBlob(Array.from(f32), catDt));

@@ -26,9 +26,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dbArg = process.argv.indexOf('--db');
-if (dbArg > -1) process.env.MEMORY_BANK_DB_PATH = path.resolve(process.argv[dbArg + 1]);
-const DRY = process.argv.includes('--dry-run');
+// Strict: `--db=PATH` or a typo like `--dryrun` must fail, not run against the live DB.
+const { parseCliArgs } = await import(path.join(REPO, 'dist/cli-args.js'));
+let args;
+try {
+  args = parseCliArgs(process.argv.slice(2), { values: ['--db'], flags: ['--dry-run'] });
+} catch (e) {
+  console.error(e.message);
+  process.exit(1);
+}
+if (args.values['--db']) process.env.MEMORY_BANK_DB_PATH = path.resolve(args.values['--db']);
+const DRY = args.flags.has('--dry-run');
 
 const { getDbPath, getIndexDir } = await import(path.join(REPO, 'dist/paths.js'));
 const DB_PATH = getDbPath();

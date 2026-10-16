@@ -61,6 +61,25 @@ Defects found while comparing against another installation's report, in live che
 | TC-INJ-013 | MEDIUM | Inject log carries client, entrypoint, has_session, stage timings, fallback_reason and req_id (daemon and fallback lines of one prompt share req_id) | `npx vitest run test/inject-core.test.ts test/inject-daemon-socket.test.ts test/inject-daemon-protocol.test.ts` |
 | TC-INJ-014 | LOW | After install: the first prompt of a new session is served by the daemon and the ledger holds exactly the facts injected | headless `claude -p` session + `--resume`, then compare inject log and ledger |
 
+## Local search performance (v1.7.7)
+
+From the 2026-10-16 search-latency diagnosis (plan: `docs/plans/2026-10-16-local-search-perf.md`, AC-001..013). Rows 001–008 are pinned by tests; 009–012 are live checks run during the release. Scripts under test import `dist/`: build first or run through `npm test -- <files>`.
+
+| ID | Severity | AC | Coverage | Evidence command |
+| --- | --- | --- | --- | --- |
+| TC-PERF-001 | CRITICAL | AC-006 | int8 scale is per table: no record = 127 (legacy DBs read unchanged), fresh fact tables record 600, exchanges stay 127, a corrupt record throws; facts written at either scale are found again at similarity ≈ 1 | `npx vitest run test/vec-quant.test.ts` |
+| TC-PERF-002 | CRITICAL | AC-006 | No caller encodes/decodes with a bare dtype string; every vec writer/reader derives its codec from `getVecQuant` | `npx vitest run test/search-perf-guards.test.ts` |
+| TC-PERF-003 | CRITICAL | AC-007 | Migration: float32 → int8@600 behind a verified backup, rows kept, every vector still finds itself; `--restore` brings the exact bytes back and keeps ids added since; a damaged backup is refused; dry-run changes nothing | `npx vitest run test/migrate-vec-facts-int8.test.ts` |
+| TC-PERF-004 | CRITICAL | AC-007 | Holder guard blocks old versions, processes older than their code update, unknown processes and unknown start times | `npx vitest run test/migrate-vec-facts-int8.test.ts -t vec-migrate-guard` |
+| TC-PERF-005 | HIGH | AC-005 | Compaction keeps ids, stored bytes, schema and scale; KNN identical; chunk count shrinks; only sparse tables with a freeable chunk are rebuilt | `npx vitest run test/vec-compact.test.ts` |
+| TC-PERF-006 | HIGH | AC-001, AC-002 | MCP search knowledge section returns under a held write lock (cached connection, no write); a failure reaches stderr and the result | `npx vitest run test/knowledge-graph.test.ts test/search-perf-guards.test.ts` |
+| TC-PERF-007 | HIGH | AC-003 | Maintenance runs once per interval (env-tunable, 0 = always), one run at a time, logs ran/skipped, compacts sparse tables | `npx vitest run test/session-start-maintenance.test.ts` |
+| TC-PERF-008 | HIGH | AC-004 | Hook entry points run the ABI check before stdin/DB; a hook launched under a mismatched node re-runs under a compatible one (live, skipped without a second node) | `npx vitest run test/node-abi.test.ts` |
+| TC-PERF-009 | HIGH | AC-009 | Release surfaces aligned: package.json, plugin.json, marketplace.json, CHANGELOG, tag, GitHub release; installed cache at the new version | `git show HEAD:package.json`, `gh release view v1.7.7`, `installed_plugins.json` |
+| TC-PERF-010 | HIGH | AC-010 | Live compaction: fact table row counts unchanged, chunks shrink | `scripts/compact-vec-tables.mjs` output + read-only counts |
+| TC-PERF-011 | HIGH | AC-012 | Live VACUUM: `integrity_check` ok, row counts unchanged, cold first search re-measured on fresh clones | measurement script, n=7 |
+| TC-PERF-012 | MEDIUM | AC-011, AC-013 | int8@600 agreement with exact float32 measured on a live copy (stop rule < 40/48 gated-set matches → not applied live); new inject log lines after install | quality script output, `logs/inject-context.jsonl` tail |
+
 ## Current hard UI blocker policy
 
 The repo has a UI (`ui/server.cjs`) but no browser E2E dependency. The generated hard validator must fail until live browser interaction evidence exists or unsupported flows are explicitly handled with hard source/product evidence. Build/server/page-load checks alone are not completion evidence.

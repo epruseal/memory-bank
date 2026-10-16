@@ -30,6 +30,7 @@ import { injectSocketPathIn, ownPackageVersion } from '../dist/version-guard.js'
 import { selfHealDeps } from '../dist/deps-heal.js';
 import { loadLedger, appendLedger } from '../dist/inject-ledger.js';
 import { readHookInput } from '../dist/hook-stdin.js';
+import { nativeAbiMismatch, compatibleNode, rerunWithInput, rerunBudgetMs } from '../dist/node-abi.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -40,6 +41,16 @@ const SOCKET_RESPONSE_TIMEOUT_MS = 3000;
 // session start). Loading a second copy cold costs the same ~5s and doubles the
 // CPU, so wait for the one already loading — but not forever.
 const SOCKET_WARMING_TIMEOUT_MS = 20000;
+// A native-ABI re-run gets what is left of the hook's time budget after this
+// process's own time (the daemon wait above included), minus a margin to write
+// its log line. Claude Code docs, hooks "timeout" row: "Claude Code lowers the
+// `command` … default to 30 on `UserPromptSubmit`" and cancels the hook there,
+// discarding its output. MEMORY_BANK_INJECT_HOOK_BUDGET_MS follows a changed
+// hook timeout. Margin 3s: logging is one appendFileSync; the rest absorbs node
+// start-up before process.uptime() begins and a busy machine.
+const DEFAULT_HOOK_BUDGET_MS = 30_000;
+const LOG_MARGIN_MS = 3_000;
+const MIN_RERUN_MS = 3_000; // the cold path measured ~2.3s
 
 function injectSocketPath() {
   // Mirrors paths.ts getIndexDir() without importing the heavy dist chain.
@@ -218,11 +229,38 @@ async function main() {
     return;
   }
 
-  // FAST PATH — warm daemon inside a running MCP server.
-  const answer = await askDaemon(prompt, cwd, sessionId, meta);
+  // FAST PATH — warm daemon inside a running MCP server. A re-run for the
+  // native ABI (below) skips it: the daemon already failed in the parent.
+  const reexecReason = process.env.MEMORY_BANK_INJECT_FALLBACK_REASON;
+  const answer = reexecReason ? { failed: reexecReason } : await askDaemon(prompt, cwd, sessionId, meta);
   if (!answer.failed) {
     await deliver(answer.context, sessionId, answer.ledgerKeys);
     return;
+  }
+
+  // The cold path loads better-sqlite3. If this node cannot (ABI mismatch —
+  // see dist/node-abi.js), compute under a node that can, feeding it the stdin
+  // this process already consumed; it delivers and logs itself. A re-run that
+  // fails or times out cannot log itself, so that line is written here.
+  if (!reexecReason && nativeAbiMismatch() !== null) {
+    const node = compatibleNode('inject-context');
+    if (node && node !== process.execPath) {
+      const started = Date.now();
+      const envBudget = Number(process.env.MEMORY_BANK_INJECT_HOOK_BUDGET_MS);
+      const budgetMs = Number.isFinite(envBudget) && envBudget > 0 ? envBudget : DEFAULT_HOOK_BUDGET_MS;
+      const elapsedMs = Math.round(process.uptime() * 1000);
+      const timeoutMs = rerunBudgetMs(elapsedMs, { budgetMs, marginMs: LOG_MARGIN_MS, minMs: MIN_RERUN_MS });
+      const failure = timeoutMs === null
+        ? `no time left in the ${budgetMs}ms hook budget (${elapsedMs}ms used, needs ${MIN_RERUN_MS}ms + ${LOG_MARGIN_MS}ms margin)`
+        : rerunWithInput(node, fileURLToPath(import.meta.url), raw, { MEMORY_BANK_INJECT_FALLBACK_REASON: String(answer.failed) }, timeoutMs);
+      if (failure) {
+        appendInjectLog({
+          status: 'error', error: `native-ABI re-run under ${node} failed: ${failure}`, project: cwd,
+          prompt_len: prompt.length, via: 'fallback', duration_ms: Date.now() - started, has_session: Boolean(sessionId), ...meta,
+        });
+      }
+      return;
+    }
   }
 
   // COLD FALLBACK — compute locally (heavy imports load only here).

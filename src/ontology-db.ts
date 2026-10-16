@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
-import { getVecTableDtype, embeddingToVecBlob, vecParamSql, normalizeVecDistance } from './db.js';
+import { getVecQuant, embeddingToVecBlob, vecParamSql, normalizeVecDistance } from './db.js';
 import { ontologyNameRejectReason } from './fact-validity.js';
 import type {
   OntologyDomain,
@@ -109,13 +109,13 @@ export function upsertCategoryEmbedding(
   categoryId: string,
   embedding: number[],
 ): void {
-  const dt = getVecTableDtype(db, 'vec_categories');
-  const buf = embeddingToVecBlob(embedding, dt);
-  const tx = db.transaction(() => {
+  // dtype/scale read inside the write transaction (see fact-db upsertFactVector).
+  db.transaction(() => {
+    const q = getVecQuant(db, 'vec_categories');
     db.prepare('DELETE FROM vec_categories WHERE id = ?').run(categoryId);
-    db.prepare(`INSERT INTO vec_categories (id, embedding) VALUES (?, ${vecParamSql(dt)})`).run(categoryId, buf);
-  });
-  tx();
+    db.prepare(`INSERT INTO vec_categories (id, embedding) VALUES (?, ${vecParamSql(q)})`)
+      .run(categoryId, embeddingToVecBlob(embedding, q));
+  }).immediate();
 }
 
 export function deleteCategoryEmbedding(db: Database.Database, categoryId: string): void {
@@ -135,17 +135,27 @@ export function searchSimilarCategories(
   embedding: number[],
   k: number = 20,
 ): Array<{ category: OntologyCategory; domainName: string; distance: number }> {
+  const knn = () => {
+    const q = getVecQuant(db, 'vec_categories');
+    const rows = db.prepare(`
+      SELECT id, distance FROM vec_categories
+      WHERE embedding MATCH ${vecParamSql(q)} ORDER BY distance LIMIT ?
+    `).all(embeddingToVecBlob(embedding, q), k) as Array<{ id: string; distance: number }>;
+    // ×scale int8 distances → float32-equivalent scale for callers.
+    for (const h of rows) h.distance = normalizeVecDistance(h.distance, q);
+    return rows;
+  };
   let hits: Array<{ id: string; distance: number }>;
   try {
-    const dt = getVecTableDtype(db, 'vec_categories');
-    hits = db.prepare(`
-      SELECT id, distance FROM vec_categories
-      WHERE embedding MATCH ${vecParamSql(dt)} ORDER BY distance LIMIT ?
-    `).all(embeddingToVecBlob(embedding, dt), k) as Array<{ id: string; distance: number }>;
-    // ×127-scaled int8 distances → float32-equivalent scale for callers.
-    for (const h of hits) h.distance = normalizeVecDistance(h.distance, dt);
-  } catch {
-    return []; // index absent → caller uses the full category list
+    hits = knn();
+  } catch (e) {
+    // Only an absent table (very old DBs) reads as "no candidates". A swap
+    // (compaction, int8 migration) can change dtype/scale between the read and
+    // the MATCH, so one retry; anything else — bad scale record, wrong schema —
+    // throws with its cause. The classifier turns a lookup that stays broken
+    // into IndexRepairError (ontology-classifier.ts categoryHits).
+    if (/no such table/i.test(e instanceof Error ? e.message : String(e))) return [];
+    hits = knn();
   }
 
   const results: Array<{ category: OntologyCategory; domainName: string; distance: number }> = [];

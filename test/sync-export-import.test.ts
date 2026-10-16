@@ -142,6 +142,73 @@ describe('sync-export/import', () => {
     expect(result.newRelations).toBe(1);
   });
 
+  const writeOneFact = async (id: string, factKr: string | null) => {
+    const { getSyncDir } = await import('../src/sync-export.js');
+    const now = new Date().toISOString();
+    fs.writeFileSync(path.join(getSyncDir(), 'facts.jsonl'), JSON.stringify({
+      id, fact: `Imported fact ${id}`, fact_kr: factKr, category: 'decision', scope_type: 'global', scope_project: null,
+      source_exchange_ids: '[]', created_at: now, updated_at: now, consolidated_count: 1, ontology_category_id: null,
+    }) + '\n');
+  };
+
+  it('import writes vectors at the table scale recorded by the int8 migration (600)', async () => {
+    const { initDatabase, embeddingToVecBlob } = await import('../src/db.js');
+    let db = initDatabase();
+    try {
+      for (const t of ['vec_facts', 'vec_facts_kr']) {
+        db.prepare('INSERT OR REPLACE INTO vec_int8_scale (table_name, scale) VALUES (?, 600)').run(t);
+      }
+    } finally {
+      db.close();
+    }
+    await writeOneFact('scale-fact', '배율 600 으로 가져온다');
+    const { importFromSync } = await import('../src/sync-import.js');
+    expect((await importFromSync()).newFacts).toBe(1);
+
+    const expected = embeddingToVecBlob(new Array(384).fill(0.05), { dtype: 'int8', scale: 600 });
+    db = initDatabase();
+    try {
+      for (const t of ['vec_facts', 'vec_facts_kr']) {
+        const row = db.prepare(`SELECT embedding FROM ${t} WHERE id = ?`).get('scale-fact') as { embedding: Buffer };
+        expect(Buffer.from(row.embedding).equals(expected), t).toBe(true);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it('a failed vector write leaves no fact row behind, so the next import retries it (2026-10-16)', async () => {
+    const { initDatabase } = await import('../src/db.js');
+    let db = initDatabase();
+    try {
+      // An unusable scale record makes the vector write throw inside the import.
+      db.prepare("INSERT OR REPLACE INTO vec_int8_scale (table_name, scale) VALUES ('vec_facts', 0)").run();
+    } finally {
+      db.close();
+    }
+    await writeOneFact('retry-fact', null);
+    const { importFromSync } = await import('../src/sync-import.js');
+    const first = await importFromSync();
+    expect(first.newFacts).toBe(0);
+    expect(first.failedFacts).toBe(1); // counted, not only printed to a stderr nobody reads
+    expect(first.failedFactErrors).toEqual([expect.stringMatching(/^retry-fact: .*vec_int8_scale/)]);
+    db = initDatabase();
+    try {
+      // Before the fix the row was already committed here, and the id check skipped it forever.
+      expect(db.prepare('SELECT count(*) AS n FROM facts WHERE id = ?').get('retry-fact')).toEqual({ n: 0 });
+      db.prepare("DELETE FROM vec_int8_scale WHERE table_name = 'vec_facts'").run();
+    } finally {
+      db.close();
+    }
+    expect((await importFromSync()).newFacts).toBe(1);
+    db = initDatabase();
+    try {
+      expect(db.prepare('SELECT count(*) AS n FROM vec_facts WHERE id = ?').get('retry-fact')).toEqual({ n: 1 });
+    } finally {
+      db.close();
+    }
+  });
+
   it('다른 기기가 내보낸 템플릿 쓰레기는 들이지 않고 수를 센다 (2026-10-03)', async () => {
     const { getSyncDir } = await import('../src/sync-export.js');
     const syncDir = getSyncDir();

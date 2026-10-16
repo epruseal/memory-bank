@@ -21,7 +21,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { initDatabase, getVecDtype, getVecTableDtype, embeddingToVecBlob, vecParamSql } from '../dist/db.js';
+import { initDatabase, getVecQuant, embeddingToVecBlob, vecParamSql } from '../dist/db.js';
 import { generateEmbedding, generateExchangeEmbedding, initEmbeddings, EMBEDDING_VERSION, EMBEDDING_MODEL } from '../dist/embeddings.js';
 import { getIndexDir } from '../dist/paths.js';
 import { buildReembedPending } from '../dist/reembed-selector.js';
@@ -110,19 +110,20 @@ async function reembedFacts(db) {
     // invalidates both, and vec_facts_kr rows are not version-tracked.
     const krEmb = row.fact_kr ? await generateEmbedding(row.fact_kr) : null;
     const tx = db.transaction(() => {
-      // dtype read INSIDE the tx — serialized against a migration swap.
-      const dtF = getVecTableDtype(db, 'vec_facts');
-      const dtK = getVecTableDtype(db, 'vec_facts_kr');
+      // dtype/scale read INSIDE the tx — serialized against a migration swap
+      // because tx.immediate() below takes the write lock before this read.
+      const qF = getVecQuant(db, 'vec_facts');
+      const qK = getVecQuant(db, 'vec_facts_kr');
       db.prepare('UPDATE facts SET embedding = ?, embedding_version = ? WHERE id = ?')
         .run(buf, EMBEDDING_VERSION, row.id);
       db.prepare('DELETE FROM vec_facts WHERE id = ?').run(row.id);
-      db.prepare(`INSERT INTO vec_facts (id, embedding) VALUES (?, ${vecParamSql(dtF)})`).run(row.id, embeddingToVecBlob(emb, dtF));
+      db.prepare(`INSERT INTO vec_facts (id, embedding) VALUES (?, ${vecParamSql(qF)})`).run(row.id, embeddingToVecBlob(emb, qF));
       db.prepare('DELETE FROM vec_facts_kr WHERE id = ?').run(row.id);
       if (krEmb) {
-        db.prepare(`INSERT INTO vec_facts_kr (id, embedding) VALUES (?, ${vecParamSql(dtK)})`).run(row.id, embeddingToVecBlob(krEmb, dtK));
+        db.prepare(`INSERT INTO vec_facts_kr (id, embedding) VALUES (?, ${vecParamSql(qK)})`).run(row.id, embeddingToVecBlob(krEmb, qK));
       }
     });
-    tx();
+    tx.immediate(); // a deferred BEGIN reads first and hits BUSY_SNAPSHOT if another writer commits before our upgrade
     if (++done % 500 === 0) log(`facts: ${done}/${pending.length}`);
   }
   if (pending.length) log(`facts: done (${done})`);
@@ -144,11 +145,11 @@ async function embedKoreanFacts(db) {
   for (const row of rows) {
     const emb = await generateEmbedding(row.fact_kr);
     const tx = db.transaction(() => {
-      const dtK = getVecTableDtype(db, 'vec_facts_kr');
+      const qK = getVecQuant(db, 'vec_facts_kr');
       db.prepare('DELETE FROM vec_facts_kr WHERE id = ?').run(row.id);
-      db.prepare(`INSERT INTO vec_facts_kr (id, embedding) VALUES (?, ${vecParamSql(dtK)})`).run(row.id, embeddingToVecBlob(emb, dtK));
+      db.prepare(`INSERT INTO vec_facts_kr (id, embedding) VALUES (?, ${vecParamSql(qK)})`).run(row.id, embeddingToVecBlob(emb, qK));
     });
-    tx();
+    tx.immediate(); // write lock before the dtype/scale read (see reembedFacts)
     if (++done % 500 === 0) log(`facts-kr: ${done}/${rows.length}`);
   }
   if (rows.length) log(`facts-kr: done (${done})`);
@@ -206,12 +207,12 @@ async function reembedExchanges(db) {
       // duplicating ~1.5KB per row. last_indexed stamp: the migration's delta
       // reconciliation depends on every vector writer stamping it.
       const tx = db.transaction(() => {
-        const vecDtype = getVecDtype(db);
-        const buf = embeddingToVecBlob(emb, vecDtype);
+        const vecQuant = getVecQuant(db, 'vec_exchanges');
+        const buf = embeddingToVecBlob(emb, vecQuant);
         db.prepare('UPDATE exchanges SET embedding = NULL, embedding_version = ?, last_indexed = ? WHERE id = ?')
           .run(EMBEDDING_VERSION, Date.now(), row.id);
         db.prepare('DELETE FROM vec_exchanges WHERE id = ?').run(row.id);
-        db.prepare(`INSERT INTO vec_exchanges (id, embedding) VALUES (?, ${vecParamSql(vecDtype)})`).run(row.id, buf);
+        db.prepare(`INSERT INTO vec_exchanges (id, embedding) VALUES (?, ${vecParamSql(vecQuant)})`).run(row.id, buf);
       });
       // .immediate(): BEGIN IMMEDIATE — the write lock is acquired BEFORE the
       // dtype read (a deferred BEGIN would read first and let the migration

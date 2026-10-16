@@ -201,15 +201,16 @@ function categoryEmbeddingText(name: string, description?: string | null): strin
 async function healCategoryIndex(
   db: Database.Database,
   limit: number = 100,
-): Promise<{ added: number; purged: number; missingRemaining: number; staleRemaining: number; blocked: 'embed' | 'write' | 'purge' | 'scan' | null }> {
+): Promise<{ added: number; purged: number; missingRemaining: number; staleRemaining: number; blocked: 'embed' | 'write' | 'purge' | 'scan' | null; cause?: string }> {
+  const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
   let indexed: Set<string>;
   try {
     indexed = new Set((db.prepare('SELECT id FROM vec_categories').all() as Array<{ id: string }>).map((r) => r.id));
-  } catch {
+  } catch (e) {
     // vec table unusable — nothing to heal here; report full missingness so
     // the caller refuses rather than classifying candidate-starved.
     const live = (db.prepare('SELECT COUNT(*) AS n FROM ontology_categories').get() as { n: number }).n;
-    return { added: 0, purged: 0, missingRemaining: live, staleRemaining: 0, blocked: 'scan' };
+    return { added: 0, purged: 0, missingRemaining: live, staleRemaining: 0, blocked: 'scan', cause: why(e) };
   }
   const liveRows = db.prepare('SELECT id, name, description FROM ontology_categories').all() as Array<{
     id: string;
@@ -228,12 +229,14 @@ async function healCategoryIndex(
   const staleAll = [...indexed].filter((id) => !liveIds.has(id));
   let purged = 0;
   let blocked: 'embed' | 'write' | 'purge' | 'scan' | null = null;
+  let cause: string | undefined;
   for (const id of staleAll) {
     try {
       db.prepare('DELETE FROM vec_categories WHERE id = ?').run(id);
       purged++;
-    } catch {
+    } catch (e) {
       blocked = 'purge'; // vec table write-broken mid-way — stop, guard decides
+      cause = why(e);
       break;
     }
     if (purged >= limit) break;
@@ -253,10 +256,11 @@ async function healCategoryIndex(
     try {
       upsertCategoryEmbedding(db, c.id, emb);
       added++;
-    } catch {
+    } catch (e) {
       // vec INSERT rejected while the table scans: index corruption, NOT an
       // embedding-runtime problem — must escalate hard, not loop transient.
       blocked = 'write';
+      cause = why(e);
       break;
     }
   }
@@ -264,7 +268,7 @@ async function healCategoryIndex(
   // (embed failures AND beyond-limit backlog): purge success must never be
   // mistaken for repair success — an incomplete candidate index means
   // classification would run with some live categories invisible.
-  return { added, purged, missingRemaining: missingAll.length - added, staleRemaining: staleAll.length - purged, blocked };
+  return { added, purged, missingRemaining: missingAll.length - added, staleRemaining: staleAll.length - purged, blocked, cause };
 }
 
 /**
@@ -328,7 +332,21 @@ async function categoryHits(
       }
     }
   }
-  let hits = searchSimilarCategories(db, embedding, k);
+  // A lookup failure other than an absent table (bad scale record, wrong
+  // schema) is kept, not swallowed: the heal below may still repair the index,
+  // but if retrieval stays empty it surfaces as IndexRepairError with its
+  // cause — never as a transient that re-selects the fact on every run.
+  let lookupError: unknown = null;
+  const lookup = () => {
+    try {
+      lookupError = null;
+      return searchSimilarCategories(db, embedding as number[], k);
+    } catch (e) {
+      lookupError = e;
+      return [];
+    }
+  };
+  let hits = lookup();
   const catCount = (db.prepare('SELECT COUNT(*) AS n FROM ontology_categories').get() as { n: number }).n;
   if (catCount > 0) {
     // Index-coverage self-heal — triggered by EXACT id-set reconciliation,
@@ -353,7 +371,7 @@ async function categoryHits(
           break;
         }
       }
-      needHeal = missingExists || staleExists;
+      needHeal = missingExists || staleExists || lookupError !== null;
     } catch {
       needHeal = true; // vec table unusable — heal reports full missingness → refusal
     }
@@ -376,7 +394,7 @@ async function categoryHits(
         const progress = heal.added + heal.purged;
         if (progress === 0 && (heal.blocked === 'purge' || heal.blocked === 'scan' || heal.blocked === 'write')) {
           throw new IndexRepairError(
-            `ontology category index repair FAILED (${heal.blocked}: vec_categories unwritable/unscannable; missing ${heal.missingRemaining}, stale ${heal.staleRemaining}) — manual repair required (fact ${fact.id})`,
+            `ontology category index repair FAILED (${heal.blocked}: vec_categories unwritable/unscannable${heal.cause ? ` — ${heal.cause}` : ''}; missing ${heal.missingRemaining}, stale ${heal.staleRemaining}) — manual repair required (fact ${fact.id})`,
           );
         }
         throw new TransientLlmError(
@@ -384,7 +402,7 @@ async function categoryHits(
         );
       }
       if (heal.added + heal.purged > 0) {
-        hits = searchSimilarCategories(db, embedding as number[], k); // re-rank with reconciled index
+        hits = lookup(); // re-rank with reconciled index
       }
     };
     if (needHeal) {
@@ -400,9 +418,14 @@ async function categoryHits(
       // yields nothing usable do we refuse below.
       await healAndRefresh();
     }
+    if (hits.length === 0 && lookupError !== null) {
+      const cause = lookupError instanceof Error ? lookupError.message : String(lookupError);
+      throw new IndexRepairError(
+        `ontology category index unreadable (${cause}) — the heal found nothing to rewrite; manual repair required (fact ${fact.id})`,
+      );
+    }
     if (hits.length === 0) {
-      // Starvation guard: searchSimilarCategories swallows vec-table errors
-      // into [] and an empty/unusable index also yields [] — classifying
+      // Starvation guard: an absent or empty index yields [] — classifying
       // with zero candidates while categories EXIST would let the LLM
       // persist duplicate taxonomy. (vec0 MATCH returns nearest rows
       // regardless of distance, so a non-empty usable index cannot yield 0.)

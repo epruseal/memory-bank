@@ -1,18 +1,45 @@
 import Database from 'better-sqlite3';
 import { ConversationExchange } from './types.js';
 export type VecDtype = 'float32' | 'int8';
+/** dtype + int8 scale of one vec0 table. float32 tables carry scale 1. */
+export interface VecQuant {
+    dtype: VecDtype;
+    scale: number;
+}
+/** Legacy scale: vec_exchanges, and any int8 table with no recorded scale. */
 export declare const VEC_INT8_SCALE = 127;
+/** Scale scripts/migrate-vec-facts-int8.mjs records for the fact-side tables it converts. */
+export declare const FACT_VEC_INT8_SCALE = 600;
+/** Per-table scale record. A missing row means the legacy 127. */
+export declare const VEC_INT8_SCALE_TABLE = "vec_int8_scale";
+/** The fact-side vec0 tables (per-table scale, compaction, int8 migration). */
+export declare const FACT_VEC_TABLES: readonly ["vec_facts", "vec_facts_kr", "vec_categories"];
+/** CREATE statement of a fact-side vec0 table — the one shape initDatabase, the
+ * migration and compaction all produce. */
+export declare function factVecTableDdl(table: string, type: 'int8' | 'FLOAT', opts?: {
+    ifNotExists?: boolean;
+}): string;
 /** Authoritative dtype of any vec0 table — read from the ACTUAL schema in
  * sqlite_master (never a flag), so readers/writers can never disagree with a
  * migration swap. Unknown/absent table defaults to int8 (the fresh-DB DDL). */
 export declare function getVecTableDtype(db: Database.Database, table: string): VecDtype;
-export declare function getVecDtype(db: Database.Database): VecDtype;
-/** Convert a float embedding to the blob matching the table dtype. */
-export declare function embeddingToVecBlob(embedding: number[], dtype: VecDtype): Buffer;
-/** SQL placeholder for a vec_exchanges MATCH/INSERT param under the dtype. */
-export declare function vecParamSql(dtype: VecDtype): string;
-/** Normalize a vec KNN distance back to float32 scale (int8 distances are ×127). */
-export declare function normalizeVecDistance(distance: number, dtype: VecDtype): number;
+/**
+ * dtype + scale of a vec0 table. The dtype comes from the schema; the int8
+ * scale from vec_int8_scale, which only the fact-vector int8 migration writes,
+ * in the SAME transaction that swaps the table — so the two can only change
+ * together. No row (or no record table at all) = 127: every int8 table before
+ * per-table scales existed, and every table a fresh DB creates (what ≤1.7.6
+ * creates too, so older processes sharing the DB read it right).
+ * A recorded value outside (0, 10000] is corruption and throws: decoding with
+ * a guessed scale would silently skew every similarity gate.
+ */
+export declare function getVecQuant(db: Database.Database, table: string): VecQuant;
+/** Convert a float embedding to the blob matching the table's dtype + scale. */
+export declare function embeddingToVecBlob(embedding: number[], quant: VecQuant): Buffer;
+/** SQL placeholder for a vec0 MATCH/INSERT param under the table's dtype. */
+export declare function vecParamSql(quant: VecQuant): string;
+/** Normalize a vec KNN distance back to float32 scale (int8 distances are ×scale). */
+export declare function normalizeVecDistance(distance: number, quant: VecQuant): number;
 /**
  * Convert a (float32-scale) L2 distance between UNIT vectors to cosine
  * similarity. e5 embeddings are L2-normalized, so ‖a-b‖² = 2(1 - cos) and

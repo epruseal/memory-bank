@@ -7,6 +7,7 @@ import { suppressConsole } from './test-utils.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import Database from 'better-sqlite3';
 
 const restoreConsole = suppressConsole();
 
@@ -102,6 +103,47 @@ describe('Knowledge Graph Enhanced Search', () => {
     const ctx = await getKnowledgeContext('API design patterns', 'test-project');
     expect(ctx).toBeDefined();
     expect(ctx.facts).toBeInstanceOf(Array);
+  });
+
+  // 2026-10-16: getKnowledgeContext used to open a fresh initDatabase() per call —
+  // migrations + a dedup DELETE (a write) — so a worker holding the write lock made
+  // the MCP search wait 5s and then drop the knowledge section silently.
+  it('returns enriched facts under a held write lock (cached read connection, no write)', async () => {
+    const { initEmbeddings, generateEmbedding } = await import('../src/embeddings.js');
+    await initEmbeddings();
+    const q = 'which state library did we pick for the mobile app';
+    const emb = await generateEmbedding(q, 'query');
+
+    const db = initDatabase();
+    const domain = createDomain(db, 'Frontend', 'Frontend development');
+    const category = createCategory(db, domain.id, 'State Management', 'State management patterns');
+    const picked = insertFact(db, {
+      fact: 'Picked Riverpod for mobile state', category: 'decision', scope_type: 'global',
+      scope_project: null, source_exchange_ids: ['ex-1'], embedding: emb,
+    });
+    const dropped = insertFact(db, {
+      fact: 'Provider was dropped', category: 'decision', scope_type: 'global',
+      scope_project: null, source_exchange_ids: ['ex-2'], embedding: new Array(384).fill(0.05),
+    });
+    classifyFact(db, picked, category.id);
+    createRelation(db, picked, 'SUPERSEDES', dropped, 'replaced');
+    db.close();
+
+    await getKnowledgeContext(q); // first call opens (and migrates) the cached search connection
+
+    const locker = new Database(dbPath);
+    locker.exec('BEGIN IMMEDIATE');
+    try {
+      const t0 = Date.now();
+      const ctx = await getKnowledgeContext(q);
+      expect(Date.now() - t0).toBeLessThan(1000);
+      const hit = ctx.facts.find((f) => f.fact === 'Picked Riverpod for mobile state');
+      expect(hit).toMatchObject({ domain: 'Frontend', categoryName: 'State Management', category: 'decision' });
+      expect(hit!.relatedFacts).toEqual([{ fact: 'Provider was dropped', relationType: 'SUPERSEDES' }]);
+    } finally {
+      locker.exec('ROLLBACK');
+      locker.close();
+    }
   });
 });
 

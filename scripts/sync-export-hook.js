@@ -6,6 +6,9 @@
  */
 
 import { exportForSync } from '../dist/sync-export.js';
+import { ensureNativeAbi } from '../dist/node-abi.js';
+
+ensureNativeAbi('sync-export');
 
 try {
   const result = exportForSync();

@@ -100,13 +100,13 @@ console.log('Copying vec embeddings (streaming prod vec_exchanges)...');
 // dtype-aware: raw blob copy only works when both tables share a dtype, and
 // int8 params must be wrapped in vec_int8() (vec0 treats a bare blob param as
 // float32 otherwise). Prod migrated to int8 on 2026-07-11.
-const { getVecDtype, vecParamSql } = await import(path.join(REPO, 'dist/db.js'));
-const prodDtype = getVecDtype(prod);
-const benchDtype = getVecDtype(bench);
-if (prodDtype !== benchDtype) {
-  throw new Error(`vec dtype mismatch: prod=${prodDtype} bench=${benchDtype} — align dtypes before regenerating`);
+const { getVecQuant, vecParamSql } = await import(path.join(REPO, 'dist/db.js'));
+const prodQuant = getVecQuant(prod, 'vec_exchanges');
+const benchQuant = getVecQuant(bench, 'vec_exchanges');
+if (prodQuant.dtype !== benchQuant.dtype || prodQuant.scale !== benchQuant.scale) {
+  throw new Error(`vec quant mismatch: prod=${JSON.stringify(prodQuant)} bench=${JSON.stringify(benchQuant)} — align before regenerating`);
 }
-const vecIns = bench.prepare(`INSERT INTO vec_exchanges (id, embedding) VALUES (?, ${vecParamSql(benchDtype)})`);
+const vecIns = bench.prepare(`INSERT INTO vec_exchanges (id, embedding) VALUES (?, ${vecParamSql(benchQuant)})`);
 let copied = 0;
 let batch = [];
 const flush = bench.transaction((b) => { for (const [id, emb] of b) vecIns.run(id, emb); });

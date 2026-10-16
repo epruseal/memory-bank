@@ -38,6 +38,10 @@ The build is two-step: `tsc` compiles `src/` → `dist/`, then `esbuild` bundles
 | `embeddings.ts` | Local embedding generation using `@xenova/transformers` |
 | `llm.ts` | Anthropic API wrapper for Haiku calls (fact extraction/consolidation) |
 | `parser.ts` | JSONL conversation file parser |
+| `vec-compact.ts` | Rebuild a fact-side vec0 table without deleted slots (same ids, bytes, dtype, scale) |
+| `vec-migrate-guard.ts` | Refuses a vec format change while processes or install dirs run older code |
+| `node-abi.ts` | Finds a node whose ABI matches better-sqlite3 and re-runs a hook under it |
+| `cli-args.ts` | Strict argument parsing for scripts that write the live DB |
 | `paths.ts` | Config/data directory resolution (supports `MEMORY_BANK_CONFIG_DIR` override) |
 | `sync.ts` | File sync + incremental indexing + summary generation |
 
@@ -81,6 +85,11 @@ Consolidation relations: `DUPLICATE` (merge), `CONTRADICTION` (replace), `EVOLUT
 | `MEMORY_BANK_CONFIG_DIR` | Override config directory (useful for testing) |
 | `MEMORY_BANK_DB_PATH` / `TEST_DB_PATH` | Override database path |
 | `TEST_ARCHIVE_DIR` | Override archive directory for tests |
+| `MEMORY_BANK_MAINTENANCE_INTERVAL_MIN` | Session-start maintenance interval in minutes (default 360, 0 = every start; a partial run retries after 60) |
+| `MEMORY_BANK_NODE` | Node binary for hooks when the default node's ABI does not match better-sqlite3 |
+| `MEMORY_BANK_INJECT_HOOK_BUDGET_MS` | Injection hook time budget that bounds its native-ABI re-run (default 30000 = Claude Code's UserPromptSubmit default) |
+| `MEMORY_BANK_SESSION_START_SPAWN` | `0` = maintenance logs the workers it would spawn instead of spawning them (tests) |
+| `MEMORY_BANK_PLUGIN_CACHE_DIR` / `MEMORY_BANK_PROCESS_SCAN_ROOT` | Test-only: narrow the int8 migration guard's install-dir / process scan (the migration prints them when set) |
 
 ### Ontology System
 
@@ -110,7 +119,7 @@ Automatic classification of facts into domain/category hierarchy:
 
 ### ESM Module System
 - All imports use `.js` extension: `import { foo } from './bar.js'`
-- `require()` is forbidden — use `import` exclusively
+- `require()` is forbidden — use `import` exclusively. One exception: `src/node-abi.ts` loads better-sqlite3 through `createRequire` to catch an ABI mismatch synchronously, before a hook reads stdin (an `import` of a mismatched addon fails at module load, where no hook code can catch it)
 - CommonJS files use `.cjs` extension (e.g., `ui/server.cjs`)
 
 ### Database Patterns

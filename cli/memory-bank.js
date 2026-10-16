@@ -3,6 +3,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { spawn } from 'child_process';
 import { realpathSync } from 'fs';
+import { ensureNativeAbi } from '../dist/node-abi.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(realpathSync(__filename));
@@ -61,6 +62,9 @@ EXAMPLES:
 }
 
 async function main() {
+  // Every command opens the DB in this process or in a child spawned with
+  // process.execPath — fix the node before either (dist/node-abi.js).
+  ensureNativeAbi('memory-bank');
   try {
     const distDir = join(__dirname, '../dist');
 

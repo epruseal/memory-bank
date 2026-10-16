@@ -30,6 +30,7 @@ import {
   recordOntologyAttempt,
   persistFallbackClassification,
   MAX_CLASSIFY_ATTEMPTS,
+  IndexRepairError,
 } from '../src/ontology-classifier.js';
 import {
   createDomain,
@@ -616,6 +617,31 @@ describe('ontology-classifier', () => {
       expect(row.ontology_attempts).toBe(0); // hard failure is not the fact's fault either
     });
 
+    it('corrupt int8 scale record (index complete, nothing to heal) → IndexRepairError with the cause, no ledger burn (2026-10-16)', async () => {
+      const embeddingArr = new Array(384).fill(0.1);
+      insertTestFact(db, 'cs-0', 'Scale corrupt', embeddingArr);
+      const domain = createDomain(db, 'Existing', 'e');
+      const cat = createCategory(db, domain.id, 'Existing Cat', 'c');
+      db.exec('DROP TABLE vec_categories');
+      db.exec('CREATE VIRTUAL TABLE vec_categories USING vec0(id TEXT PRIMARY KEY, embedding int8[384])');
+      db.prepare('INSERT INTO vec_categories (id, embedding) VALUES (?, vec_int8(?))').run(cat.id, Buffer.from(new Int8Array(384).fill(12).buffer));
+      db.exec('CREATE TABLE vec_int8_scale (table_name TEXT PRIMARY KEY, scale REAL NOT NULL)');
+      db.prepare("INSERT INTO vec_int8_scale (table_name, scale) VALUES ('vec_categories', 0)").run();
+
+      // Before: the lookup swallowed the error, the id-set heal had nothing to
+      // write, and the fact was re-selected as "transient" on every run.
+      await expect(
+        classifyFactsBatch(db, [makeFact({ id: 'cs-0', fact: 'Scale corrupt', embedding: new Float32Array(embeddingArr) })]),
+      ).rejects.toThrow(/index unreadable \(vec_int8_scale: invalid scale 0 for vec_categories\)/);
+      await expect(classifyAndLinkFact(db, 'cs-0', embeddingArr)).rejects.toThrow(IndexRepairError);
+      expect(callHaiku).not.toHaveBeenCalled();
+      const row = db.prepare('SELECT ontology_category_id, ontology_attempts FROM facts WHERE id = ?').get('cs-0') as {
+        ontology_category_id: string | null;
+        ontology_attempts: number;
+      };
+      expect(row).toEqual({ ontology_category_id: null, ontology_attempts: 0 });
+    });
+
     it('STALE vec rows masking a missing category still get healed (0-hit fallback)', async () => {
       const embeddingArr = new Array(384).fill(0.1);
       insertTestFact(db, 'sm-0', 'Stale mask', embeddingArr);
@@ -764,7 +790,7 @@ describe('ontology-classifier', () => {
 
       await expect(
         classifyFactsBatch(db, [makeFact({ id: 'wr-0', fact: 'Write broken', embedding: new Float32Array(embeddingArr) })]),
-      ).rejects.toThrow(/repair FAILED \(write/);
+      ).rejects.toThrow(/repair FAILED \(write: vec_categories unwritable\/unscannable — \S.*; missing/); // the cause is kept
       expect(callHaiku).not.toHaveBeenCalled();
     });
 

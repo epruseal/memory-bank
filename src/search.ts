@@ -1,8 +1,9 @@
-import { initDatabase, getVecDtype, embeddingToVecBlob, vecParamSql, normalizeVecDistance, l2DistanceToSimilarity } from './db.js';
+import { initDatabase, getVecQuant, embeddingToVecBlob, vecParamSql, normalizeVecDistance, l2DistanceToSimilarity } from './db.js';
+import type { VecQuant } from './db.js';
 import { getDbPath } from './paths.js';
 import { initEmbeddings, generateEmbedding, EMBEDDING_VERSION } from './embeddings.js';
 import { searchSimilarFacts } from './fact-db.js';
-import { getRelatedFacts, listDomains, listCategories } from './ontology-db.js';
+import { getRelatedFacts } from './ontology-db.js';
 import { SearchResult, ConversationExchange, MultiConceptResult } from './types.js';
 import type DatabaseType from 'better-sqlite3';
 import fs from 'fs';
@@ -118,9 +119,9 @@ export async function searchConversations(
       await initEmbeddings();
       const queryEmbedding = await generateEmbedding(query, 'query');
 
-      // dtype-aware: int8 tables need vec_int8()-wrapped quantized query blobs,
-      // and their distances come back ×127-scaled (normalized below).
-      const vecQuery = (vecDtype: 'float32' | 'int8'): ExchangeRow[] => {
+      // dtype/scale-aware: int8 tables need vec_int8()-wrapped quantized query
+      // blobs, and their distances come back ×scale (normalized below).
+      const vecQuery = (vecQuant: VecQuant): ExchangeRow[] => {
         const stmt = db.prepare(`
           SELECT
             e.id,
@@ -135,7 +136,7 @@ export async function searchConversations(
             vec.distance
           FROM vec_exchanges AS vec
           JOIN exchanges AS e ON vec.id = e.id
-          WHERE vec.embedding MATCH ${vecParamSql(vecDtype)}
+          WHERE vec.embedding MATCH ${vecParamSql(vecQuant)}
             AND k = ?
             AND e.embedding_version = ?
             ${timeClause}
@@ -146,26 +147,26 @@ export async function searchConversations(
         // current-model query embedding — exclude rows the re-embed worker has
         // not upgraded yet (newest sessions are upgraded first).
         const rows = stmt.all(
-          embeddingToVecBlob(queryEmbedding, vecDtype),
+          embeddingToVecBlob(queryEmbedding, vecQuant),
           limit,
           EMBEDDING_VERSION,
           ...timeParams
         ) as ExchangeRow[];
-        for (const r of rows) r.distance = normalizeVecDistance(r.distance, vecDtype);
+        for (const r of rows) r.distance = normalizeVecDistance(r.distance, vecQuant);
         return rows;
       };
 
-      let vecDtype = getVecDtype(db);
+      let vecQuant = getVecQuant(db, 'vec_exchanges');
       try {
-        results = vecQuery(vecDtype);
+        results = vecQuery(vecQuant);
       } catch (e) {
         // The int8 migration may have swapped the table dtype between our
         // dtype read and the query (read path is not serialized by the swap
         // lock). Retry once with a fresh dtype; rethrow anything else.
-        const fresh = getVecDtype(db);
-        if (fresh === vecDtype) throw e;
-        vecDtype = fresh;
-        results = vecQuery(vecDtype);
+        const fresh = getVecQuant(db, 'vec_exchanges');
+        if (fresh.dtype === vecQuant.dtype && fresh.scale === vecQuant.scale) throw e;
+        vecQuant = fresh;
+        results = vecQuery(vecQuant);
       }
     }
 
@@ -679,53 +680,54 @@ export async function getKnowledgeContext(
   limit: number = 5,
 ): Promise<KnowledgeContext> {
   await initEmbeddings();
-  const db = initDatabase();
+  // The cached search connection, never a fresh initDatabase(): that ran the
+  // migration pass (incl. a dedup DELETE — a write) on every MCP search, so a
+  // worker holding the write lock stalled the search 5s and then dropped this
+  // section. Owned by getSearchDb — do not close it here.
+  const db = getSearchDb();
 
-  try {
-    const queryEmbedding = await generateEmbedding(query, 'query');
-    const factResults = searchSimilarFacts(db, queryEmbedding, project ?? null, limit, 0.6);
+  const queryEmbedding = await generateEmbedding(query, 'query');
+  const factResults = searchSimilarFacts(db, queryEmbedding, project ?? null, limit, 0.6);
 
-    if (factResults.length === 0) {
-      return { facts: [] };
-    }
-
-    // Build domain/category lookup
-    const domains = listDomains(db);
-    const categories = listCategories(db);
-    const domainMap = new Map(domains.map(d => [d.id, d.name]));
-    const categoryMap = new Map(categories.map(c => [c.id, { name: c.name, domainId: c.domain_id }]));
-
-    const enrichedFacts: KnowledgeContext['facts'] = [];
-
-    for (const { fact, distance } of factResults) {
-      const similarity = parseFloat(l2DistanceToSimilarity(distance).toFixed(3));
-      const catInfo = fact.ontology_category_id
-        ? categoryMap.get(fact.ontology_category_id)
-        : undefined;
-      const domainName = catInfo ? (domainMap.get(catInfo.domainId) ?? 'Unclassified') : 'Unclassified';
-      const catName = catInfo ? catInfo.name : 'Unclassified';
-
-      // Expand via 1-hop graph traversal
-      const related = getRelatedFacts(db, fact.id, 1);
-      const relatedFacts = related.map(({ fact: relFact, relation }) => ({
-        fact: relFact.fact,
-        relationType: relation.relation_type,
-      }));
-
-      enrichedFacts.push({
-        fact: fact.fact,
-        category: fact.category,
-        domain: domainName,
-        categoryName: catName,
-        similarity,
-        relatedFacts,
-      });
-    }
-
-    return { facts: enrichedFacts };
-  } finally {
-    db.close();
+  if (factResults.length === 0) {
+    return { facts: [] };
   }
+
+  // Category + domain for just the hit facts (not every category in the DB).
+  const categoryStmt = db.prepare(`
+    SELECT c.name AS categoryName, d.name AS domainName
+    FROM ontology_categories c LEFT JOIN ontology_domains d ON d.id = c.domain_id
+    WHERE c.id = ?
+  `);
+
+  const enrichedFacts: KnowledgeContext['facts'] = [];
+
+  for (const { fact, distance } of factResults) {
+    const similarity = parseFloat(l2DistanceToSimilarity(distance).toFixed(3));
+    const catInfo = fact.ontology_category_id
+      ? categoryStmt.get(fact.ontology_category_id) as { categoryName: string; domainName: string | null } | undefined
+      : undefined;
+    const domainName = catInfo ? (catInfo.domainName ?? 'Unclassified') : 'Unclassified';
+    const catName = catInfo ? catInfo.categoryName : 'Unclassified';
+
+    // Expand via 1-hop graph traversal
+    const related = getRelatedFacts(db, fact.id, 1);
+    const relatedFacts = related.map(({ fact: relFact, relation }) => ({
+      fact: relFact.fact,
+      relationType: relation.relation_type,
+    }));
+
+    enrichedFacts.push({
+      fact: fact.fact,
+      category: fact.category,
+      domain: domainName,
+      categoryName: catName,
+      similarity,
+      relatedFacts,
+    });
+  }
+
+  return { facts: enrichedFacts };
 }
 
 /**
