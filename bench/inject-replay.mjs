@@ -19,7 +19,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  VARIANTS, REL_VARIANTS, PROJECT_FACTS_SQL, affectedReadings, determinismEntry, codeDigest, sqliteDigest, widenedFactIds, alignWindow, buildFactIndex, extractIdentifiers, foldSample, kwLines, makeAsOf, searchedLogRows,
+  VARIANTS, REL_VARIANTS, PROJECT_FACTS_SQL, affectedReadings, determinismEntry, replayBinding, bindingDrift, recordRoots, widenedFactIds, alignWindow, buildFactIndex, extractIdentifiers, foldSample, kwLines, makeAsOf, searchedLogRows,
 } from './inject-bench-lib.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -248,6 +248,10 @@ async function replay() {
   const suffix = args.values['--suffix'] ?? '';
   if (!/^[A-Za-z0-9._-]*$/.test(suffix)) fail('bad --suffix');
 
+  // Bound before anything is read and checked again at the end: the recorded inputs and code are the
+  // bytes this run used (a --build or a rebuild while it ran would otherwise be recorded as its own).
+  const { EMBEDDING_MODEL } = await import(dist('embedding-version.js'));
+  const bound = replayBinding(REPO, OUT, EMBEDDING_MODEL);
   const sample = JSON.parse(fs.readFileSync(path.join(OUT, 'sample.json'), 'utf8'));
   const buildInfo = JSON.parse(fs.readFileSync(path.join(OUT, 'build.json'), 'utf8'));
   if (typeof buildInfo.snapshot?.fact_revisions !== 'number') fail('snapshot holds no fact revisions — as-of cannot hide rewritten facts; run --add-revisions');
@@ -272,8 +276,8 @@ async function replay() {
   const rootsOf = {};   // family roots of each cwd as resolved now — the report groups by these, not by a later disk
   const widened = (project) => {
     if (!widenedOf.has(project)) {
-      rootsOf[project] = resolveRepoRoots(project);
-      widenedOf.set(project, widenedFactIds(projectFacts, project, scopeMatcher(project, true), rootsOf[project].length > 0));
+      const roots = recordRoots(rootsOf, project, resolveRepoRoots);
+      widenedOf.set(project, widenedFactIds(projectFacts, project, scopeMatcher(project, true), roots.length > 0));
     }
     return widenedOf.get(project);
   };
@@ -336,14 +340,9 @@ async function replay() {
     hashes[v] = crypto.createHash('sha256').update(body).digest('hex');
   }
   // The inputs and the code too: the report refuses lists made from another sample, snapshot or code.
-  const inputs = { sample: crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, 'sample.json'))).digest('hex'), snapshot: sqliteDigest(SNAPSHOT) };
-  let git = null;
-  let dirty = null;
-  try {
-    git = execFileSync('git', ['-C', REPO, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    dirty = execFileSync('git', ['-C', REPO, 'status', '--porcelain', '--', 'src', 'bench', 'dist'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() !== '';
-  } catch { /* no git — recorded as null */ }
-  const code = { git, dirty, files: codeDigest(REPO) };
+  const drift = bindingDrift(bound, replayBinding(REPO, OUT, EMBEDDING_MODEL));
+  if (drift.length) fail(`inputs or code changed while the replay ran (${drift.slice(0, 5).join(', ')}) — run it again`);
+  const { inputs, code } = bound;
   if (!suffix) writeJson(path.join(OUT, 'replay-meta.json'), { ...meta, generatedAt: new Date().toISOString(), hashes, inputs, roots: rootsOf, code });
   console.log(JSON.stringify({ prompts: sample.length, variants, hard: meta.hard.length, affected: affected.size, affectedAsOf: meta.affectedAsOf.length, kw: meta.kw, hashes }));
 }

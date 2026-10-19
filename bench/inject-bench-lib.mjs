@@ -7,7 +7,10 @@
 
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { builtinModules } from 'node:module';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { WORKTREE_CONTAINERS } from '../dist/project-family.js';
 
 export const VARIANTS = ['v0', 'rel020', 'rel030', 'rel045', 'family', 'kw'];
 export const REL_VARIANTS = { rel020: 0.02, rel030: 0.03, rel045: 0.045 };
@@ -268,6 +271,45 @@ export function judgeUserMessage(prompt, labeled) {
   ].join('\n');
 }
 
+/** The bytes one judge call sends: callHaiku's prompt is the system text, a blank line, then the user message. */
+export function judgeMessage(prompt, labeled) {
+  return `${JUDGE_SYSTEM}\n\n${judgeUserMessage(prompt, labeled)}`;
+}
+
+/** sha256 of the first-attempt judge message for `items` labelled with `seed`, each fact's text from `textOf(factId)`. */
+export function judgeMessageSha(prompt, items, seed, textOf) {
+  return sha256(judgeMessage(prompt, labelItems(items.map((it) => ({ ...it, text: textOf(it.factId) })), seed)));
+}
+
+/** What a retry appends to the first message (inject-judge.mjs judgeCall). */
+export const JUDGE_RETRY_MARK = '\n\nYour previous answer was invalid (';
+
+/** sha256 of the first attempt behind each recorded judge message — a retry is the first message plus a note. */
+export function firstAttemptShas(messages) {
+  return new Set(messages.map((m) => {
+    const i = m.indexOf(JUDGE_RETRY_MARK);
+    return sha256(i > -1 ? m.slice(0, i) : m);
+  }));
+}
+
+/** Seeds a judgment row can have been labelled with: the re-judge seed, or the main seed at any item count up to `maxItems`. */
+export function judgeSeedCandidates(row, maxItems) {
+  return row.pass === 'rejudge' ? [`${row.qid}:rejudge`] : Array.from({ length: maxItems + 1 }, (_, k) => `${row.qid}:main:${k}`);
+}
+
+/**
+ * Binding of a judgment row recorded before rows carried one: the seed whose message, rebuilt from
+ * the current texts, is one the judge actually received (`received`: firstAttemptShas of the call
+ * transcripts) — or null when none is.
+ */
+export function legacyBinding(row, prompt, textOf, received, maxItems) {
+  for (const seed of judgeSeedCandidates(row, maxItems)) {
+    const message = judgeMessageSha(prompt, row.items, seed, textOf);
+    if (received.has(message)) return { seed, message };
+  }
+  return null;
+}
+
 /**
  * Accept a judge reply only when it is a JSON array whose ids are exactly the
  * labels sent (no missing, extra or repeated id) and every score is 0, 1 or 2.
@@ -515,23 +557,120 @@ export function determinismBound(det, lineSha) {
     && Object.keys(lineSha).every((v) => det.variants?.[v]?.a === lineSha[v] && det.variants?.[v]?.b === lineSha[v]);
 }
 
-/**
- * Files whose bytes decide the replayed lines — recorded by --replay, compared by --report (a report on
- * lines made by other code would carry the wrong code version). Paths relative to the repository.
- */
-export const REPLAY_CODE_FILES = [
-  'bench/inject-replay.mjs', 'bench/inject-bench-lib.mjs',
-  'dist/inject-select.js', 'dist/project-family.js', 'dist/fact-db.js', 'dist/ontology-db.js', 'dist/embeddings.js', 'dist/db.js',
-];
+/** The replay's entry file: the code that decides the replayed lines is every module it loads (moduleClosure). */
+export const REPLAY_ENTRY = 'bench/inject-replay.mjs';
+const SPEC_RES = [/\bfrom\s*['"]([^'"\n]+)['"]/g, /\bimport\s*['"]([^'"\n]+)['"]/g, /\bimport\(\s*['"]([^'"\n]+)['"]\s*\)/g];
+const DIST_RE = /\bdist\(\s*['"]([^'"\n]+)['"]\s*\)/g;   // the bench scripts' helper naming a dist module
+// Loads the walk cannot follow (a computed dynamic import, CommonJS require) — the list would miss them.
+const OPAQUE_RE = /\bimport\(\s*(?!['"]|dist\()|\brequire\(/;
+const isBuiltin = (spec) => spec.startsWith('node:') || builtinModules.includes(spec);
+const packageName = (spec) => (spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0]);
+// An npm package name — a quoted phrase after 'from' in prose ('from "name: description"') is not an import.
+const PACKAGE_RE = /^(@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+const sha256File = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
-/** sha256 of each REPLAY_CODE_FILES entry under `repo`. */
-export function codeDigest(repo) {
-  return Object.fromEntries(REPLAY_CODE_FILES.map((f) => [f, crypto.createHash('sha256').update(fs.readFileSync(path.join(repo, f))).digest('hex')]));
+/**
+ * Every repository file `entry` loads — static imports, dynamic imports of a literal and the
+ * bench's dist helper — followed transitively (repo-relative paths, sorted), and the bare packages
+ * they import. A relative import that names no file, or a load the walk cannot follow, throws: the
+ * list would silently miss what it loads.
+ */
+export function moduleClosure(repo, entry = REPLAY_ENTRY) {
+  const files = new Set();
+  const packages = new Set();
+  const queue = [entry];
+  while (queue.length) {
+    const rel = queue.shift();
+    if (files.has(rel)) continue;
+    const abs = path.join(repo, rel);
+    if (fs.statSync(abs, { throwIfNoEntry: false })?.isFile() !== true) throw new Error(`moduleClosure: ${rel} is imported but is not a file`);
+    files.add(rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    const opaque = OPAQUE_RE.exec(src);
+    if (opaque) throw new Error(`moduleClosure: ${rel} loads code the walk cannot follow (${JSON.stringify(src.slice(opaque.index, opaque.index + 30))})`);
+    for (const re of SPEC_RES) {
+      for (const m of src.matchAll(re)) {
+        const spec = m[1];
+        if (spec.startsWith('.')) queue.push(path.relative(repo, path.resolve(path.dirname(abs), spec)));
+        else if (!isBuiltin(spec) && PACKAGE_RE.test(packageName(spec))) packages.add(packageName(spec));
+      }
+    }
+    for (const m of src.matchAll(DIST_RE)) queue.push(path.join('dist', m[1]));
+  }
+  return { files: [...files].sort(), packages: [...packages].sort() };
 }
 
-/** Code files whose digest now differs from what the replay recorded. */
+/** Files of the embedding model `model` the transformers package loads (its local models folder or its download cache). */
+export function embeddingModelFiles(repo, model) {
+  const pkg = path.join(repo, 'node_modules', '@xenova', 'transformers');
+  const out = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) out.push(path.relative(repo, p));
+    }
+  };
+  for (const base of ['models', '.cache']) {
+    const dir = path.join(pkg, base, model);
+    if (fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) walk(dir);
+  }
+  return out.sort();
+}
+
+/**
+ * What decides the replayed lines besides the inputs — recorded by --replay, compared by --report:
+ * sha256 of every module the replay loads, the installed version of every package they import, the
+ * embedding model id (`model`, the resolved EMBEDDING_MODEL) and sha256 of its files.
+ */
+export function codeDigest(repo, model) {
+  const { files, packages } = moduleClosure(repo);
+  const out = {};
+  for (const f of files) out[f] = sha256File(path.join(repo, f));
+  for (const name of packages) {
+    let version = 'missing';
+    try { version = JSON.parse(fs.readFileSync(path.join(repo, 'node_modules', name, 'package.json'), 'utf8')).version ?? 'no version'; } catch { /* recorded as missing */ }
+    out[`package:${name}`] = version;
+  }
+  out['embedding-model'] = model;
+  const modelFiles = embeddingModelFiles(repo, model);
+  if (modelFiles.length === 0) out['embedding-model-files'] = 'none on disk';
+  for (const f of modelFiles) out[f] = sha256File(path.join(repo, f));
+  return out;
+}
+
+/** Entries (modules, packages, model files) that differ between the recorded digest and the one now — either side missing counts. */
 export function driftedCode(recorded, now) {
-  return Object.keys(now).filter((f) => recorded?.[f] !== now[f]);
+  return [...new Set([...Object.keys(recorded ?? {}), ...Object.keys(now)])].filter((f) => recorded?.[f] !== now[f]).sort();
+}
+
+/** HEAD and whether src/, bench/ or dist/ hold uncommitted changes — both null without git. */
+export function gitState(repo) {
+  const run = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  try {
+    return { git: run('rev-parse', 'HEAD'), dirty: run('status', '--porcelain', '--', 'src', 'bench', 'dist') !== '' };
+  } catch {
+    return { git: null, dirty: null };
+  }
+}
+
+/** What one replay is bound to: the input bytes (sample, snapshot with its WAL) and the code (codeDigest + git state). */
+export function replayBinding(repo, out, model) {
+  return {
+    inputs: { sample: sha256File(path.join(out, 'sample.json')), snapshot: sqliteDigest(path.join(out, 'snapshot.sqlite')) },
+    code: { ...gitState(repo), files: codeDigest(repo, model) },
+  };
+}
+
+/** What changed between two bindings (inputs and code entries) — a replay whose inputs or code changed while it ran is not bound to either. */
+export function bindingDrift(a, b) {
+  return [...driftedInputs(a.inputs, b.inputs), ...driftedCode(a.code.files, b.code.files)];
+}
+
+/** Records the family roots of `project` once, as resolved now (a copy, in the resolver's order), and returns them. */
+export function recordRoots(rootsOf, project, resolve) {
+  if (!Object.hasOwn(rootsOf, project)) rootsOf[project] = [...resolve(project)];
+  return rootsOf[project];
 }
 
 /** sha256 of a SQLite file together with its WAL (uncheckpointed pages are read by the replay too). */
@@ -551,7 +690,7 @@ export function placementOf(project, roots) {
   if (!roots.length) return 'no-family';
   const repo = roots[roots.length - 1];
   if (roots.length > 1) return roots[0].startsWith(repo + '/') ? 'worktree-inside' : 'worktree-outside';
-  return ['/.auto-issue-worktrees/', '/.claude/worktrees/'].some((c) => project.startsWith(repo + c)) ? 'worktree-inside' : 'repo-folder';
+  return WORKTREE_CONTAINERS.some((c) => project.startsWith(repo + c)) ? 'worktree-inside' : 'repo-folder';
 }
 
 /** Ids of the project facts the family adds for `project`: in the family, not the exact path (none without roots). */

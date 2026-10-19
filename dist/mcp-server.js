@@ -52019,7 +52019,7 @@ async function queryBaseline(queryEmbedding) {
 import fs3 from "fs";
 import os2 from "os";
 import path3 from "path";
-var WORKTREE_CONTAINERS = ["/.auto-issue-worktrees/", "/.claude/worktrees/"];
+var WORKTREE_CONTAINERS = Object.freeze(["/.auto-issue-worktrees/", "/.claude/worktrees/"]);
 var CACHE_LIMIT = 256;
 var CACHE_TTL_MS = 6e4;
 var cache = /* @__PURE__ */ new Map();
@@ -52108,18 +52108,22 @@ function resolveUncached(cwd) {
       const i = start.indexOf(marker);
       if (i > 0) {
         const root = start.slice(0, i);
-        return !tooBroad(root) && isRepoRoot(root) ? [root] : [];
+        return !tooBroad(root) && isRepoRoot(root) && !excludedUnderRoot(root, start, [root]) ? [root] : [];
       }
     }
     return [];
   }
+  let viaLink = false;
   for (let dir = start; ; dir = path3.dirname(dir)) {
+    const st = dir === start ? own2 : lstat(dir);
+    if (st === UNREADABLE) return [];
     const g = dotGitOf(dir);
     if (g.kind !== "none") {
-      if (g.kind === "invalid" || tooBroad(dir)) return [];
+      if (viaLink || g.kind === "invalid" || tooBroad(dir)) return [];
       if (g.kind === "root") return [dir];
       return g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
     }
+    if (st !== null && st.isSymbolicLink()) viaLink = true;
     if (dir === path3.dirname(dir)) return [];
   }
 }
@@ -52146,6 +52150,7 @@ function excludedUnderRoot(root, scopeProject, roots) {
     const st = lstat(dir);
     if (st === UNREADABLE) return true;
     if (!st) return !deletedWorktreeOf(root, scopeProject, dir);
+    if (st.isSymbolicLink()) return true;
     const g = dotGitOf(dir);
     if (g.kind === "none") continue;
     if (g.kind === "linked" && g.main !== null && roots.includes(g.main)) continue;
@@ -52451,7 +52456,7 @@ function getFactsByCategory(db, categoryId) {
   ).all(categoryId).map(rowToFact2);
 }
 function getRelatedFacts(db, factId, hops = 1, decay = 0.6, minRelevance = 0.2, scopeProject, opts = {}) {
-  const inScope = scopeMatcher(scopeProject ?? null, opts.scopeFamily === true);
+  const inScope = scopeMatcher(scopeProject ? canonicalizeProject(db, scopeProject) : null, opts.scopeFamily === true);
   const visited = /* @__PURE__ */ new Set([factId]);
   const results = [];
   let frontier = [factId];

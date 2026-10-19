@@ -12,7 +12,7 @@ import { resolveRepoRoots, scopeMatcher, clearRepoRootCache } from '../src/proje
 
 let tmp: string;
 let R: string;   // main repo (memory-bank)
-let S: string;   // sibling whose name extends R's (memory-bank-cloud)
+let S: string;   // sibling whose name extends R's (memory-bank-extra)
 let W: string;   // linked worktree inside R
 let E: string;   // linked worktree outside R
 
@@ -34,7 +34,7 @@ function linkWorktree(worktreeTop: string, repo: string, name: string, backRef =
 beforeAll(() => {
   tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mb-family-')));
   R = path.join(tmp, 'proj', 'memory-bank');
-  S = path.join(tmp, 'proj', 'memory-bank-cloud');
+  S = path.join(tmp, 'proj', 'memory-bank-extra');
   makeRepo(R);
   fs.mkdirSync(path.join(R, 'docs', 'deep'), { recursive: true });
   fs.mkdirSync(path.join(R, 'src'), { recursive: true });
@@ -115,6 +115,43 @@ describe('resolveRepoRoots', () => {
     fs.symlinkSync(S, lnk);
     expect(resolveRepoRoots(lnk)).toEqual([]);
     expect(resolveRepoRoots(path.join(R, '.claude', 'worktrees', 'really-gone')), 'positive control: a missing worktree folder').toEqual([R]);
+  });
+
+  it('a deleted cwd inside a LIVE worktree has no family — the rule facts follow (a deleted clone could have been another repository)', () => {
+    const live = path.join(R, '.claude', 'worktrees', 'live-cwd');
+    linkWorktree(live, R, 'live-cwd');
+    expect(resolveRepoRoots(path.join(live, 'gone-clone', 'x'))).toEqual([]);
+    expect(resolveRepoRoots(path.join(R, '.claude', 'worktrees', 'gone-too', 'x')), 'positive control: the worktree folder itself is gone').toEqual([R]);
+    expect(resolveRepoRoots(live), 'positive control: the live worktree').toEqual([live, R]);
+  });
+
+  it('a cwd that reaches its repository through a symbolic link has no family; a link to the root itself is that root', () => {
+    fs.mkdirSync(path.join(S, 'sub', 'x'), { recursive: true });
+    const via = path.join(R, 'linked-sub');
+    fs.symlinkSync(path.join(S, 'sub'), via);
+    expect(resolveRepoRoots(path.join(via, 'x')), 'R/linked-sub/x is a folder of S — R is only where the link sits').toEqual([]);
+    const toRoot = path.join(tmp, 'link-to-root');
+    fs.symlinkSync(R, toRoot);
+    expect(resolveRepoRoots(path.join(toRoot, 'docs'))).toEqual([toRoot]);
+  });
+
+  it('a cwd that is a file has no family', () => {
+    const file = path.join(R, 'docs', 'notes.txt');
+    fs.writeFileSync(file, 'x');
+    expect(resolveRepoRoots(file)).toEqual([]);
+    expect(resolveRepoRoots(path.join(R, 'docs')), 'positive control: its folder').toEqual([R]);
+  });
+
+  it('a HEAD that is a FIFO is no git HEAD (never a repository)', (ctx) => {
+    const Q = path.join(tmp, 'fifo-head');
+    fs.mkdirSync(path.join(Q, '.git'), { recursive: true });
+    fs.mkdirSync(path.join(Q, 'p'), { recursive: true });
+    if (spawnSync('mkfifo', [path.join(Q, '.git', 'HEAD')]).status !== 0) ctx.skip();
+    expect(resolveRepoRoots(path.join(Q, 'p'))).toEqual([]);
+    fs.rmSync(path.join(Q, '.git', 'HEAD'));
+    fs.writeFileSync(path.join(Q, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    clearRepoRootCache();
+    expect(resolveRepoRoots(path.join(Q, 'p')), 'positive control: a regular HEAD').toEqual([Q]);
   });
 
   it('HEAD may be a symbolic link (core.preferSymlinkRefs) but never a folder', () => {
@@ -282,6 +319,16 @@ describe('scopeMatcher', () => {
     expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(R, 'tmp', 'gone-clone', '.claude', 'worktrees', 'w')), 'not the root\'s own container').toBe(false);
   });
 
+  it('a fact path through a symbolic link under the root is left out (the link can point into another repository)', () => {
+    fs.mkdirSync(path.join(S, 'pkg', 'deep'), { recursive: true });
+    const lnk = path.join(R, 'vendor-link');
+    fs.symlinkSync(path.join(S, 'pkg'), lnk);
+    const m = scopeMatcher(path.join(R, 'docs'), true);
+    expect(m(lnk)).toBe(false);
+    expect(m(path.join(lnk, 'deep'))).toBe(false);
+    expect(m(path.join(R, 'docs', 'deep')), 'positive control: a real folder').toBe(true);
+  });
+
   it('a folder that cannot be read is never read as absent (fail closed)', (ctx) => {
     if (process.getuid?.() === 0) ctx.skip();   // root reads through permissions
     const Q = path.join(tmp, 'locked-repo');
@@ -308,7 +355,7 @@ describe('scopeMatcher', () => {
     fs.mkdirSync(path.join(tmp, 'proj', 'plain-outside'), { recursive: true });
     const m = scopeMatcher(R, true);
     expect(m(`${R}/../plain-outside`), 'climbs out of R into a folder that is no repository').toBe(false);
-    expect(m(`${R}/../memory-bank-cloud`)).toBe(false);
+    expect(m(`${R}/../memory-bank-extra`)).toBe(false);
     expect(m(`${R}/./docs`)).toBe(false);
   });
 

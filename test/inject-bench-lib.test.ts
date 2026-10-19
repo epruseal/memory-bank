@@ -10,8 +10,12 @@ import {
   isBypassFact, kwLines, leakProbes, lostJ2Rel, makeAsOf, meanDelta, parseDecisionsBlock, perPromptCounts, aggregate,
   ratioDelta, searchedLogRows, splitOf, toEpoch, validateJudgeReply, validity, labelItems, leakFold, blockDiffers,
   buildFactIndex, repoOf, unboundMeta, driftedInputs, missingRows, determinismEntry, determinismBound, affectedReadings, PROJECT_FACTS_SQL,
-  placementOf, widenedFactIds, sqliteDigest, driftedCode, codeDigest, REPLAY_CODE_FILES,
+  placementOf, widenedFactIds, sqliteDigest, driftedCode, codeDigest, REPLAY_ENTRY, moduleClosure, embeddingModelFiles,
+  gitState, replayBinding, bindingDrift, recordRoots, JUDGE_SYSTEM, JUDGE_RETRY_MARK, judgeMessage, judgeUserMessage,
+  judgeMessageSha, firstAttemptShas, judgeSeedCandidates, legacyBinding,
 } from '../bench/inject-bench-lib.mjs';
+import { execFileSync } from 'child_process';
+import crypto from 'crypto';
 
 /**
  * Pure rules of the injection replay bench (plan 2026-10-19). These decide the
@@ -292,7 +296,12 @@ describe('decision', () => {
     expect(judge, 'grouped by repository (replay-time roots), not by worktree').toContain('const repoOfQ = (q) => repoOf(rootsOfQ(q), projectOf.get(q));');
     expect(judge, 'roots as resolved at replay time, never the disk at report time').toContain('const rootsOfQ = (q) => meta.roots[projectOf.get(q)];');
     expect(judge).not.toContain('resolveRepoRoots');
-    expect(replay).toContain('widenedOf.set(project, widenedFactIds(projectFacts, project, scopeMatcher(project, true), rootsOf[project].length > 0));');
+    expect(replay).toContain('const roots = recordRoots(rootsOf, project, resolveRepoRoots);\n      widenedOf.set(project, widenedFactIds(projectFacts, project, scopeMatcher(project, true), roots.length > 0));');
+    expect(replay, 'bound before the sample is read').toMatch(/const bound = replayBinding\(REPO, OUT, EMBEDDING_MODEL\);\n  const sample = JSON\.parse/);
+    expect(replay, 'and checked again at the end').toContain('const drift = bindingDrift(bound, replayBinding(REPO, OUT, EMBEDDING_MODEL));\n  if (drift.length) fail(');
+    expect(replay).toContain('const { inputs, code } = bound;');
+    expect(judge, 'the report compares the whole code digest').toContain('const codeChanged = driftedCode(meta.code?.files, codeDigest(REPO, EMBEDDING_MODEL));');
+    expect(judge, 'every scored judgment row is bound').toContain('if (judgeMessageSha(promptOf.get(j.qid), j.items, b.seed, textOf) !== b.message) { binding.drifted++; continue; }');
     expect(replay).toContain('const reading = affectedReadings(widened(p.project), asOf.visibleFactId);');
     expect(replay).toContain('if (reading.registered) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
     expect(replay).toContain('const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();');
@@ -322,6 +331,8 @@ describe('decision', () => {
     expect(placementOf('/r/.claude/worktrees/w', ['/r/.claude/worktrees/w', '/r'])).toBe('worktree-inside');
     expect(placementOf('/r/.auto-issue-worktrees/gone/src', ['/r']), 'a deleted worktree inside the repository').toBe('worktree-inside');
     expect(placementOf('/u/.auto-issue-worktrees/ORG-r/issue-1', ['/u/.auto-issue-worktrees/ORG-r/issue-1', '/r'])).toBe('worktree-outside');
+    expect(placementOf('/r-x', ['/r-x', '/r']), 'a sibling whose name extends the repository is outside it').toBe('worktree-outside');
+    expect(placementOf('/r-x/.claude/worktrees/w', ['/r']), 'the container must be the repository\'s own').toBe('repo-folder');
     expect(placementOf('/x', [])).toBe('no-family');
     const facts = [{ id: 'a', scope_project: '/r' }, { id: 'b', scope_project: '/r/docs' }, { id: 'c', scope_project: '/other' }];
     const inFamily = (s: string | null) => s === '/r' || (s ?? '').startsWith('/r/');
@@ -337,13 +348,144 @@ describe('decision', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+  it('moduleClosure follows every load of the replay (static, literal import(), the dist helper) and refuses what it cannot follow', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-closure-'));
+    const put = (rel: string, body: string) => { fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true }); fs.writeFileSync(path.join(dir, rel), body); };
+    try {
+      put(REPLAY_ENTRY, "import a from './lib.mjs';\nimport fs from 'node:fs';\nimport os from 'os';\nimport Db from 'better-sqlite3';\nconst m = await import(dist('mod.js'));\nawait import('./dyn.mjs');\n");
+      put('bench/lib.mjs', "export * from '../dist/dep.js';\n// prose: the value comes from \"name: description\" in passage mode\n");
+      put('bench/dyn.mjs', 'export const x = 1;\n');
+      put('dist/mod.js', "import { y } from './dep.js';\nimport '@scope/pkg/sub';\n");
+      put('dist/dep.js', 'export const y = 2;\n');
+      put('dist/unused.js', 'export const z = 3;\n');
+      expect(moduleClosure(dir)).toEqual({
+        files: ['bench/dyn.mjs', REPLAY_ENTRY, 'bench/lib.mjs', 'dist/dep.js', 'dist/mod.js'].sort(),
+        packages: ['@scope/pkg', 'better-sqlite3'],
+      });
+      put('dist/dep.js', "export const y = 2;\nconst k = await import(name);\n");
+      expect(() => moduleClosure(dir), 'a computed import').toThrow(/cannot follow/);
+      put('dist/dep.js', "const r = require('x');\n");
+      expect(() => moduleClosure(dir), 'a CommonJS require').toThrow(/cannot follow/);
+      put('dist/dep.js', "import './gone.js';\n");
+      expect(() => moduleClosure(dir), 'a relative import naming no file').toThrow(/dist\/gone\.js is imported but is not a file/);
+      put('dist/dep.js', 'export const y = 2;\n');
+      // the digest: modules, package versions, the model id and its files — any entry changing (or vanishing) is drift
+      put('node_modules/better-sqlite3/package.json', '{"version":"1.2.3"}');
+      const before = codeDigest(dir, 'Org/model');
+      expect(before['package:better-sqlite3']).toBe('1.2.3');
+      expect(before['package:@scope/pkg'], 'a package that is not installed').toBe('missing');
+      expect(before['embedding-model']).toBe('Org/model');
+      expect(before['embedding-model-files']).toBe('none on disk');
+      const weights = 'node_modules/@xenova/transformers/.cache/Org/model/onnx/model_quantized.onnx';
+      put(weights, 'w1');
+      expect(embeddingModelFiles(dir, 'Org/model')).toEqual([weights]);
+      const withModel = codeDigest(dir, 'Org/model');
+      expect(driftedCode(before, withModel)).toEqual(['embedding-model-files', weights].sort());
+      put(weights, 'w2');
+      expect(driftedCode(withModel, codeDigest(dir, 'Org/model')), 'other weights').toEqual([weights]);
+      expect(driftedCode(withModel, codeDigest(dir, 'Org/other')), 'another model').toContain('embedding-model');
+      put('dist/dep.js', 'export const y = 3;\n');
+      expect(driftedCode(withModel, codeDigest(dir, 'Org/model'))).toContain('dist/dep.js');
+      put('node_modules/better-sqlite3/package.json', '{"version":"1.2.4"}');
+      expect(driftedCode(withModel, codeDigest(dir, 'Org/model'))).toContain('package:better-sqlite3');
+      const { 'dist/dep.js': _gone, ...withoutDep } = withModel;
+      expect(driftedCode(withModel, withoutDep), 'an entry the replay recorded that is gone now').toEqual(['dist/dep.js']);
+      expect(driftedCode(withoutDep, withModel), 'an entry the replay never recorded').toEqual(['dist/dep.js']);
+      expect(driftedCode(undefined, { a: 'x' })).toEqual(['a']);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    // The real replay: the modules that decide its lines — selection, scope, text cap, model id, canonical project — are all in it.
     const repo = fileURLToPath(new URL('..', import.meta.url));
-    const now = codeDigest(repo);
-    expect(Object.keys(now)).toEqual(REPLAY_CODE_FILES);
-    expect(REPLAY_CODE_FILES, 'the replay\'s own code and the selection it runs').toEqual(expect.arrayContaining(['bench/inject-replay.mjs', 'dist/inject-select.js', 'dist/project-family.js', 'dist/ontology-db.js']));
-    expect(driftedCode(now, now)).toEqual([]);
-    expect(driftedCode({ ...now, 'dist/db.js': 'x' }, now)).toEqual(['dist/db.js']);
-    expect(driftedCode(undefined, now)).toEqual(REPLAY_CODE_FILES);
+    const real = moduleClosure(repo);
+    expect(real.files).toEqual(expect.arrayContaining(['bench/inject-replay.mjs', 'bench/inject-bench-lib.mjs', 'dist/inject-select.js', 'dist/project-family.js',
+      'dist/fact-db.js', 'dist/ontology-db.js', 'dist/embeddings.js', 'dist/db.js', 'dist/fact-text.js', 'dist/embedding-version.js', 'dist/project-canon.js']));
+    expect(real.packages).toEqual(expect.arrayContaining(['@xenova/transformers', 'better-sqlite3', 'sqlite-vec']));
+  });
+  it('gitState: HEAD and whether src/bench/dist are dirty (a temporary repository)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-git-'));
+    const git = (...a: string[]) => execFileSync('git', ['-C', dir, ...a], { stdio: 'ignore' });
+    try {
+      expect(gitState(dir), 'no repository').toEqual({ git: null, dirty: null });
+      git('init', '-q');
+      fs.mkdirSync(path.join(dir, 'src'));
+      fs.writeFileSync(path.join(dir, 'src', 'a.ts'), 'a');
+      fs.writeFileSync(path.join(dir, 'notes.md'), 'n');
+      git('add', '.');
+      git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-qm', 'c');
+      const head = execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      expect(gitState(dir)).toEqual({ git: head, dirty: false });
+      fs.writeFileSync(path.join(dir, 'notes.md'), 'changed');
+      expect(gitState(dir).dirty, 'outside src/bench/dist').toBe(false);
+      fs.writeFileSync(path.join(dir, 'src', 'a.ts'), 'changed');
+      expect(gitState(dir)).toEqual({ git: head, dirty: true });
+      fs.writeFileSync(path.join(dir, 'src', 'a.ts'), 'a');
+      fs.mkdirSync(path.join(dir, 'bench'));
+      fs.writeFileSync(path.join(dir, 'bench', 'new.mjs'), 'untracked');
+      expect(gitState(dir).dirty, 'an untracked bench file').toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('replayBinding / bindingDrift / recordRoots: what the replay records is what it read, roots in the resolver\'s order', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-bind-'));
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-bind-repo-'));
+    try {
+      fs.mkdirSync(path.join(repo, 'bench'));
+      fs.writeFileSync(path.join(repo, REPLAY_ENTRY), 'export const x = 1;\n');
+      fs.writeFileSync(path.join(dir, 'sample.json'), '[]');
+      fs.writeFileSync(path.join(dir, 'snapshot.sqlite'), 'db');
+      const a = replayBinding(repo, dir, 'Org/model');
+      expect(bindingDrift(a, replayBinding(repo, dir, 'Org/model'))).toEqual([]);
+      fs.writeFileSync(path.join(dir, 'sample.json'), '[1]');
+      expect(bindingDrift(a, replayBinding(repo, dir, 'Org/model'))).toEqual(['sample']);
+      fs.writeFileSync(path.join(dir, 'sample.json'), '[]');
+      fs.writeFileSync(path.join(dir, 'snapshot.sqlite-wal'), 'pages');
+      expect(bindingDrift(a, replayBinding(repo, dir, 'Org/model'))).toEqual(['snapshot']);
+      fs.rmSync(path.join(dir, 'snapshot.sqlite-wal'));
+      fs.writeFileSync(path.join(repo, REPLAY_ENTRY), 'export const x = 2;\n');
+      expect(bindingDrift(a, replayBinding(repo, dir, 'Org/model'))).toEqual([REPLAY_ENTRY]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+    const rootsOf: Record<string, string[]> = {};
+    const resolved = ['/r/.claude/worktrees/w', '/r'];
+    let calls = 0;
+    const resolve = () => { calls++; return resolved; };
+    expect(recordRoots(rootsOf, '/r/.claude/worktrees/w', resolve)).toEqual(['/r/.claude/worktrees/w', '/r']);
+    resolved.reverse();
+    expect(rootsOf['/r/.claude/worktrees/w'], 'a copy, in the order resolved').toEqual(['/r/.claude/worktrees/w', '/r']);
+    recordRoots(rootsOf, '/r/.claude/worktrees/w', resolve);
+    expect(calls, 'resolved once per cwd').toBe(1);
+    expect(recordRoots(rootsOf, 'constructor', () => [])).toEqual([]);
+  });
+  it('judge binding: the message is the system text + user message; any text, seed or prompt change is another message', () => {
+    const prompt = { project: '/p', query: 'Which tool runs migrations?' };
+    const items = [{ factId: 'a', kind: 'line' }, { factId: 'b', kind: 'line' }, { factId: 'c', kind: 'control_same' }];
+    const texts: Record<string, string> = { a: '[decision] Flyway runs migrations', b: '[note] lunch is stew', c: '[note] plants on Monday' };
+    const textOf = (id: string) => texts[id];
+    const labeled = labelItems(items.map((it) => ({ ...it, text: textOf(it.factId) })), 'q:main:0');
+    expect(judgeMessage(prompt, labeled)).toBe(`${JUDGE_SYSTEM}\n\n${judgeUserMessage(prompt, labeled)}`);
+    const sha = (t: string) => crypto.createHash('sha256').update(t).digest('hex');
+    const m0 = judgeMessageSha(prompt, items, 'q:main:0', textOf);
+    expect(m0).toBe(sha(judgeMessage(prompt, labeled)));
+    expect(judgeMessageSha(prompt, items, 'q:main:3', textOf), 'another seed labels the notes in another order').not.toBe(m0);
+    expect(judgeMessageSha({ ...prompt, query: 'Which tool?' }, items, 'q:main:0', textOf)).not.toBe(m0);
+    expect(judgeMessageSha({ ...prompt, project: '/other' }, items, 'q:main:0', textOf)).not.toBe(m0);
+    expect(judgeMessageSha(prompt, items, 'q:main:0', (id) => (id === 'b' ? '[note] lunch is soup' : textOf(id))), 'one fact text').not.toBe(m0);
+    // what the judge received: the first attempt, or a retry (first message + a note)
+    const sent = judgeMessage(prompt, labeled);
+    expect(firstAttemptShas([sent])).toEqual(new Set([m0]));
+    expect(firstAttemptShas([`${sent}${JUDGE_RETRY_MARK}missing id f2). Answer again`])).toEqual(new Set([m0]));
+    expect(judgeSeedCandidates({ qid: 'q', pass: 'rejudge' }, 9)).toEqual(['q:rejudge']);
+    expect(judgeSeedCandidates({ qid: 'q', pass: 'main' }, 2)).toEqual(['q:main:0', 'q:main:1', 'q:main:2']);
+    const later = labelItems(items.map((it) => ({ ...it, text: textOf(it.factId) })), 'q:main:2');
+    const received = firstAttemptShas(['an unrelated worker prompt', judgeMessage(prompt, later)]);
+    expect(legacyBinding({ qid: 'q', pass: 'main', items }, prompt, textOf, received, 5)).toEqual({ seed: 'q:main:2', message: sha(judgeMessage(prompt, later)) });
+    expect(legacyBinding({ qid: 'q', pass: 'main', items }, prompt, textOf, received, 1), 'the seed is past the candidates').toBeNull();
+    expect(legacyBinding({ qid: 'q', pass: 'main', items }, prompt, (id) => (id === 'a' ? '[decision] Liquibase' : textOf(id)), received, 5), 'the text judged differs').toBeNull();
   });
   it('repoOf groups a linked worktree with its repository; unboundMeta names variants whose meta hash differs', () => {
     expect(repoOf(['/r/.wt/a', '/r'], '/r/.wt/a/src')).toBe('/r');

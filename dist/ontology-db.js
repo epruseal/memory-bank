@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { getVecQuant, embeddingToVecBlob, vecParamSql, normalizeVecDistance } from './db.js';
 import { ontologyNameRejectReason } from './fact-validity.js';
 import { scopeMatcher } from './project-family.js';
+import { canonicalizeProject } from './project-canon.js';
 // === Domain CRUD ===
 export function createDomain(db, name, description) {
     const rejectReason = ontologyNameRejectReason(name);
@@ -198,7 +199,9 @@ export function createRelation(db, sourceFactId, relationType, targetFactId, rea
  *                       Pass null/undefined to allow cross-project traversal (e.g., explore_graph).
  */
 export function getRelatedFacts(db, factId, hops = 1, decay = 0.6, minRelevance = 0.2, scopeProject, opts = {}) {
-    const inScope = scopeMatcher(scopeProject ?? null, opts.scopeFamily === true);
+    // The same canonical project the KNN scope filter uses (searchSimilarFacts): a slug-form project
+    // resolves to its path, so both paths of one injection see the same scope.
+    const inScope = scopeMatcher(scopeProject ? canonicalizeProject(db, scopeProject) : null, opts.scopeFamily === true);
     const visited = new Set([factId]);
     const results = [];
     let frontier = [factId];

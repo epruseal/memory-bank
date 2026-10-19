@@ -233,6 +233,19 @@ describe('selectInjectFacts', () => {
     expect(prod.lines.map((l) => l.fact.id), 'production options take the family relation path').toEqual(sOn.lines.map((l) => l.fact.id));
   }, 60_000);
 
+  it('a slug-form project resolves to the same path on the relation path as on the KNN (both canonicalized)', async () => {
+    await add('slugseed', 'Grafana dashboards for this service live in the ops folder as JSON');
+    await add('slugrel', 'Dashboard JSON files are exported with the share-externally option off', { scope: REPO });
+    onto.createRelation(db, ids.slugseed, 'SUPPORTS', ids.slugrel);
+    const slug = REPO.replace(/[/._]/g, '-');
+    db.prepare(`INSERT INTO exchanges (id, project, timestamp, user_message, assistant_message, archive_path, line_start, line_end, cwd)
+      VALUES ('slug-ex', ?, '2026-10-19T00:00:00Z', 'u', 'a', '/x', 1, 2, ?)`).run(slug, REPO);
+    const related = (project: string) => new Set(onto.getRelatedFacts(db, ids.slugseed, 1, 0.6, 0.2, project, { scopeFamily: false }).map((r) => r.fact.id));
+    expect(related(REPO).has(ids.slugrel), 'positive control: the path itself').toBe(true);
+    expect(related(slug).has(ids.slugrel), 'the slug of REPO is REPO').toBe(true);
+    expect(related(PROJECT).has(ids.slugrel), 'exact match: REPO/docs is not REPO').toBe(false);
+  }, 30_000);
+
   it('visibleFactId hides a fact from the KNN and from relation expansion (replay as-of)', async () => {
     const { e, baseline } = await queryVec(QUERY);
     const hidden = new Set([ids.seed]);
@@ -256,6 +269,20 @@ describe('selectInjectFacts', () => {
     expect(decided.verdict).toBe('valid');
     expect({ ...sel.PRODUCTION_SELECT_OPTIONS }).toEqual(decided.production);
     expect(Object.isFrozen(sel.PRODUCTION_SELECT_OPTIONS)).toBe(true);
+  });
+
+  // The decisions block is the report's: where the report that wrote the doc is on disk (.bench-out/ is not committed),
+  // its bytes are the ones the doc names and its decisions are the block. Skipped (visibly) without the bench output.
+  const reportFile = path.resolve(__dirname, '..', '.bench-out', 'inject-replay', 'report.json');
+  it.skipIf(!fs.existsSync(reportFile))('the committed decisions block is the one in the report.json the doc names', async () => {
+    const { parseDecisionsBlock } = await import('../bench/inject-bench-lib.mjs');
+    const crypto = await import('crypto');
+    const doc = fs.readFileSync(path.resolve(__dirname, '..', 'docs', 'bench', '2026-10-19-inject-replay.md'), 'utf8');
+    const named = /sha256: `([0-9a-f]{64})`/.exec(doc)?.[1];
+    const bytes = fs.readFileSync(reportFile);
+    expect(named, 'the doc names its report').toBe(crypto.createHash('sha256').update(bytes).digest('hex'));
+    const report = JSON.parse(bytes.toString('utf8'));
+    expect(parseDecisionsBlock(doc)).toEqual({ verdict: report.decisions.verdict, production: report.decisions.production });
   });
 
   it('visibleFactId is applied before the overfetch cut: hidden rows cannot crowd out a visible match', async () => {

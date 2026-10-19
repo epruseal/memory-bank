@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import { getVecQuant, embeddingToVecBlob, vecParamSql, normalizeVecDistance } from './db.js';
 import { ontologyNameRejectReason } from './fact-validity.js';
 import { scopeMatcher } from './project-family.js';
+import { canonicalizeProject } from './project-canon.js';
 import type {
   OntologyDomain,
   OntologyCategory,
@@ -296,7 +297,9 @@ export function getRelatedFacts(
   scopeProject?: string | null,
   opts: RelatedFactsOptions = {},
 ): Array<{ fact: Fact; relation: OntologyRelation; relevance: number; hop: number }> {
-  const inScope = scopeMatcher(scopeProject ?? null, opts.scopeFamily === true);
+  // The same canonical project the KNN scope filter uses (searchSimilarFacts): a slug-form project
+  // resolves to its path, so both paths of one injection see the same scope.
+  const inScope = scopeMatcher(scopeProject ? canonicalizeProject(db, scopeProject) : null, opts.scopeFamily === true);
   const visited = new Set<string>([factId]);
   const results: Array<{ fact: Fact; relation: OntologyRelation; relevance: number; hop: number }> = [];
 

@@ -26,11 +26,15 @@ import path from 'path';
  * ancestor of one, or '/': a home directory that is itself a git work tree
  * would otherwise make every non-repo folder under it one family with every
  * project. Relative paths (slug-form projects) have no family, and neither has
- * a cwd whose last component is a symbolic link or a file. A path that cannot
- * be read (EACCES, EIO) counts as no family / outside it, never as absent.
+ * a cwd that is a symbolic link or a file, or that reaches its repository
+ * through a symbolic link (a link inside a repository can point into another
+ * one). A path that cannot be read (EACCES, EIO) counts as no family / outside
+ * it, never as absent. The worktrees of a bare repository (`<dir>/.bare/worktrees/…`)
+ * are not grouped: each one is its own family.
  */
 
-const WORKTREE_CONTAINERS = ['/.auto-issue-worktrees/', '/.claude/worktrees/'];
+/** Worktree containers of a repository root (`<root>/.claude/worktrees/<name>`) — the one list; the bench reads it too. */
+export const WORKTREE_CONTAINERS = Object.freeze(['/.auto-issue-worktrees/', '/.claude/worktrees/']);
 const CACHE_LIMIT = 256;
 /** A daemon outlives a folder: the same path can become another repository (or none). */
 const CACHE_TTL_MS = 60_000;
@@ -140,23 +144,31 @@ function resolveUncached(cwd: string): string[] {
   if (own === null) {
     // A deleted worktree (replayed history): its container names the repo — when the
     // folder in front of the container is itself a repository root (an umbrella folder
-    // holding worktrees of several repositories is not).
+    // holding worktrees of several repositories is not) and the path is a deleted worktree
+    // of it by the rule facts follow (excludedUnderRoot): what is gone is the container or a
+    // worktree folder directly in it, not a folder inside a live worktree (a deleted clone).
     for (const marker of WORKTREE_CONTAINERS) {
       const i = start.indexOf(marker);
       if (i > 0) {
         const root = start.slice(0, i);
-        return !tooBroad(root) && isRepoRoot(root) ? [root] : [];
+        return !tooBroad(root) && isRepoRoot(root) && !excludedUnderRoot(root, start, [root]) ? [root] : [];
       }
     }
     return [];
   }
+  // A link passed below the repository root: the repository found above it is the one the link
+  // sits in, not the one its target belongs to (a link to the root itself is the root).
+  let viaLink = false;
   for (let dir = start; ; dir = path.dirname(dir)) {
+    const st = dir === start ? own : lstat(dir);
+    if (st === UNREADABLE) return [];
     const g = dotGitOf(dir);
     if (g.kind !== 'none') {
-      if (g.kind === 'invalid' || tooBroad(dir)) return [];
+      if (viaLink || g.kind === 'invalid' || tooBroad(dir)) return [];
       if (g.kind === 'root') return [dir];
       return g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
     }
+    if (st !== null && st.isSymbolicLink()) viaLink = true;
     if (dir === path.dirname(dir)) return [];
   }
 }
@@ -196,7 +208,8 @@ function deletedWorktreeOf(root: string, scopeProject: string, missing: string):
 
 /**
  * Whether `scopeProject`, strictly under `root`, is left out of the family:
- * a folder on the way (or the path itself) has its own `.git` that is not a
+ * a folder on the way (or the path itself) is a symbolic link (it can point
+ * into another repository), or has its own `.git` that is not a
  * linked worktree of a family root (a separate clone, a submodule). A folder
  * that no longer exists ends the walk: the path stays in the family only under
  * a worktree container of the root (`<root>/.claude/worktrees/…`,
@@ -214,6 +227,7 @@ function excludedUnderRoot(root: string, scopeProject: string, roots: string[]):
     const st = lstat(dir);
     if (st === UNREADABLE) return true;   // cannot tell — fail closed
     if (!st) return !deletedWorktreeOf(root, scopeProject, dir);
+    if (st.isSymbolicLink()) return true;
     const g = dotGitOf(dir);
     if (g.kind === 'none') continue;
     if (g.kind === 'linked' && g.main !== null && roots.includes(g.main)) continue;
@@ -227,8 +241,8 @@ function excludedUnderRoot(root: string, scopeProject: string, roots: string[]):
  * The single predicate behind the KNN scope filter, the relation scope filter
  * and the replay bench. family=false (and family=true with no roots) is the
  * exact match the injection has always used; family=true matches a root or a
- * path under it — on a '/' boundary, so `memory-bank` never matches
- * `memory-bank-cloud`, never inside a repository nested under a root, and a
+ * path under it — on a '/' boundary, so `<repo>` never matches
+ * `<repo>-extra`, never inside a repository nested under a root, and a
  * deleted path only inside a worktree container of the root. A
  * path with '.' or '..' segments matches only exactly. A null project sees
  * every scope.
