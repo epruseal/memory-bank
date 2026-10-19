@@ -368,6 +368,31 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect((await report()).stderr).toMatch(/1 kept calls of rows no longer in judgments\.jsonl/);
   });
 
+  it('an interrupted append: a torn last line is cut before anything is appended after it, in both files', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    const before = fs.readFileSync(file, 'utf8');
+    fs.appendFileSync(file, '{"qid":"q3","pass":"main","mod');
+    const torn = await report();
+    expect(torn.status, torn.stderr).toBe(0);
+    expect(torn.report.judge.tornTail).toBe(1);
+    fs.appendFileSync(callsFile, '{"key":"abc","fi');
+    expect((await report()).stderr, 'a torn kept call is read as such').toMatch(/judge-calls\.jsonl: line 252 is not JSON — run --bind-legacy/);
+    const b = await bind();
+    expect(b.status, b.stdout + b.stderr).toBe(0);
+    expect(lastJson(b)).toMatchObject({ tornCut: 2 });
+    expect(fs.readFileSync(file, 'utf8'), 'the torn row is gone, nothing else').toBe(before);
+    const r = await report();
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.report.judge.tornTail).toBe(0);
+    // a complete last line that only lost its newline is kept, and gets one
+    const lines = before.split('\n').filter(Boolean);
+    fs.writeFileSync(file, lines.join('\n'));
+    const c = await bind();
+    expect(c.status, c.stdout + c.stderr).toBe(0);
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+  });
+
   it('a call with no transcript (the API-key path) binds by the call --judge kept for it', async () => {
     const file = path.join(out, 'judgments.jsonl');
     const line5 = fs.readFileSync(file, 'utf8').split('\n')[5];

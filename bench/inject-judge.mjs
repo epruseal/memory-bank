@@ -193,9 +193,39 @@ function loadJudgments() {
   return out;
 }
 
+/**
+ * Before anything is appended after it: an interrupted append's last line is cut (its call is redone; no call
+ * was kept for it — the call is kept only after its row), and a complete last line missing its newline gets one.
+ * Without this the next append would join the torn line and leave a broken line in the middle of the file.
+ */
+function closeTornTail(file) {
+  if (!fs.existsSync(file)) return 0;
+  const text = fs.readFileSync(file, 'utf8');
+  if (!text || text.endsWith('\n')) return 0;
+  const start = text.lastIndexOf('\n') + 1;
+  try {
+    JSON.parse(text.slice(start));
+    fs.appendFileSync(file, '\n');
+    return 0;
+  } catch {
+    fs.truncateSync(file, Buffer.byteLength(text.slice(0, start)));
+    return 1;
+  }
+}
+
+/** Kept judge calls (judge-calls.jsonl): every line JSON — a broken one stops the reader (--bind-legacy closes a torn tail first). */
+function readKept() {
+  if (!fs.existsSync(JUDGE_CALLS)) return [];
+  return fs.readFileSync(JUDGE_CALLS, 'utf8').split('\n').filter(Boolean).map((l, i) => {
+    try { return JSON.parse(l); } catch { return fail(`${JUDGE_CALLS}: line ${i + 1} is not JSON — run --bind-legacy (it cuts an interrupted last line)`); }
+  });
+}
+
 // ------------------------------------------------------------------ judge
 
 async function judgeAll() {
+  closeTornTail(JUDGMENTS);
+  closeTornTail(JUDGE_CALLS);
   const { sample, lines } = await loadBench();
   const concurrency = intArg('--concurrency', 4, 1, 8);
   const limit = intArg('--limit', Infinity, 1, 100000);
@@ -399,6 +429,7 @@ function keptCallHolds(j, b, c, textOf, parse) {
  * kept call is never dropped: one no row binds now stays in the file.
  */
 async function bindLegacy() {
+  const tornCut = closeTornTail(JUDGMENTS) + closeTornTail(JUDGE_CALLS);
   const { sample } = await loadBench();
   const promptOf = new Map(sample.map((p) => [p.qid, p]));
   const textOf = await judgedTextOf();
@@ -406,7 +437,7 @@ async function bindLegacy() {
   const { calls: recorded, unreadable } = await llmCalls();
   const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
   const before = fs.existsSync(BINDINGS) ? JSON.parse(fs.readFileSync(BINDINGS, 'utf8')).rows ?? {} : {};
-  const keptLines = fs.existsSync(JUDGE_CALLS) ? fs.readFileSync(JUDGE_CALLS, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const keptLines = readKept();
   const keptBefore = firstPerKey(keptLines);
   const onDisk = new Set(recorded.map((c) => c.file));
   const keptOnly = [...new Map(keptLines.filter((c) => !onDisk.has(c.file)).map((c) => [c.file, { file: c.file, message: c.message, reply: c.reply, model: c.model }])).values()];
@@ -417,7 +448,7 @@ async function bindLegacy() {
   for (const j of rows) if (j.pass === 'main' && j.items) itemCount.set(j.qid, (itemCount.get(j.qid) ?? 0) + j.items.length);
   const bindings = {};
   const evidence = [];
-  const counts = { rows: rows.length, outOfSample: 0, withOwnBinding: 0, kept: 0, matched: 0, retried: 0, unmatchedScored: 0, failedRows: 0, failedWithoutCall: 0, keptUnbound: 0, keptWithoutRow: 0 };
+  const counts = { rows: rows.length, tornCut, outOfSample: 0, withOwnBinding: 0, kept: 0, matched: 0, retried: 0, unmatchedScored: 0, failedRows: 0, failedWithoutCall: 0, keptUnbound: 0, keptWithoutRow: 0 };
   const used = new Set();
   for (const j of rows) {
     const p = promptOf.get(j.qid);
@@ -506,7 +537,7 @@ async function report() {
   // and no other row binds it. A row the judge wrote also carries its seed, message and reply, which must agree.
   const bindingsDoc = fs.existsSync(BINDINGS) ? JSON.parse(fs.readFileSync(BINDINGS, 'utf8')) : null;
   const legacy = bindingsDoc?.rows ?? {};
-  const keptLines = fs.existsSync(JUDGE_CALLS) ? fs.readFileSync(JUDGE_CALLS, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const keptLines = readKept();
   const keptCalls = firstPerKey(keptLines);
   const rowKeys = new Set(allJudgments.map((j) => j.key));
   const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
