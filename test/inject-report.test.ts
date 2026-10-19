@@ -226,6 +226,9 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect((await report()).stderr, 'a consistent forgery of the message: not the message the row was judged on').toMatch(NOT_KEPT);
     forge({ ...keptLines[0], model: 'another-model' }, true);
     expect((await report()).stderr, 'another model answered').toMatch(NOT_KEPT);
+    restore();   // the binding names the true call again: only the kept call's file name differs below
+    forge({ ...keptLines[0], file: `${keptLines[0].file}.elsewhere` }, false);
+    expect((await report()).stderr, 'the kept call is not the recording the binding names').toMatch(NOT_KEPT);
     forge({ ...keptLines[0], file: keptLines[1].file }, true);
     expect((await report()).stderr, 'one recorded call named as the answer to two rows').toMatch(/1 binding a call another row binds/);
     restore();
@@ -249,6 +252,14 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(gone.status, gone.stderr).toBe(0);
     expect(gone.report.judge.binding).toMatchObject({ transcript: 2, transcriptChecked: 0, transcriptGone: 2, ...NO_DRIFT });
     const rebound = fs.readFileSync(bindingsFile, 'utf8');
+    // the same row twice (an append repeated): its kept call answers one of them, the other stays unbound
+    const judgedLines = fs.readFileSync(file, 'utf8');
+    fs.appendFileSync(file, judgedLines.split('\n')[0] + '\n');
+    const dup = await bind();
+    expect(dup.status, 'a duplicated row cannot take its call a second time').toBe(1);
+    expect(JSON.parse(dup.stdout.trim().split('\n').pop() ?? '{}')).toMatchObject({ kept: 2, unmatchedScored: 1, written: false });
+    expect(fs.readFileSync(callsFile, 'utf8')).toBe(kept);
+    fs.writeFileSync(file, judgedLines);
     // and a row that can no longer be bound leaves the kept evidence as it was (nothing written)
     rewrite(file, 2, (row) => ({ ...row, bound: undefined, reply: undefined }));
     const fourth = await bind();
