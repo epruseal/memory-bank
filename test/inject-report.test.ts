@@ -90,7 +90,7 @@ const judgedRow = (i: number, pass: string, items: Array<{ factId: string; kind:
   ({ qid: `q${i}`, pass, model: 'test-model', scores, items, bound: bound(i, items, seed), reply: replyFor(items, scores, seed) });
 const NO_DRIFT = {
   unbound: 0, drifted: 0, noReply: 0, noCall: 0, badItems: 0, callReused: 0, transcriptMismatch: 0, keptWithoutRow: 0, malformedRows: 0, failedUnbound: 0,
-  duplicateRows: 0, overlapItems: 0, noSelfRecord: 0, notLegacy: 0, evidenceDrift: false,
+  duplicateRows: 0, overlapItems: 0, noSelfRecord: 0, notLegacy: 0, retiredLost: 0, evidenceDrift: false,
 };
 type Item = { factId: string; kind: string };
 /** The isolated LLM sessions' transcript folder of the fixture (one SDK query per file: the message, then the answer). */
@@ -443,6 +443,57 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     // what is left to do is asking q5 again (--judge) — the report says so, and no longer stops on the retired rows
     const after = await report();
     expect(after.stderr).toMatch(/1 prompt\(s\) have shown lines without a judgment/);
+      // a retired call is recorded by the bindings: removing it from judge-calls.jsonl (and binding again) stops every run
+    const kept = fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean);
+    const firstRetired = kept.findIndex((l) => JSON.parse(l).retired);
+    fs.writeFileSync(callsFile, kept.filter((_, n) => n !== firstRetired).join('\n') + '\n');
+    const lost = await bind();
+    expect(lost.status, 'retiring and asking again would leave no trace').toBe(1);
+    expect(lastJson(lost)).toMatchObject({ retiredLost: 1 });
+    expect((await bind()).status, 'and it stays lost on the next run').toBe(1);
+    expect((await report()).stderr).toMatch(/1 retired calls the bindings recorded that are gone from judge-calls\.jsonl/);
+  });
+
+  it('retiring: a row whose control is a line shown now goes too; a failed row never does (V6 counts it for good)', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    // a failed row of q5 as --judge leaves it (the row, then its failed call), judged on cs5's text of then
+    const failedItems = [{ factId: 'cs5', kind: 'line' }];
+    const failedLine = JSON.stringify({ qid: 'q5', pass: 'main', model: 'test-model', at: '2026-10-19T00:00:00Z', items: failedItems, bound: bound(5, failedItems, 'q5:main:99'), failed: 'invalid reply' });
+    fs.appendFileSync(file, failedLine + '\n');
+    keepSelf(failedLine, 5, failedItems, 'q5:main:99', 'not json');
+    await rebind();
+    // cs5 rewritten (q5's main and re-judge rows were judged on other text), and cs6 — a control of q6's two rows — now shown
+    const db = new Database(path.join(out, 'snapshot.sqlite'));
+    db.prepare("UPDATE facts SET fact = 'rewritten by a later consolidation' WHERE id = 'cs5'").run();
+    db.close();
+    for (const v of VARIANTS) writeLines(v, qids.map((qid, i) => ({ qid, lines: [...(v === 'family' ? familyLines(i) : base(i)), ...(i === 6 ? [{ id: 'cs6', origin: 'vec', note: '', margin: 0 }] : [])] })));
+    writeMeta();
+    writeDeterminism();
+    const r = await run(['--retire-stale', '--out', out]);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout.trim().split('\n')[0]), 'q5\'s two rows and q6\'s two — not the failed one').toEqual({ retired: 4 });
+    expect(fs.readFileSync(file, 'utf8').split('\n'), 'the failed row stays').toContain(failedLine);
+    expect(lastJson(r)).toMatchObject({ failedRows: 1, failedWithoutCall: 0, keptWithoutRow: 0, unmatchedScored: 0 });
+  });
+
+  it('retiring cut off after marking the calls: the rows are still there and still stale, so the next run finishes it', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    const db = new Database(path.join(out, 'snapshot.sqlite'));
+    db.prepare("UPDATE facts SET fact = 'rewritten by a later consolidation' WHERE id = 'cs5'").run();
+    db.close();
+    writeMeta();
+    // what a run cut off between its two writes leaves: q5's calls marked, q5's rows still in judgments.jsonl
+    const keys5 = new Set(fs.readFileSync(file, 'utf8').split('\n').filter((l) => l && JSON.parse(l).qid === 'q5').map((l) => crypto.createHash('sha256').update(l).digest('hex')));
+    expect(keys5.size).toBe(2);
+    const mark = '2026-10-19T00:00:00.000Z';
+    fs.writeFileSync(callsFile, fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => { const c = JSON.parse(l); return JSON.stringify(keys5.has(c.key) ? { ...c, retired: mark } : c); }).join('\n') + '\n');
+    const r = await run(['--retire-stale', '--out', out]);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout.trim().split('\n')[0])).toEqual({ retired: 2 });
+    expect(lastJson(r)).toMatchObject({ rows: 249, keptWithoutRow: 0, unmatchedScored: 0 });
+    const calls = fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(calls.filter((c) => c.retired).map((c) => c.retired), 'a mark already set is kept').toEqual([mark, mark, mark, mark]);
   });
 
   it('a call with no transcript (the API-key path) binds by the call --judge kept for it', async () => {
@@ -467,6 +518,40 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     const other = await bind();
     expect(other.status).toBe(1);
     expect(lastJson(other)).toMatchObject({ answeredByOther: 1 });
+    });
+
+  it('another model\'s transcript of the same bytes is the row\'s call only if it was answered right before the row was written', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    // a row --judge wrote at a known time over the API-key path (no transcript): the row, then its call
+    const items = [{ factId: 'f9', kind: 'line' }];
+    const reply = replyFor(items, { f9: 1 }, 'q9:main:50');
+    const at = '2026-10-19T10:00:00.000Z';
+    const line = JSON.stringify({ ...judgedRow(9, 'main', items, { f9: 1 }, 'q9:main:50'), at });
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const transcriptAt = (name: string, when: string, model: string) => {
+      const labeled = labelItems(items.map((it) => ({ ...it, text: judged(it.factId) })), 'q9:main:50');
+      fs.writeFileSync(path.join(llmDir(), name), [
+        JSON.stringify({ type: 'user', timestamp: when, message: { role: 'user', content: judgeMessage(promptOf(9), labeled) } }),
+        JSON.stringify({ type: 'assistant', timestamp: when, message: { model, content: [{ type: 'text', text: reply }] } }),
+      ].join('\n') + '\n');
+    };
+    const bindWith = async (when: string) => {
+      fs.writeFileSync(file, fs.readFileSync(file, 'utf8') + line + '\n');
+      keepSelf(line, 9, items, 'q9:main:50', reply);
+      transcriptAt('other-run.jsonl', when, 'fallback-model');
+      return bind();
+    };
+    // another run's answer of the same bytes, an hour earlier: another call — the row binds by its own record
+    const hourBefore = await bindWith('2026-10-19T09:00:00.000Z');
+    expect(lastJson(hourBefore), hourBefore.stdout + hourBefore.stderr).toMatchObject({ answeredByOther: 0, unmatchedScored: 0 });
+    // the same, answered seconds before the row was written: this row's call, answered by another model — refused
+    fs.writeFileSync(file, lines.join('\n') + '\n');
+    fs.writeFileSync(callsFile, fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).filter((l) => JSON.parse(l).key !== crypto.createHash('sha256').update(line).digest('hex')).join('\n') + '\n');
+    fs.rmSync(path.join(out, 'judgment-bindings.json'));
+    const secondsBefore = await bindWith('2026-10-19T09:59:57.000Z');
+    expect(secondsBefore.status).toBe(1);
+    expect(lastJson(secondsBefore)).toMatchObject({ answeredByOther: 1, unmatchedScored: 1 });
   });
 
   it('a row the judge wrote is bound with its own seed and message: another seed\'s call, or a call on other text, binds nothing', async () => {

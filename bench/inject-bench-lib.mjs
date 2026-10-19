@@ -320,6 +320,16 @@ export function indexCalls(calls) {
 }
 
 /**
+ * A prompt's judged main items: those of its scored main rows only. A failed row's items were never judged — its
+ * prompt is asked again in full (lines and controls), and a re-judge asks these same items in another order.
+ */
+export function scoredMainItems(rows, model) {
+  const out = new Map();
+  for (const j of rows) if (j.model === model && j.pass === 'main' && Array.isArray(j.items) && j.scores) out.set(j.qid, [...(out.get(j.qid) ?? []), ...j.items]);
+  return out;
+}
+
+/**
  * Seeds a judgment row can have been labelled with: the seed it recorded when judged (`bound`), else the
  * re-judge seed, or the main seed at any item count up to `maxItems`.
  */

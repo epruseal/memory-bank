@@ -304,7 +304,7 @@ describe('decision', () => {
     expect(judge, 'every scored judgment row is bound').toContain("if ((j.bound && (b.seed !== j.bound.seed || b.message !== j.bound.message)) || rebuilt(j, b.seed) !== b.message) { binding.drifted++; continue; }");
     expect(judge, 'and every binding count in the stop list stops the report').toContain(`const BINDING_STOPS = [
   'unbound', 'drifted', 'noReply', 'noCall', 'badItems', 'callReused', 'transcriptMismatch', 'keptWithoutRow', 'malformedRows', 'failedUnbound',
-  'duplicateRows', 'overlapItems', 'noSelfRecord', 'notLegacy', 'evidenceDrift',
+  'duplicateRows', 'overlapItems', 'noSelfRecord', 'notLegacy', 'retiredLost', 'evidenceDrift',
 ];`);
     expect(judge).toContain('if (BINDING_STOPS.some((k) => binding[k])) fail(`judgment rows not bound');
     expect(judge, 'the judge records what it sends with the function the report checks with').toContain('const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };');
@@ -314,12 +314,29 @@ describe('decision', () => {
     expect(judge).toContain('retried: reply.retried, reply: reply.reply,');
     expect(judge, '--judge binds what it wrote before any report reads it').toContain('// every scored row — these new ones too — is bound to its recorded call before a report reads it\n  await bindLegacy();');
     expect(judge, 'and labels the call with the same seed').toContain('const labeled = labelItems(task.want.map((w) => ({ ...w, text: text(w.factId) })), task.seed);');
-    expect(judge, 'a failed first call is asked again in full (its controls too)').toContain("for (const j of prior) if (j.pass === 'main' && j.items && j.scores) items.set(");
+    expect(judge, 'a failed first call is asked again in full (its controls too)').toContain('const items = scoredMainItems(prior, MODEL);');
+    expect(judge, 'and a re-judge asks the scored main items only').toContain('const itemsNow = scoredMainItems(loadJudgments(), MODEL);');
+    expect(judge, '--judge checks its arguments, then retires, before it asks anything').toMatch(/const limit = intArg\('--limit'[^\n]*\n  const \{ sample, lines \} = await loadBench\(\);\n  const retired = await retireStale\(sample, lines\);\n/);
+    expect(judge, 'retiring marks the calls before the rows go').toMatch(/write\(JUDGE_CALLS, calls\.map[^\n]*\n  const rest = [^\n]*\n  write\(JUDGMENTS, rest/);
     expect(replay).toContain('const reading = affectedReadings(widened(p.project), asOf.visibleFactId);');
     expect(replay).toContain('if (reading.registered) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
     expect(replay).toContain('const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();');
     expect(replay).toContain('variants[v] = determinismEntry(a, b, used);');
     expect(judge).toContain('const deterministic = determinismBound(det, lineSha);');
+  });
+  it('a prompt\'s judged main items are its scored main rows\' — never a failed row\'s, another model\'s or a re-judge\'s', async () => {
+    const { scoredMainItems } = await import('../bench/inject-bench-lib.mjs');
+    const it_ = (id: string, kind = 'line') => ({ factId: id, kind });
+    const rows = [
+      { qid: 'q1', pass: 'main', model: 'm', items: [it_('a'), it_('x', 'control_same')], failed: 'invalid reply' },
+      { qid: 'q1', pass: 'main', model: 'm', items: [it_('a'), it_('y', 'control_same')], scores: { a: 1, y: 0 } },
+      { qid: 'q1', pass: 'main', model: 'm', items: [it_('b')], scores: { b: 2 } },
+      { qid: 'q1', pass: 'rejudge', model: 'm', items: [it_('a'), it_('y', 'control_same'), it_('b')], scores: { a: 1, y: 0, b: 2 } },
+      { qid: 'q1', pass: 'main', model: 'other', items: [it_('c')], scores: { c: 0 } },
+      { qid: 'q2', pass: 'main', model: 'm', items: [it_('d')], failed: 'invalid reply' },
+    ];
+    const got = scoredMainItems(rows, 'm');
+    expect(Object.fromEntries([...got].map(([q, items]) => [q, items.map((x: { factId: string }) => x.factId)]))).toEqual({ q1: ['a', 'y', 'b'] });
   });
   it('affected readings, determinism entries and input binding (shared by replay and report)', () => {
     expect(PROJECT_FACTS_SQL, 'the registered reading counts facts active now').toMatch(/WHERE is_active = 1 AND scope_type = 'project'$/);
