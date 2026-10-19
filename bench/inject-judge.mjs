@@ -21,8 +21,8 @@ import {
   CONTROL_PER_KIND, JUDGE_SYSTEM, REJUDGE_PROMPTS, THRESHOLDS, VARIANTS, aggregate, bootstrapDelta, decide, decideC2,
   decideC3, decisionsBlock, judgeUserMessage, labelItems, leakProbes, lostJ2Rel, meanDelta, perPromptCounts, ratioDelta,
   seededRandom, validateJudgeReply, validity, makeAsOf, isBypassFact, buildFactIndex, blockDiffers, leakFold, repoOf, unboundMeta,
-  driftedInputs, missingRows, determinismBound, codeDigest, driftedCode, sqliteDigest, placementOf, gitState, judgeMessage,
-  judgeMessageSha, firstAttemptShas, legacyBinding,
+  driftedInputs, missingRows, determinismBound, codeDigest, driftedCode, sqliteDigest, placementOf, gitState,
+  judgeMessageSha, JUDGE_RETRY_MARK, firstAttemptSha, indexCalls, legacyBinding, replyGivesRowScores,
 } from './inject-bench-lib.mjs';
 import crypto from 'node:crypto';
 
@@ -62,6 +62,8 @@ const OUT = path.resolve(args.values['--out'] ?? path.join(REPO, '.bench-out', '
 const MODEL = args.values['--model'] ?? 'claude-sonnet-5-5';
 const JUDGMENTS = path.join(OUT, 'judgments.jsonl');
 const BINDINGS = path.join(OUT, 'judgment-bindings.json');   // --bind-legacy: bindings of rows written before rows carried one
+const JUDGE_CALLS = path.join(OUT, 'judge-calls.jsonl');       // --bind-legacy: the judge calls those bindings name (message + reply)
+const fileSha = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const fail = (msg) => { console.error(`inject-judge: ${msg}`); process.exit(1); };
 const readJson = (f) => JSON.parse(fs.readFileSync(path.join(OUT, f), 'utf8'));
 const readLines = (f) => fs.readFileSync(path.join(OUT, f), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -88,7 +90,7 @@ async function judgeCall(prompt, labeled) {
       continue;
     }
     const v = validateJudgeReply(parseJsonResponse(text), labels);
-    if (v.ok) return v;
+    if (v.ok) return { ...v, retried: attempt > 0 };
     if (attempt === 1) return { ok: false, reason: v.reason };
     user = `${judgeUserMessage(prompt, labeled)}\n\nYour previous answer was invalid (${v.reason}). Answer again with only the JSON array, every id exactly once.`;
   }
@@ -211,7 +213,8 @@ async function judgeAll() {
   const mainDone = new Map();
   for (const j of prior) if (j.pass === 'main' && j.scores) mainDone.set(j.qid, { ...(mainDone.get(j.qid) ?? {}), ...j.scores });
   const items = new Map(); // qid → [{factId, kind}]
-  for (const j of prior) if (j.pass === 'main' && j.items) items.set(j.qid, [...(items.get(j.qid) ?? []), ...j.items]);
+  // Items of scored rows only: a prompt whose first call failed is asked again in full (lines and controls).
+  for (const j of prior) if (j.pass === 'main' && j.items && j.scores) items.set(j.qid, [...(items.get(j.qid) ?? []), ...j.items]);
 
   const tasks = [];
   for (const p of sample) {
@@ -248,11 +251,11 @@ async function judgeAll() {
   const append = (rec) => fs.appendFileSync(JUDGMENTS, JSON.stringify(rec) + '\n');
   const run = async (task) => {
     const labeled = labelItems(task.want.map((w) => ({ ...w, text: text(w.factId) })), task.seed);
-    // Bound to what the judge receives: the report rebuilds this message from the snapshot and refuses a row it no longer matches.
-    const bound = { seed: task.seed, message: crypto.createHash('sha256').update(judgeMessage(task.prompt, labeled)).digest('hex') };
+    // Bound to what the judge receives — the same function the report rebuilds it with from the snapshot.
+    const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };
     const reply = await judgeCall(task.prompt, labeled);
     if (reply.ok) {
-      append({ qid: task.prompt.qid, pass: task.pass, model: MODEL, at: new Date().toISOString(), items: task.want, bound,
+      append({ qid: task.prompt.qid, pass: task.pass, model: MODEL, at: new Date().toISOString(), items: task.want, bound, retried: reply.retried,
         scores: Object.fromEntries(labeled.map((it) => [it.factId, reply.scores.get(it.label)])) });
     } else {
       failed++;
@@ -294,53 +297,76 @@ async function judgedTextOf() {
 }
 
 /**
- * Rows written before judgment rows carried a binding: find, among the user messages of the isolated
- * LLM sessions (the memory-bank-llm transcripts — a judge call's prompt is recorded there), the one
- * each row's message — rebuilt from the current snapshot — equals. Matched rows are written to
- * judgment-bindings.json; the report refuses a scored row that is neither bound inline nor here.
+ * The isolated LLM sessions' calls (memory-bank-llm transcripts — one SDK query per file): the message
+ * each sent and the reply it got (assistant text) with the answering model.
  */
-async function bindLegacy() {
-  const { sample } = await loadBench();
-  const promptOf = new Map(sample.map((p) => [p.qid, p]));
-  const textOf = await judgedTextOf();
+async function llmCalls() {
   const { getProjectsDir, LLM_WORKDIR_BASENAME } = await import(dist('paths.js'));
   const projectsDir = getProjectsDir();
-  const messages = [];
-  let files = 0;
+  const calls = [];
   let unreadable = 0;
   for (const entry of fs.readdirSync(projectsDir)) {
     if (entry !== LLM_WORKDIR_BASENAME && !entry.endsWith(`-${LLM_WORKDIR_BASENAME}`)) continue;
     for (const f of fs.readdirSync(path.join(projectsDir, entry))) {
       if (!f.endsWith('.jsonl')) continue;
-      files++;
+      let message = null;
+      let reply = '';
+      let model = null;
       for (const line of fs.readFileSync(path.join(projectsDir, entry, f), 'utf8').split('\n')) {
         if (!line.trim()) continue;
         let o;
         try { o = JSON.parse(line); } catch { unreadable++; continue; }
-        if (o.type !== 'user') continue;
         const c = o.message?.content;
-        const t = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b?.type === 'text').map((b) => b.text).join('') : null;
-        if (t) messages.push(t);
+        const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b?.type === 'text').map((b) => b.text).join('') : '';
+        if (o.type === 'user' && message === null && text) message = text;
+        else if (o.type === 'assistant' && message !== null) { reply += text; model ??= o.message?.model ?? null; }
       }
+      if (message !== null) calls.push({ file: `${entry}/${f}`, message, reply, model });
     }
   }
-  const received = firstAttemptShas(messages);
+  return { calls, unreadable };
+}
+
+/**
+ * Rows written before judgment rows carried a binding: find the judge call behind each — a call whose
+ * message (its first attempt) equals the row's message rebuilt from the current snapshot, answered by the
+ * row's model with exactly the row's scores. The matched calls (message and reply) are kept in
+ * judge-calls.jsonl next to judgment-bindings.json; the report checks every binding against them again.
+ */
+async function bindLegacy() {
+  const { sample } = await loadBench();
+  const promptOf = new Map(sample.map((p) => [p.qid, p]));
+  const textOf = await judgedTextOf();
+  const { parseJsonResponse } = await import(dist('llm.js'));
+  const { calls, unreadable } = await llmCalls();
+  const callsByFirst = indexCalls(calls);
   const rows = loadJudgments();
   const itemCount = new Map();
   for (const j of rows) if (j.pass === 'main' && j.items) itemCount.set(j.qid, (itemCount.get(j.qid) ?? 0) + j.items.length);
   const bindings = {};
-  const counts = { rows: rows.length, boundInline: 0, matched: 0, unmatchedScored: 0, unmatchedFailed: 0 };
+  const evidence = [];
+  const counts = { rows: rows.length, boundInline: 0, matched: 0, retried: 0, unmatchedScored: 0, failedRows: 0 };
+  const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
   for (const j of rows) {
     if (j.bound) { counts.boundInline++; continue; }
+    if (!j.scores) { counts.failedRows++; continue; }   // nothing to bind: a failed row counts toward V6 only
     const p = promptOf.get(j.qid);
-    const b = p && j.items ? legacyBinding(j, p, textOf, received, itemCount.get(j.qid) ?? 0) : null;
-    if (b) { bindings[j.key] = { ...b, via: 'transcript' }; counts.matched++; } else if (j.scores) counts.unmatchedScored++; else counts.unmatchedFailed++;
+    const found = p ? legacyBinding(j, p, textOf, callsByFirst, itemCount.get(j.qid) ?? 0, parseJsonResponse) : null;
+    if (!found) { counts.unmatchedScored++; continue; }
+    const retried = found.call.message.includes(JUDGE_RETRY_MARK);
+    if (retried) counts.retried++;
+    bindings[j.key] = { seed: found.seed, message: found.message, via: 'transcript', call: { file: found.call.file, messageSha: sha(found.call.message), replySha: sha(found.call.reply), model: found.call.model, retried } };
+    evidence.push(JSON.stringify({ key: j.key, file: found.call.file, message: found.call.message, reply: found.call.reply, model: found.call.model }));
+    counts.matched++;
   }
-  const body = JSON.stringify({ version: 1, generatedAt: new Date().toISOString(), transcripts: { files, messages: messages.length, unreadableLines: unreadable }, counts, rows: bindings }, null, 1) + '\n';
-  const tmp = `${BINDINGS}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, body);
-  fs.renameSync(tmp, BINDINGS);
-  console.log(JSON.stringify({ transcripts: files, messages: messages.length, ...counts }));
+  const write = (file, body) => { const tmp = `${file}.tmp-${process.pid}`; fs.writeFileSync(tmp, body); fs.renameSync(tmp, file); };
+  write(JUDGE_CALLS, evidence.join('\n') + (evidence.length ? '\n' : ''));
+  write(BINDINGS, JSON.stringify({
+    version: 2, generatedAt: new Date().toISOString(),
+    generator: { ...gitState(REPO), judge: fileSha(fileURLToPath(import.meta.url)), lib: fileSha(path.join(here, 'inject-bench-lib.mjs')) },
+    transcripts: { calls: calls.length, unreadableLines: unreadable }, counts, evidence: { file: path.basename(JUDGE_CALLS), sha256: fileSha(JUDGE_CALLS) }, rows: bindings,
+  }, null, 1) + '\n');
+  console.log(JSON.stringify({ transcripts: calls.length, ...counts }));
   if (counts.unmatchedScored) process.exit(1);
 }
 
@@ -373,19 +399,35 @@ async function report() {
   // rebuilt now from this sample and snapshot — a row judged on other text never counts.
   const textOf = await judgedTextOf();
   const promptOf = new Map(sample.map((p) => [p.qid, p]));
+  // A legacy binding counts only with its judge call kept in judge-calls.jsonl: that call's message is the
+  // row's message and its reply gives exactly the row's scores, from the row's model.
   const legacy = fs.existsSync(BINDINGS) ? JSON.parse(fs.readFileSync(BINDINGS, 'utf8')).rows ?? {} : {};
-  const binding = { inline: 0, transcript: 0, unbound: 0, drifted: 0 };
+  const keptCalls = new Map(fs.existsSync(JUDGE_CALLS)
+    ? fs.readFileSync(JUDGE_CALLS, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).map((c) => [c.key, c]) : []);
+  const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
+  const { parseJsonResponse } = await import(dist('llm.js'));
+  const binding = { inline: 0, transcript: 0, unbound: 0, drifted: 0, noCall: 0, retried: 0 };
   for (const j of judgments.filter((x) => x.scores)) {
     const b = j.bound ?? legacy[j.key];
     if (!b) { binding.unbound++; continue; }
     if (judgeMessageSha(promptOf.get(j.qid), j.items, b.seed, textOf) !== b.message) { binding.drifted++; continue; }
+    if (!j.bound) {
+      const c = keptCalls.get(j.key);
+      const ok = c && sha(c.message) === b.call?.messageSha && sha(c.reply) === b.call?.replySha && firstAttemptSha(c.message) === b.message
+        && c.model === j.model && replyGivesRowScores(j, b.seed, c.reply, textOf, parseJsonResponse);
+      if (!ok) { binding.noCall++; continue; }
+      if (c.message.includes(JUDGE_RETRY_MARK)) binding.retried++;
+    } else if (j.retried) binding.retried++;
     binding[j.bound ? 'inline' : 'transcript']++;
   }
-  if (binding.unbound || binding.drifted) {
-    fail(`judgment rows not bound to what the judge received: ${binding.unbound} without a binding, ${binding.drifted} whose message no longer matches (fact text, prompt or judge text changed) — run --bind-legacy, or --judge again`);
+  if (binding.unbound || binding.drifted || binding.noCall) {
+    fail(`judgment rows not bound to what the judge received: ${binding.unbound} without a binding, ${binding.drifted} whose message no longer matches (fact text, prompt or judge text changed), ${binding.noCall} whose kept judge call is missing or does not give the row's scores — run --bind-legacy, or --judge again`);
   }
   // Main rows that re-asked only the lines a prompt was missing (no controls) — counted, read like any main row.
   const fillRows = judgments.filter((j) => j.pass === 'main' && j.scores && !j.items.some((it) => it.kind !== 'line')).length;
+  // Judged prompts none of whose scored main rows holds a control — V1/V2 count fewer pairs; surfaced, not hidden.
+  const withControls = new Set([...kinds].filter(([, k]) => k !== 'line').map(([key]) => key.split('|')[0]));
+  const promptsWithoutControls = [...main.keys()].filter((q) => !withControls.has(q)).length;
 
   // controls (V1, V2)
   const ctrl = { control_same: [0, 0], control_other: [0, 0] };
@@ -428,8 +470,8 @@ async function report() {
   const unbound = unboundMeta(meta.hashes, lineSha);
   if (unbound.length) fail(`replay-meta.json hashes do not match the lines files for ${unbound.join(', ')} — re-run --replay (all variants, no suffix)`);
   if (!Array.isArray(meta.affectedRegistered) || !Array.isArray(meta.affectedAsOf)) fail('replay-meta.json has no affectedRegistered / affectedAsOf — re-run --replay');
-  const fileSha = (f) => crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, f))).digest('hex');
-  const replayInputs = { sample: fileSha('sample.json'), snapshot: sqliteDigest(path.join(OUT, 'snapshot.sqlite')) };
+  const outSha = (f) => fileSha(path.join(OUT, f));
+  const replayInputs = { sample: outSha('sample.json'), snapshot: sqliteDigest(path.join(OUT, 'snapshot.sqlite')) };
   const drifted = driftedInputs(meta.inputs, replayInputs);
   if (drifted.length) fail(`replay-meta.json was made from another ${drifted.join(' and ')} — re-run --replay`);
   const gaps = missingRows(sample.map((p) => p.qid), lines);
@@ -443,13 +485,14 @@ async function report() {
   if (missingRoots.length) fail(`replay-meta.json has no family roots for ${missingRoots.length} cwd(s) — re-run --replay`);
   const codeKeys = Object.keys(meta.code.files);
   const inputs = {
-    ...replayInputs, judgments: fileSha('judgments.jsonl'), bindings: fs.existsSync(BINDINGS) ? fileSha(path.basename(BINDINGS)) : null,
+    ...replayInputs, judgments: outSha('judgments.jsonl'), bindings: fs.existsSync(BINDINGS) ? fileSha(BINDINGS) : null, judgeCalls: fs.existsSync(JUDGE_CALLS) ? fileSha(JUDGE_CALLS) : null,
     code: {
       replay: { git: meta.code.git, dirty: meta.code.dirty },
       bound: {
-        modules: codeKeys.filter((k) => /\.(m?js)$/.test(k) && !k.startsWith('node_modules/')).length,
+        modules: codeKeys.filter((k) => /\.(m?js)$/.test(k) && !k.includes(':') && !k.startsWith('node_modules/')).length,
         packages: codeKeys.filter((k) => k.startsWith('package:')).length,
-        modelFiles: codeKeys.filter((k) => k.startsWith('node_modules/')).length,
+        native: codeKeys.filter((k) => k.startsWith('native:')).length,
+        modelFiles: codeKeys.filter((k) => k.startsWith('node_modules/@xenova/transformers/')).length,
         model: meta.code.files['embedding-model'],
       },
       report: gitState(REPO),
@@ -581,7 +624,7 @@ async function report() {
       calls, failures, tornTail: torn, outsideSample: allJudgments.length - judgments.length,
       controls: { same: ctrl.control_same, other: ctrl.control_other },
       agreement: { agree, pairs, prompts: rejudgePrompts.size, lines: lineAgree, j2 },
-      binding, fillRows,
+      binding, fillRows, promptsWithoutControls,
     },
     lineSha, inputs, validity: v, stats, c2: c2stats, c4, hardGain, hardLines, decisions,
   };
@@ -633,8 +676,8 @@ function writeDoc(file, r, reportSha) {
     `판정 호출 ${r.judge.calls}회, 실패 ${r.judge.failures}회, 끊긴 마지막 줄 ${r.judge.tornTail}개, 표본 밖 판정 행 ${r.judge.outsideSample}개(집계 제외). 대조군 판정 2: 같은 scope ${r.judge.controls.same[0]}/${r.judge.controls.same[1]}, 다른 프로젝트 ${r.judge.controls.other[0]}/${r.judge.controls.other[1]}. 재채점 일치 ${r.judge.agreement.agree}/${r.judge.agreement.pairs}(재채점 프롬프트 ${r.judge.agreement.prompts}개).`,
     `참고(판정 규칙 밖): 대조군을 뺀 줄만의 재채점 일치 ${r.judge.agreement.lines[0]}/${r.judge.agreement.lines[1]}. 판정 2 의 재현성은 처음 판정 ${r.judge.agreement.j2.main}개·재채점 ${r.judge.agreement.j2.rejudge}개·양쪽 ${r.judge.agreement.j2.both}개(양성 일치 ${fmt(r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge ? (2 * r.judge.agreement.j2.both) / (r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge) : null)}). 부트스트랩 구간은 판정 잡음을 담지 않는다.`,
     `V4 는 두 번의 재생이 이 보고가 읽은 줄 파일과 바이트 단위로 같아야 통과한다(줄 파일 sha256 앞 12자: ${VARIANTS.map((vn) => `${vn} ${r.lineSha[vn].slice(0, 12)}`).join(' · ')}).`,
-    `결속: 이 보고는 재생이 시작할 때 기록한(끝날 때 다시 재어 같았던) 표본·스냅샷(WAL 포함) 해시와, 재생이 불러온 모듈 ${r.inputs.code.bound.modules}개·패키지 버전 ${r.inputs.code.bound.packages}개·임베딩 모델(\`${r.inputs.code.bound.model}\`) 파일 ${r.inputs.code.bound.modelFiles}개의 해시를 지금 다시 계산해 같을 때만 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)}). 표시된 줄은 모두 판정돼 있어야 하고, 판정 행은 판정기가 받은 메시지(판정 지시문·프롬프트·사실 문장)를 지금 스냅샷으로 다시 만든 것과 바이트가 같아야 한다 — 판정 때 기록한 행 ${r.judge.binding.inline}개, 판정 호출 기록에서 확인한 행 ${r.judge.binding.transcript}개. 재생 코드 \`${r.inputs.code.replay?.git ? r.inputs.code.replay.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.replay?.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.replay?.dirty === false ? '(src·bench·dist 깨끗함)' : ''}. 기록만 하는 값: 판정 파일 ${r.inputs.judgments.slice(0, 12)}, 보고를 낸 코드 \`${r.inputs.code.report.git ? r.inputs.code.report.git.slice(0, 7) : '확인 불가'}\`.`,
-    `보충 판정 행(대조군 없이 빠진 줄만 다시 부른 main 행) ${r.judge.fillRows}개 — 다른 main 행과 같이 읽는다.`,
+    `결속: 이 보고는 재생이 시작할 때 기록한(끝날 때 다시 재어 같았던) 표본·스냅샷(WAL 포함) 해시와, 재생이 불러온 모듈 ${r.inputs.code.bound.modules}개·패키지 ${r.inputs.code.bound.packages}개(하위 의존 포함, 버전)·네이티브 바이너리 ${r.inputs.code.bound.native}개·Node 버전·임베딩 모델(\`${r.inputs.code.bound.model}\`) 파일 ${r.inputs.code.bound.modelFiles}개의 해시를 지금 다시 계산해 같을 때만 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)}). 표시된 줄은 모두 판정돼 있어야 하고, 판정 행은 판정기가 받은 메시지(판정 지시문·프롬프트·사실 문장)를 지금 스냅샷으로 다시 만든 것과 바이트가 같아야 한다 — 판정 때 기록한 행 ${r.judge.binding.inline}개, 판정 호출 기록에서 찾은 행 ${r.judge.binding.transcript}개(그 호출의 메시지와 답을 \`judge-calls.jsonl\` 에 보존하고, 보고가 답의 점수·모델이 행과 같은지 다시 본다). 재생 코드 \`${r.inputs.code.replay?.git ? r.inputs.code.replay.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.replay?.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.replay?.dirty === false ? '(src·bench·dist 깨끗함)' : ''}. 기록만 하는 값: 판정 파일 ${r.inputs.judgments.slice(0, 12)}, 보고를 낸 코드 \`${r.inputs.code.report.git ? r.inputs.code.report.git.slice(0, 7) : '확인 불가'}\`.`,
+    `보충 판정 행(대조군 없이 빠진 줄만 다시 부른 main 행) ${r.judge.fillRows}개 — 다른 main 행과 같이 읽는다. 대조군이 하나도 판정되지 않은 프롬프트 ${r.judge.promptsWithoutControls}개. 한 번 다시 물어 점수를 얻은 판정 행 ${r.judge.binding.retried}개(결속은 첫 메시지 — 다시 묻기는 형식 지적 한 줄만 덧붙인다).`,
     '',
     ...['train', 'heldout', 'all'].flatMap((split) => [
       `## 변형별 지표 — ${split}`,
@@ -677,8 +720,9 @@ function writeDoc(file, r, reportSha) {
     '## 한계',
     '',
     '- 판정기는 LLM 이다. 사람 라벨이 아니고, 길이·언어 편향이 있을 수 있다. 대조군(V1·V2)과 재채점(V3)으로만 보정했다.',
+    '- 판정 메시지 결속은 Agent SDK 경로의 바이트(판정 지시문 + 빈 줄 + 사용자 메시지)다. SDK 가 실패해 API 키 경로로 가면 같은 내용이 system 과 user 로 나뉘어 간다 — 내용은 같고 나뉜 자리만 다르다. 판정 호출 기록이 없는 그 경로의 행은 판정 때 기록한 결속만 있다.',
     '- 재생은 세션 원장(이미 보여 준 사실)을 재현하지 않는다. 비활성 전환은 복원하지 못한다(지금 상태로 읽음). 프롬프트 뒤에 문장이 바뀐 사실은 숨긴다 — 통합의 재작성은 벡터를 바꾸지 않아 행에는 그때의 벡터와 나중 문장이 짝지어 있고, 판정할 문장이 그때 보인 문장이 아니기 때문이다. 대상: 통합의 EVOLUTION(개정 행의 사실), CONTRADICTION 병합(개정 행의 새 문장을 지금 가진 다른 사실 — 병합 없이 새 사실 문장을 그대로 쓴 경우까지 숨겨 보수적).',
-    '- 지워진 경로(cwd·사실 경로 모두)는 저장소 루트의 worktree 보관 폴더(`.claude/worktrees/`·`.auto-issue-worktrees/`) 자체나 그 바로 아래 worktree 폴더가 지워졌을 때만 그 저장소의 가족이다. 여러 저장소의 worktree 를 담은 상위 폴더 아래, 살아 있는 worktree 안에서 지워진 경로는 가족이 없다(다른 저장소였을 수 있다) — 그런 프롬프트의 가족 효과는 재지 못한다. 심링크를 거쳐 저장소에 닿는 경로도 가족 밖이다. bare 저장소(`.bare/worktrees/…`)의 worktree 끼리는 묶지 않는다(각자 한 가족).',
+    '- 지워진 경로(cwd·사실 경로 모두)는 저장소 루트의 worktree 보관 폴더(`.claude/worktrees/`·`.auto-issue-worktrees/`) 바로 아래 worktree 폴더 그 자체이고, 그 보관 폴더가 지금 있으며 그 안의 폴더가 모두 그 루트의 연결 worktree 일 때만 그 저장소의 가족이다. 지워진 worktree 안의 더 깊은 경로, 보관 폴더째 지워진 경로, 다른 폴더도 담은 보관 폴더(여러 저장소의 worktree 를 담는 층일 수 있다), 살아 있는 worktree 안에서 지워진 경로는 가족이 없다(다른 저장소였을 수 있다) — 그런 프롬프트의 가족 효과는 재지 못한다. 심링크를 거쳐 저장소에 닿는 경로(루트로 가는 링크 포함)도 가족 밖이다. bare 저장소(`.bare/worktrees/…`)의 worktree 끼리는 묶지 않는다(각자 한 가족).',
     '- 정렬은 ±180초 안의 가장 이른 행을 고르고 여러 행이 맞는 경우를 세지 않는다. 프롬프트 길이 비교는 UTF-16 길이(JS)와 코드포인트 수(SQLite)가 달라 이모지가 든 프롬프트는 빠진다.',
     '- 누출 검사는 정규화(NFC·소문자·공백 접기·마크다운 이스케이프 제거)한 원문 전체에서 20자 간격으로 뽑은 40자 창을 이 문서에서 찾는다 — 59자 이상 그대로 옮긴 인용은 반드시 잡는다. 더 짧은 인용·의역은 잡지 못한다.',
     '- 표본은 대화 색인에 남은 사람의 프롬프트다. 색인되지 않는 자동화 세션에 대한 결론이 아니다.',

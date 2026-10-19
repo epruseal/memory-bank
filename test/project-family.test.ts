@@ -59,9 +59,28 @@ describe('resolveRepoRoots', () => {
     expect(resolveRepoRoots(E)).toEqual([E, R]);
   });
 
-  it('a deleted worktree path resolves through its container', () => {
-    expect(resolveRepoRoots(path.join(R, '.auto-issue-worktrees', 'gone-9', 'src'))).toEqual([R]);
-    expect(resolveRepoRoots(path.join(R, '.claude', 'worktrees', 'agent-x'))).toEqual([R]);
+  it('a deleted worktree resolves through its container: the worktree folder itself, in a container that holds only the root\'s worktrees', () => {
+    const Q = path.join(tmp, 'del-wt');
+    makeRepo(Q);
+    fs.mkdirSync(path.join(Q, '.auto-issue-worktrees'), { recursive: true });
+    expect(resolveRepoRoots(path.join(Q, '.auto-issue-worktrees', 'gone-9'))).toEqual([Q]);
+    expect(resolveRepoRoots(path.join(Q, '.auto-issue-worktrees', 'gone-9', 'src')), 'deeper: a clone inside the deleted worktree cannot be told apart').toEqual([]);
+    expect(resolveRepoRoots(path.join(Q, '.claude', 'worktrees', 'agent-x')), 'the container is gone — nothing on disk to check').toEqual([]);
+    linkWorktree(path.join(Q, '.claude', 'worktrees', 'live'), Q, 'live');
+    clearRepoRootCache();
+    expect(resolveRepoRoots(path.join(Q, '.claude', 'worktrees', 'agent-x')), 'a container holding the root\'s own worktree').toEqual([Q]);
+  });
+
+  it('a container that also holds other folders may be an umbrella of several repositories\' worktrees — nothing deleted in it is the root\'s', () => {
+    const T = path.join(tmp, 'umbrella-in-repo');
+    makeRepo(T);
+    fs.mkdirSync(path.join(T, '.auto-issue-worktrees', 'ORG-other', 'issue-2'), { recursive: true });   // another repository's layer
+    expect(resolveRepoRoots(path.join(T, '.auto-issue-worktrees', 'ORG-gone'))).toEqual([]);
+    expect(scopeMatcher(T, true)(path.join(T, '.auto-issue-worktrees', 'ORG-gone')), 'a fact path of the same shape').toBe(false);
+    fs.rmSync(path.join(T, '.auto-issue-worktrees', 'ORG-other'), { recursive: true, force: true });
+    clearRepoRootCache();
+    expect(resolveRepoRoots(path.join(T, '.auto-issue-worktrees', 'ORG-gone')), 'positive control: the container emptied').toEqual([T]);
+    expect(scopeMatcher(T, true)(path.join(T, '.auto-issue-worktrees', 'ORG-gone'))).toBe(true);
   });
 
   it('outside any repository there is no family', () => {
@@ -110,29 +129,39 @@ describe('resolveRepoRoots', () => {
   });
 
   it('a symbolic link inside a worktree container borrows nothing from the container\'s repository', () => {
-    fs.mkdirSync(path.join(R, '.claude', 'worktrees'), { recursive: true });
-    const lnk = path.join(R, '.claude', 'worktrees', 'lnk');
+    const Q = path.join(tmp, 'link-in-container');
+    makeRepo(Q);
+    fs.mkdirSync(path.join(Q, '.claude', 'worktrees'), { recursive: true });
+    const lnk = path.join(Q, '.claude', 'worktrees', 'lnk');
     fs.symlinkSync(S, lnk);
     expect(resolveRepoRoots(lnk)).toEqual([]);
-    expect(resolveRepoRoots(path.join(R, '.claude', 'worktrees', 'really-gone')), 'positive control: a missing worktree folder').toEqual([R]);
+    expect(resolveRepoRoots(path.join(Q, '.claude', 'worktrees', 'really-gone')), 'a container holding a link is not the root\'s alone').toEqual([]);
+    fs.unlinkSync(lnk);
+    clearRepoRootCache();
+    expect(resolveRepoRoots(path.join(Q, '.claude', 'worktrees', 'really-gone')), 'positive control: a missing worktree folder').toEqual([Q]);
   });
 
   it('a deleted cwd inside a LIVE worktree has no family — the rule facts follow (a deleted clone could have been another repository)', () => {
-    const live = path.join(R, '.claude', 'worktrees', 'live-cwd');
-    linkWorktree(live, R, 'live-cwd');
+    const Q = path.join(tmp, 'live-cwd-repo');
+    makeRepo(Q);
+    const live = path.join(Q, '.claude', 'worktrees', 'live-cwd');
+    linkWorktree(live, Q, 'live-cwd');
     expect(resolveRepoRoots(path.join(live, 'gone-clone', 'x'))).toEqual([]);
-    expect(resolveRepoRoots(path.join(R, '.claude', 'worktrees', 'gone-too', 'x')), 'positive control: the worktree folder itself is gone').toEqual([R]);
-    expect(resolveRepoRoots(live), 'positive control: the live worktree').toEqual([live, R]);
+    expect(resolveRepoRoots(path.join(Q, '.claude', 'worktrees', 'gone-too')), 'positive control: the worktree folder itself is gone').toEqual([Q]);
+    expect(resolveRepoRoots(path.join(Q, '.claude', 'worktrees', 'gone-too', 'x')), 'below a deleted worktree folder').toEqual([]);
+    expect(resolveRepoRoots(live), 'positive control: the live worktree').toEqual([live, Q]);
   });
 
-  it('a cwd that reaches its repository through a symbolic link has no family; a link to the root itself is that root', () => {
+  it('a cwd that reaches its repository through a symbolic link has no family — a link to the root itself included', () => {
     fs.mkdirSync(path.join(S, 'sub', 'x'), { recursive: true });
     const via = path.join(R, 'linked-sub');
     fs.symlinkSync(path.join(S, 'sub'), via);
     expect(resolveRepoRoots(path.join(via, 'x')), 'R/linked-sub/x is a folder of S — R is only where the link sits').toEqual([]);
     const toRoot = path.join(tmp, 'link-to-root');
     fs.symlinkSync(R, toRoot);
-    expect(resolveRepoRoots(path.join(toRoot, 'docs'))).toEqual([toRoot]);
+    expect(resolveRepoRoots(toRoot)).toEqual([]);
+    expect(resolveRepoRoots(path.join(toRoot, 'docs')), 'the link\'s target can change under the same path').toEqual([]);
+    expect(resolveRepoRoots(path.join(R, 'docs')), 'positive control: the physical path').toEqual([R]);
   });
 
   it('a cwd that is a file has no family', () => {
@@ -250,6 +279,18 @@ describe('resolveRepoRoots', () => {
     expect(resolveRepoRoots(wt), 'reading it would block the hook; the main repository is not linked').toEqual([wt]);
   });
 
+  it('a linked worktree of a home directory that is a git work tree is only itself (the home never joins as main)', () => {
+    const home = path.join(tmp, 'home3');
+    makeRepo(home);
+    const wt = path.join(tmp, 'wt-of-home');
+    linkWorktree(wt, home, 'w');
+    vi.spyOn(os, 'homedir').mockReturnValue(home);
+    expect(resolveRepoRoots(wt)).toEqual([wt]);
+    vi.restoreAllMocks();
+    clearRepoRootCache();
+    expect(resolveRepoRoots(wt), 'positive control: the same folder as an ordinary repository').toEqual([wt, home]);
+  });
+
   it('the account home counts even when HOME points elsewhere', () => {
     const home = path.join(tmp, 'home2');
     makeRepo(home);
@@ -296,10 +337,12 @@ describe('scopeMatcher', () => {
     expect(m(foreign), 'a worktree of another repository placed under R').toBe(false);
   });
 
-  it('a deleted path under a root stays in the family only inside a worktree container of that root', () => {
+  it('a deleted path under a root stays in the family only as a deleted worktree folder in a container of that root', () => {
+    fs.mkdirSync(path.join(R, '.claude', 'worktrees'), { recursive: true });
     const m = scopeMatcher(path.join(R, 'docs'), true);
     expect(m(path.join(R, '.claude', 'worktrees', 'gone-agent'))).toBe(true);
-    expect(m(path.join(R, '.auto-issue-worktrees', 'gone-9', 'src'))).toBe(true);
+    expect(m(path.join(R, '.auto-issue-worktrees', 'gone-9'))).toBe(true);
+    expect(m(path.join(R, '.auto-issue-worktrees', 'gone-9', 'src')), 'below a deleted worktree folder').toBe(false);
     expect(m(path.join(R, '.claude', 'other', 'x')), 'not a container').toBe(false);
     expect(m(path.join(R, 'never-existed', 'x')), 'a deleted plain folder could have been another repository').toBe(false);
     const clone = path.join(R, 'tmp', 'other-repo');
@@ -335,7 +378,7 @@ describe('scopeMatcher', () => {
     makeRepo(Q);
     fs.mkdirSync(path.join(Q, 'docs'), { recursive: true });
     fs.mkdirSync(path.join(Q, '.claude', 'worktrees'), { recursive: true });
-    const gone = path.join(Q, '.claude', 'worktrees', 'gone', 'x');
+    const gone = path.join(Q, '.claude', 'worktrees', 'gone');
     expect(scopeMatcher(path.join(Q, 'docs'), true)(gone), 'positive control: readable, a deleted worktree').toBe(true);
     const locked = path.join(Q, 'locked');
     fs.mkdirSync(locked, { recursive: true });

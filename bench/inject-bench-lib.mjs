@@ -284,12 +284,20 @@ export function judgeMessageSha(prompt, items, seed, textOf) {
 /** What a retry appends to the first message (inject-judge.mjs judgeCall). */
 export const JUDGE_RETRY_MARK = '\n\nYour previous answer was invalid (';
 
-/** sha256 of the first attempt behind each recorded judge message — a retry is the first message plus a note. */
-export function firstAttemptShas(messages) {
-  return new Set(messages.map((m) => {
-    const i = m.indexOf(JUDGE_RETRY_MARK);
-    return sha256(i > -1 ? m.slice(0, i) : m);
-  }));
+/** sha256 of the first attempt of a recorded judge message — a retry is the first message plus a note. */
+export function firstAttemptSha(message) {
+  const i = message.indexOf(JUDGE_RETRY_MARK);
+  return sha256(i > -1 ? message.slice(0, i) : message);
+}
+
+/** Recorded calls ({message, reply, model, …}) by the sha256 of their first attempt. */
+export function indexCalls(calls) {
+  const out = new Map();
+  for (const c of calls) {
+    const k = firstAttemptSha(c.message);
+    out.set(k, [...(out.get(k) ?? []), c]);
+  }
+  return out;
 }
 
 /** Seeds a judgment row can have been labelled with: the re-judge seed, or the main seed at any item count up to `maxItems`. */
@@ -297,15 +305,26 @@ export function judgeSeedCandidates(row, maxItems) {
   return row.pass === 'rejudge' ? [`${row.qid}:rejudge`] : Array.from({ length: maxItems + 1 }, (_, k) => `${row.qid}:main:${k}`);
 }
 
+/** Whether `reply` gives every item of `row` exactly the row's score, the items labelled with `seed`; `parse` is the judge's reply parser. */
+export function replyGivesRowScores(row, seed, reply, textOf, parse) {
+  const labeled = labelItems(row.items.map((it) => ({ ...it, text: textOf(it.factId) })), seed);
+  const v = validateJudgeReply(parse(reply), labeled.map((it) => it.label));
+  return v.ok && labeled.every((it) => v.scores.get(it.label) === row.scores?.[it.factId]);
+}
+
 /**
- * Binding of a judgment row recorded before rows carried one: the seed whose message, rebuilt from
- * the current texts, is one the judge actually received (`received`: firstAttemptShas of the call
- * transcripts) — or null when none is.
+ * The judge call behind a judgment row written before rows carried a binding: a recorded call
+ * (`callsByFirst`: indexCalls) whose first attempt equals the row's message rebuilt from the current texts
+ * with some candidate seed, answered by the row's model with exactly the row's scores — { seed, message, call }
+ * or null. A message alone only shows that it was sent; the reply shows these scores are its answer.
  */
-export function legacyBinding(row, prompt, textOf, received, maxItems) {
+export function legacyBinding(row, prompt, textOf, callsByFirst, maxItems, parse) {
+  if (!row.scores || !row.items) return null;
   for (const seed of judgeSeedCandidates(row, maxItems)) {
     const message = judgeMessageSha(prompt, row.items, seed, textOf);
-    if (received.has(message)) return { seed, message };
+    for (const call of callsByFirst.get(message) ?? []) {
+      if (call.model === row.model && replyGivesRowScores(row, seed, call.reply, textOf, parse)) return { seed, message, call };
+    }
   }
   return null;
 }
@@ -561,8 +580,8 @@ export function determinismBound(det, lineSha) {
 export const REPLAY_ENTRY = 'bench/inject-replay.mjs';
 const SPEC_RES = [/\bfrom\s*['"]([^'"\n]+)['"]/g, /\bimport\s*['"]([^'"\n]+)['"]/g, /\bimport\(\s*['"]([^'"\n]+)['"]\s*\)/g];
 const DIST_RE = /\bdist\(\s*['"]([^'"\n]+)['"]\s*\)/g;   // the bench scripts' helper naming a dist module
-// Loads the walk cannot follow (a computed dynamic import, CommonJS require) — the list would miss them.
-const OPAQUE_RE = /\bimport\(\s*(?!['"]|dist\()|\brequire\(/;
+// Loads the walk cannot follow (a computed dynamic import or dist name, CommonJS require) — the list would miss them.
+const OPAQUE_RE = /\bimport\(\s*(?!['"]|dist\(\s*['"])|\bdist\(\s*(?!['"])|\brequire\(/;
 const isBuiltin = (spec) => spec.startsWith('node:') || builtinModules.includes(spec);
 const packageName = (spec) => (spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0]);
 // An npm package name — a quoted phrase after 'from' in prose ('from "name: description"') is not an import.
@@ -600,38 +619,74 @@ export function moduleClosure(repo, entry = REPLAY_ENTRY) {
   return { files: [...files].sort(), packages: [...packages].sort() };
 }
 
-/** Files of the embedding model `model` the transformers package loads (its local models folder or its download cache). */
+/** Files under `dir` (links followed, depth-bounded), repo-relative; `keep(name)` filters by file name. Nested node_modules are skipped. */
+function filesUnder(repo, dir, keep = () => true, depth = 0) {
+  const out = [];
+  if (depth > 12) throw new Error(`filesUnder: ${path.relative(repo, dir)} is nested too deep (a link loop?)`);
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    const st = fs.statSync(p, { throwIfNoEntry: false });   // follows a link: a linked weight file is still a weight file
+    if (st?.isDirectory()) { if (e.name !== 'node_modules') out.push(...filesUnder(repo, p, keep, depth + 1)); }
+    else if (st?.isFile() && keep(e.name)) out.push(path.relative(repo, p));
+  }
+  return out;
+}
+
+/** Files of the embedding model `model` the transformers package can load: its local models folder (read first) and its download cache. */
 export function embeddingModelFiles(repo, model) {
   const pkg = path.join(repo, 'node_modules', '@xenova', 'transformers');
   const out = [];
-  const walk = (dir) => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (e.isFile()) out.push(path.relative(repo, p));
-    }
-  };
   for (const base of ['models', '.cache']) {
     const dir = path.join(pkg, base, model);
-    if (fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) walk(dir);
+    if (fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) out.push(...filesUnder(repo, dir));
   }
   return out.sort();
 }
 
+const NATIVE_RE = /\.(node|dylib|so|dll)(\.\d+)*$/;
+
+/**
+ * Installed packages `roots` pull in — dependencies and installed optional ones, transitively (a package's
+ * own node_modules first, then the top level) — with their versions and the sha256 of their native binaries.
+ * A required dependency that is not installed is recorded as missing.
+ */
+export function dependencyDigest(repo, roots) {
+  const out = {};
+  const seen = new Set();
+  const queue = roots.map((name) => ({ name, dir: path.join(repo, 'node_modules', name), required: true }));
+  while (queue.length) {
+    const { name, dir, required } = queue.shift();
+    const key = path.relative(repo, dir);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let pkg;
+    try { pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); } catch {
+      if (required) out[`package:${name}`] = 'missing';
+      continue;
+    }
+    out[`package:${key.replace(/^node_modules\//, '')}`] = pkg.version ?? 'no version';
+    for (const f of filesUnder(repo, dir, (n) => NATIVE_RE.test(n))) out[`native:${f}`] = sha256File(path.join(repo, f));
+    const deps = [...Object.keys(pkg.dependencies ?? {}).map((d) => [d, true]), ...Object.keys(pkg.optionalDependencies ?? {}).map((d) => [d, false])];
+    for (const [dep, req] of deps) {
+      const nested = path.join(dir, 'node_modules', dep);
+      queue.push({ name: dep, dir: fs.existsSync(path.join(nested, 'package.json')) ? nested : path.join(repo, 'node_modules', dep), required: req });
+    }
+  }
+  return out;
+}
+
 /**
  * What decides the replayed lines besides the inputs — recorded by --replay, compared by --report:
- * sha256 of every module the replay loads, the installed version of every package they import, the
- * embedding model id (`model`, the resolved EMBEDDING_MODEL) and sha256 of its files.
+ * sha256 of every module the replay loads, the packages they import (transitively: versions and native
+ * binaries — dependencyDigest), the Node version, the embedding model id (`model`, the resolved
+ * EMBEDDING_MODEL) and sha256 of its files.
  */
 export function codeDigest(repo, model) {
   const { files, packages } = moduleClosure(repo);
   const out = {};
   for (const f of files) out[f] = sha256File(path.join(repo, f));
-  for (const name of packages) {
-    let version = 'missing';
-    try { version = JSON.parse(fs.readFileSync(path.join(repo, 'node_modules', name, 'package.json'), 'utf8')).version ?? 'no version'; } catch { /* recorded as missing */ }
-    out[`package:${name}`] = version;
-  }
+  Object.assign(out, dependencyDigest(repo, packages));
+  out.node = `${process.version} ${process.platform}-${process.arch}`;
   out['embedding-model'] = model;
   const modelFiles = embeddingModelFiles(repo, model);
   if (modelFiles.length === 0) out['embedding-model-files'] = 'none on disk';

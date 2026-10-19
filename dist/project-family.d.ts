@@ -21,10 +21,12 @@
  * a home directory ($HOME or the account's own — HOME can be overridden), an
  * ancestor of one, or '/': a home directory that is itself a git work tree
  * would otherwise make every non-repo folder under it one family with every
- * project. Relative paths (slug-form projects) have no family, and neither has
- * a cwd that is a symbolic link or a file, or that reaches its repository
- * through a symbolic link (a link inside a repository can point into another
- * one). A path that cannot be read (EACCES, EIO) counts as no family / outside
+ * project. Relative paths have no family here (callers resolve a slug-form
+ * project to a path first — canonicalizeProject — and use that path's family),
+ * and neither has a cwd that is a symbolic link or a file, or that reaches its
+ * repository through a symbolic link — the root itself included (a link can
+ * point into another repository, and a link's target can change under the same
+ * path). A path that cannot be read (EACCES, EIO) counts as no family / outside
  * it, never as absent. The worktrees of a bare repository (`<dir>/.bare/worktrees/…`)
  * are not grouped: each one is its own family.
  */
@@ -45,7 +47,7 @@ export declare function clearRepoRootCache(): void;
  * exact match the injection has always used; family=true matches a root or a
  * path under it — on a '/' boundary, so `<repo>` never matches
  * `<repo>-extra`, never inside a repository nested under a root, and a
- * deleted path only inside a worktree container of the root. A
+ * deleted path only when it is a deleted worktree folder of the root (deletedWorktreeOf). A
  * path with '.' or '..' segments matches only exactly. A null project sees
  * every scope.
  */

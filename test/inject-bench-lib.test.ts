@@ -12,7 +12,7 @@ import {
   buildFactIndex, repoOf, unboundMeta, driftedInputs, missingRows, determinismEntry, determinismBound, affectedReadings, PROJECT_FACTS_SQL,
   placementOf, widenedFactIds, sqliteDigest, driftedCode, codeDigest, REPLAY_ENTRY, moduleClosure, embeddingModelFiles,
   gitState, replayBinding, bindingDrift, recordRoots, JUDGE_SYSTEM, JUDGE_RETRY_MARK, judgeMessage, judgeUserMessage,
-  judgeMessageSha, firstAttemptShas, judgeSeedCandidates, legacyBinding,
+  judgeMessageSha, firstAttemptSha, indexCalls, replyGivesRowScores, judgeSeedCandidates, legacyBinding, dependencyDigest,
 } from '../bench/inject-bench-lib.mjs';
 import { execFileSync } from 'child_process';
 import crypto from 'crypto';
@@ -302,6 +302,9 @@ describe('decision', () => {
     expect(replay).toContain('const { inputs, code } = bound;');
     expect(judge, 'the report compares the whole code digest').toContain('const codeChanged = driftedCode(meta.code?.files, codeDigest(REPO, EMBEDDING_MODEL));');
     expect(judge, 'every scored judgment row is bound').toContain('if (judgeMessageSha(promptOf.get(j.qid), j.items, b.seed, textOf) !== b.message) { binding.drifted++; continue; }');
+    expect(judge, 'the judge records what it sends with the function the report checks with').toContain('const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };');
+    expect(judge, 'and labels the call with the same seed').toContain('const labeled = labelItems(task.want.map((w) => ({ ...w, text: text(w.factId) })), task.seed);');
+    expect(judge, 'a failed first call is asked again in full (its controls too)').toContain("for (const j of prior) if (j.pass === 'main' && j.items && j.scores) items.set(");
     expect(replay).toContain('const reading = affectedReadings(widened(p.project), asOf.visibleFactId);');
     expect(replay).toContain('if (reading.registered) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
     expect(replay).toContain('const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();');
@@ -367,6 +370,8 @@ describe('decision', () => {
       expect(() => moduleClosure(dir), 'a computed import').toThrow(/cannot follow/);
       put('dist/dep.js', "const r = require('x');\n");
       expect(() => moduleClosure(dir), 'a CommonJS require').toThrow(/cannot follow/);
+      put('dist/dep.js', "const n = 'mod.js';\nawait import(dist(n));\n");
+      expect(() => moduleClosure(dir), 'a computed dist name').toThrow(/cannot follow/);
       put('dist/dep.js', "import './gone.js';\n");
       expect(() => moduleClosure(dir), 'a relative import naming no file').toThrow(/dist\/gone\.js is imported but is not a file/);
       put('dist/dep.js', 'export const y = 2;\n');
@@ -384,6 +389,15 @@ describe('decision', () => {
       expect(driftedCode(before, withModel)).toEqual(['embedding-model-files', weights].sort());
       put(weights, 'w2');
       expect(driftedCode(withModel, codeDigest(dir, 'Org/model')), 'other weights').toEqual([weights]);
+      // the local models folder (transformers reads it first) counts too, and a linked weight file is still a weight file
+      const local = 'node_modules/@xenova/transformers/models/Org/model/onnx/model_quantized.onnx';
+      put('weights-store/real.onnx', 'w3');
+      fs.mkdirSync(path.dirname(path.join(dir, local)), { recursive: true });
+      fs.symlinkSync(path.join(dir, 'weights-store', 'real.onnx'), path.join(dir, local));
+      expect(embeddingModelFiles(dir, 'Org/model')).toEqual([weights, local].sort());
+      const linked = codeDigest(dir, 'Org/model');
+      put('weights-store/real.onnx', 'w4');
+      expect(driftedCode(linked, codeDigest(dir, 'Org/model')), 'the linked file\'s bytes').toEqual([local]);
       expect(driftedCode(withModel, codeDigest(dir, 'Org/other')), 'another model').toContain('embedding-model');
       put('dist/dep.js', 'export const y = 3;\n');
       expect(driftedCode(withModel, codeDigest(dir, 'Org/model'))).toContain('dist/dep.js');
@@ -402,6 +416,36 @@ describe('decision', () => {
     expect(real.files).toEqual(expect.arrayContaining(['bench/inject-replay.mjs', 'bench/inject-bench-lib.mjs', 'dist/inject-select.js', 'dist/project-family.js',
       'dist/fact-db.js', 'dist/ontology-db.js', 'dist/embeddings.js', 'dist/db.js', 'dist/fact-text.js', 'dist/embedding-version.js', 'dist/project-canon.js']));
     expect(real.packages).toEqual(expect.arrayContaining(['@xenova/transformers', 'better-sqlite3', 'sqlite-vec']));
+    const realDigest = codeDigest(repo, 'Xenova/multilingual-e5-small');
+    expect(realDigest.node, 'the Node version').toBe(`${process.version} ${process.platform}-${process.arch}`);
+    expect(Object.keys(realDigest), 'sub-dependencies and native binaries').toEqual(expect.arrayContaining(['package:onnxruntime-node', 'native:node_modules/better-sqlite3/build/Release/better_sqlite3.node']));
+  });
+  it('dependencyDigest follows dependencies (own node_modules first) and installed optional ones, with native binaries; a missing required one is recorded', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-deps-'));
+    const put = (rel: string, body: string) => { fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true }); fs.writeFileSync(path.join(dir, rel), body); };
+    const pkg = (rel: string, version: string, deps: Record<string, string> = {}, optional: Record<string, string> = {}) =>
+      put(`${rel}/package.json`, JSON.stringify({ version, dependencies: deps, optionalDependencies: optional }));
+    try {
+      pkg('node_modules/a', '1.0.0', { b: '^1', gone: '^1' }, { 'opt-here': '1', 'opt-absent': '1' });
+      pkg('node_modules/b', '1.0.0');
+      pkg('node_modules/a/node_modules/b', '2.0.0', { c: '1' });   // a's own b wins over the top-level one
+      pkg('node_modules/c', '3.0.0');
+      pkg('node_modules/opt-here', '0.1.0');
+      put('node_modules/opt-here/bin/lib.dylib', 'native-1');
+      put('node_modules/opt-here/bin/readme.txt', 'not native');
+      put('node_modules/opt-here/node_modules/x/x.node', 'nested package — not opt-here\'s own binary');
+      const d = dependencyDigest(dir, ['a']);
+      expect(d).toEqual({
+        'package:a': '1.0.0', 'package:a/node_modules/b': '2.0.0', 'package:c': '3.0.0', 'package:gone': 'missing', 'package:opt-here': '0.1.0',
+        'native:node_modules/opt-here/bin/lib.dylib': crypto.createHash('sha256').update('native-1').digest('hex'),
+      });
+      put('node_modules/opt-here/bin/lib.dylib', 'native-2');
+      expect(driftedCode(d, dependencyDigest(dir, ['a']))).toEqual(['native:node_modules/opt-here/bin/lib.dylib']);
+      pkg('node_modules/c', '3.0.1');
+      expect(driftedCode(d, dependencyDigest(dir, ['a']))).toContain('package:c');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
   it('gitState: HEAD and whether src/bench/dist are dirty (a temporary repository)', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-git-'));
@@ -477,15 +521,29 @@ describe('decision', () => {
     expect(judgeMessageSha(prompt, items, 'q:main:0', (id) => (id === 'b' ? '[note] lunch is soup' : textOf(id))), 'one fact text').not.toBe(m0);
     // what the judge received: the first attempt, or a retry (first message + a note)
     const sent = judgeMessage(prompt, labeled);
-    expect(firstAttemptShas([sent])).toEqual(new Set([m0]));
-    expect(firstAttemptShas([`${sent}${JUDGE_RETRY_MARK}missing id f2). Answer again`])).toEqual(new Set([m0]));
+    expect(firstAttemptSha(sent)).toBe(m0);
+    expect(firstAttemptSha(`${sent}${JUDGE_RETRY_MARK}missing id f2). Answer again`)).toBe(m0);
     expect(judgeSeedCandidates({ qid: 'q', pass: 'rejudge' }, 9)).toEqual(['q:rejudge']);
     expect(judgeSeedCandidates({ qid: 'q', pass: 'main' }, 2)).toEqual(['q:main:0', 'q:main:1', 'q:main:2']);
+    // a legacy row binds to a call whose message is the row's AND whose reply gives the row's scores, from the row's model
     const later = labelItems(items.map((it) => ({ ...it, text: textOf(it.factId) })), 'q:main:2');
-    const received = firstAttemptShas(['an unrelated worker prompt', judgeMessage(prompt, later)]);
-    expect(legacyBinding({ qid: 'q', pass: 'main', items }, prompt, textOf, received, 5)).toEqual({ seed: 'q:main:2', message: sha(judgeMessage(prompt, later)) });
-    expect(legacyBinding({ qid: 'q', pass: 'main', items }, prompt, textOf, received, 1), 'the seed is past the candidates').toBeNull();
-    expect(legacyBinding({ qid: 'q', pass: 'main', items }, prompt, (id) => (id === 'a' ? '[decision] Liquibase' : textOf(id)), received, 5), 'the text judged differs').toBeNull();
+    const scores = { a: 2, b: 0, c: 1 };
+    const replyOf = (lab: typeof later, sc: Record<string, number>) => JSON.stringify(lab.map((it) => ({ id: it.label, score: sc[it.factId] })));
+    const row = { qid: 'q', pass: 'main', model: 'm1', items, scores };
+    const parse = (t: string) => { try { return JSON.parse(t); } catch { return null; } };
+    expect(replyGivesRowScores(row, 'q:main:2', replyOf(later, scores), textOf, parse)).toBe(true);
+    expect(replyGivesRowScores(row, 'q:main:2', replyOf(later, { ...scores, b: 1 }), textOf, parse), 'one score differs').toBe(false);
+    expect(replyGivesRowScores(row, 'q:main:0', replyOf(later, scores), textOf, parse), 'labels of another seed').toBe(false);
+    const call = { message: judgeMessage(prompt, later), reply: replyOf(later, scores), model: 'm1' };
+    const calls = indexCalls([{ message: 'an unrelated worker prompt', reply: '[]', model: 'm1' }, call]);
+    expect(legacyBinding(row, prompt, textOf, calls, 5, parse)).toEqual({ seed: 'q:main:2', message: sha(judgeMessage(prompt, later)), call });
+    expect(legacyBinding(row, prompt, textOf, calls, 1, parse), 'the seed is past the candidates').toBeNull();
+    expect(legacyBinding(row, prompt, (id) => (id === 'a' ? '[decision] Liquibase' : textOf(id)), calls, 5, parse), 'the text judged differs').toBeNull();
+    expect(legacyBinding({ ...row, model: 'm2' }, prompt, textOf, calls, 5, parse), 'another model answered').toBeNull();
+    expect(legacyBinding({ ...row, scores: { ...scores, c: 2 } }, prompt, textOf, calls, 5, parse), 'the row holds other scores').toBeNull();
+    const retry = { ...call, message: `${call.message}${JUDGE_RETRY_MARK}missing id f1). Answer again` };
+    const failedFirst = { ...call, reply: 'not json' };
+    expect(legacyBinding(row, prompt, textOf, indexCalls([failedFirst, retry]), 5, parse)?.call, 'the retry that answered, not the first attempt').toBe(retry);
   });
   it('repoOf groups a linked worktree with its repository; unboundMeta names variants whose meta hash differs', () => {
     expect(repoOf(['/r/.wt/a', '/r'], '/r/.wt/a/src')).toBe('/r');

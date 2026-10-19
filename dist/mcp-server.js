@@ -52113,17 +52113,15 @@ function resolveUncached(cwd) {
     }
     return [];
   }
-  let viaLink = false;
   for (let dir = start; ; dir = path3.dirname(dir)) {
     const st = dir === start ? own2 : lstat(dir);
-    if (st === UNREADABLE) return [];
+    if (st === UNREADABLE || st !== null && st.isSymbolicLink()) return [];
     const g = dotGitOf(dir);
     if (g.kind !== "none") {
-      if (viaLink || g.kind === "invalid" || tooBroad(dir)) return [];
+      if (g.kind === "invalid" || tooBroad(dir)) return [];
       if (g.kind === "root") return [dir];
       return g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
     }
-    if (st !== null && st.isSymbolicLink()) viaLink = true;
     if (dir === path3.dirname(dir)) return [];
   }
 }
@@ -52136,10 +52134,24 @@ function resolveRepoRoots(cwd) {
   cache.set(cwd, { roots, at: now });
   return roots;
 }
+function ownContainer(root, container) {
+  let entries;
+  try {
+    entries = fs3.readdirSync(container, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  return entries.every((e) => {
+    if (e.isSymbolicLink()) return false;
+    if (!e.isDirectory()) return true;
+    const g = dotGitOf(path3.join(container, e.name));
+    return g.kind === "linked" && g.main === root;
+  });
+}
 function deletedWorktreeOf(root, scopeProject, missing) {
   return WORKTREE_CONTAINERS.some((c) => {
     const base = root + c;
-    return scopeProject.startsWith(base) && (base.startsWith(missing + "/") || path3.dirname(missing) + "/" === base);
+    return scopeProject === missing && path3.dirname(missing) + "/" === base && ownContainer(root, base.slice(0, -1));
   });
 }
 function excludedUnderRoot(root, scopeProject, roots) {

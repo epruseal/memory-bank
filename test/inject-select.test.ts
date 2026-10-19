@@ -50,6 +50,7 @@ beforeAll(async () => {
     fs.writeFileSync(path.join(repo, '.git', 'HEAD'), 'ref: refs/heads/main\n');
   }
   fs.mkdirSync(PROJECT, { recursive: true });
+  fs.mkdirSync(path.join(REPO, '.auto-issue-worktrees'), { recursive: true });   // the container a deleted worktree was in
   sel = await import('../src/inject-select.js');
   embed = await import('../src/embeddings.js');
   factDb = await import('../src/fact-db.js');

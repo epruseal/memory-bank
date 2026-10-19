@@ -6,7 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { VARIANTS, codeDigest, judgeMessageSha, parseDecisionsBlock, sqliteDigest } from '../bench/inject-bench-lib.mjs';
+import { VARIANTS, codeDigest, judgeMessage, judgeMessageSha, labelItems, parseDecisionsBlock, sqliteDigest } from '../bench/inject-bench-lib.mjs';
 import { truncateFact } from '../src/fact-text.js';
 import { EMBEDDING_MODEL } from '../src/embedding-version.js';
 
@@ -121,8 +121,9 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.report.c2.byRepo.largest).toEqual({ prompts: 14, differs: 7, gain: 7, cwdRoots: 1 });
     expect(r.report.c2.byRepo.withoutLargest).toEqual({ measurable: false, n: 26, gain: 13 });
     expect(r.report.c2.blockDiffers).toEqual({ prompts: 20, cwds: 3, repos: 3 });
-    expect(r.report.judge.binding).toEqual({ inline: 251, transcript: 0, unbound: 0, drifted: 0 });
+    expect(r.report.judge.binding).toEqual({ inline: 251, transcript: 0, unbound: 0, drifted: 0, noCall: 0, retried: 0 });
     expect(r.report.judge.fillRows, 'the q7 row without controls').toBe(1);
+    expect(r.report.judge.promptsWithoutControls, 'q7 also has its first row with controls').toBe(0);
     const docText = fs.readFileSync(doc, 'utf8');
     expect(docText, 'the doc names the report it came from').toContain(`sha256: \`${sha(path.join(out, 'report.json'))}\``);
     expect(docText, 'every placement bucket the report holds is listed').toContain('가족 없음 40·20·+20');
@@ -132,20 +133,62 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.report.inputs.code.report.dirty, 'the dirty flag is the working tree\'s').toBe(status !== '');
   });
 
-  it('a row written before rows carried a binding counts through judgment-bindings.json (the --bind-legacy file) and only there', () => {
+  it('--bind-legacy binds a row written before rows carried a binding only to a recorded judge call with its message AND its scores; the report checks the kept call again', () => {
     const file = path.join(out, 'judgments.jsonl');
     const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-    const row = JSON.parse(lines[0]);
-    const legacyLine = JSON.stringify({ ...row, bound: undefined });
-    lines[0] = legacyLine;
+    const legacy = [0, 1].map((n) => { const row = JSON.parse(lines[n]); lines[n] = JSON.stringify({ ...row, bound: undefined }); return row; });
     fs.writeFileSync(file, lines.join('\n') + '\n');
-    expect(report().stderr, 'no binding anywhere').toMatch(/1 without a binding/);
-    const key = crypto.createHash('sha256').update(legacyLine).digest('hex');
-    fs.writeFileSync(path.join(out, 'judgment-bindings.json'), JSON.stringify({ version: 1, rows: { [key]: { ...row.bound, via: 'transcript' } } }));
+    expect(report().stderr, 'no binding anywhere').toMatch(/2 without a binding/);
+    // the isolated LLM sessions' transcripts: one SDK query per file (user message, then the assistant's answer)
+    const projects = path.join(out, 'projects');
+    const llm = path.join(projects, '-private-tmp-memory-bank-llm');
+    fs.mkdirSync(llm, { recursive: true });
+    const record = (name: string, i: number, row: { items: Array<{ factId: string; kind: string }>; scores: Record<string, number>; bound: { seed: string } }, scores = row.scores, model = 'test-model') => {
+      const labeled = labelItems(row.items.map((it) => ({ ...it, text: judged(it.factId) })), row.bound.seed);
+      const reply = JSON.stringify(labeled.map((it) => ({ id: it.label, score: scores[it.factId] })));
+      fs.writeFileSync(path.join(llm, name), [
+        JSON.stringify({ type: 'user', message: { role: 'user', content: judgeMessage(promptOf(i), labeled) } }),
+        JSON.stringify({ type: 'assistant', message: { model, content: [{ type: 'text', text: reply }] } }),
+      ].join('\n') + '\n');
+    };
+    const bind = () => spawnSync(process.execPath, [SCRIPT, '--bind-legacy', '--out', out], { encoding: 'utf8', env: { ...process.env, TEST_PROJECTS_DIR: projects } });
+    record('row0.jsonl', 0, legacy[0]);
+    record('row1-other-model.jsonl', 1, legacy[1], legacy[1].scores, 'another-model');
+    record('row1-other-scores.jsonl', 1, legacy[1], { ...legacy[1].scores, cs1: 2 });
+    const first = bind();
+    expect(first.status, 'row 1 has no call with its model and its scores').toBe(1);
+    expect(JSON.parse(first.stdout.trim().split('\n').pop() ?? '{}')).toMatchObject({ matched: 1, unmatchedScored: 1 });
+    expect(report().stderr).toMatch(/1 without a binding/);
+    record('row1.jsonl', 1, legacy[1]);
+    const second = bind();
+    expect(second.status, second.stderr).toBe(0);
     const r = report();
     expect(r.status, r.stderr).toBe(0);
-    expect(r.report.judge.binding).toEqual({ inline: 250, transcript: 1, unbound: 0, drifted: 0 });
+    expect(r.report.judge.binding).toMatchObject({ inline: 249, transcript: 2, unbound: 0, drifted: 0, noCall: 0 });
     expect(r.report.inputs.bindings).toBe(sha(path.join(out, 'judgment-bindings.json')));
+    expect(r.report.inputs.judgeCalls).toBe(sha(path.join(out, 'judge-calls.jsonl')));
+    // the kept call is the evidence: another score in it, or no kept call at all, and the binding no longer counts
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    const kept = fs.readFileSync(callsFile, 'utf8');
+    fs.writeFileSync(callsFile, kept.replace(/"score\\":0/, '"score\\":2'));
+    expect(kept.includes('"score\\":0'), 'the fixture has a score to change').toBe(true);
+    expect(report().stderr).toMatch(/1 whose kept judge call is missing or does not give the row's scores/);
+    fs.rmSync(callsFile);
+    expect(report().stderr, 'a bindings file without its calls').toMatch(/2 whose kept judge call is missing/);
+  });
+
+  it('a judged prompt with no control in any scored main row is counted (V1/V2 then rest on fewer pairs)', () => {
+    const file = path.join(out, 'judgments.jsonl');
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const row = JSON.parse(lines[9]);
+    const items = row.items.filter((it: { kind: string }) => it.kind === 'line');
+    const scores = Object.fromEntries(items.map((it: { factId: string }) => [it.factId, row.scores[it.factId]]));
+    lines[9] = JSON.stringify({ ...row, items, scores, bound: bound(9, items, row.bound.seed) });
+    fs.writeFileSync(file, lines.join('\n') + '\n');
+    const r = report();
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.report.judge.promptsWithoutControls).toBe(1);
+    expect(r.report.judge.controls.same[1], 'one prompt\'s control fewer').toBe(N - 1);
   });
 
   it('V4 fails when either determinism run differs from the lines file the report reads — the harness is then invalid', () => {

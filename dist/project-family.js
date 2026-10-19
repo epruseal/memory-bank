@@ -24,10 +24,12 @@ import path from 'path';
  * a home directory ($HOME or the account's own — HOME can be overridden), an
  * ancestor of one, or '/': a home directory that is itself a git work tree
  * would otherwise make every non-repo folder under it one family with every
- * project. Relative paths (slug-form projects) have no family, and neither has
- * a cwd that is a symbolic link or a file, or that reaches its repository
- * through a symbolic link (a link inside a repository can point into another
- * one). A path that cannot be read (EACCES, EIO) counts as no family / outside
+ * project. Relative paths have no family here (callers resolve a slug-form
+ * project to a path first — canonicalizeProject — and use that path's family),
+ * and neither has a cwd that is a symbolic link or a file, or that reaches its
+ * repository through a symbolic link — the root itself included (a link can
+ * point into another repository, and a link's target can change under the same
+ * path). A path that cannot be read (EACCES, EIO) counts as no family / outside
  * it, never as absent. The worktrees of a bare repository (`<dir>/.bare/worktrees/…`)
  * are not grouped: each one is its own family.
  */
@@ -153,8 +155,7 @@ function resolveUncached(cwd) {
         // A deleted worktree (replayed history): its container names the repo — when the
         // folder in front of the container is itself a repository root (an umbrella folder
         // holding worktrees of several repositories is not) and the path is a deleted worktree
-        // of it by the rule facts follow (excludedUnderRoot): what is gone is the container or a
-        // worktree folder directly in it, not a folder inside a live worktree (a deleted clone).
+        // of it by the rule facts follow (excludedUnderRoot → deletedWorktreeOf).
         for (const marker of WORKTREE_CONTAINERS) {
             const i = start.indexOf(marker);
             if (i > 0) {
@@ -164,23 +165,20 @@ function resolveUncached(cwd) {
         }
         return [];
     }
-    // A link passed below the repository root: the repository found above it is the one the link
-    // sits in, not the one its target belongs to (a link to the root itself is the root).
-    let viaLink = false;
     for (let dir = start;; dir = path.dirname(dir)) {
+        // A link on the way up to the repository root, the root included: the repository found is the
+        // one the link sits in (or the link's current target), not where the cwd's facts were made.
         const st = dir === start ? own : lstat(dir);
-        if (st === UNREADABLE)
+        if (st === UNREADABLE || (st !== null && st.isSymbolicLink()))
             return [];
         const g = dotGitOf(dir);
         if (g.kind !== 'none') {
-            if (viaLink || g.kind === 'invalid' || tooBroad(dir))
+            if (g.kind === 'invalid' || tooBroad(dir))
                 return [];
             if (g.kind === 'root')
                 return [dir];
             return g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
         }
-        if (st !== null && st.isSymbolicLink())
-            viaLink = true;
         if (dir === path.dirname(dir))
             return [];
     }
@@ -206,15 +204,38 @@ export function clearRepoRootCache() {
     cache.clear();
 }
 /**
- * Whether the first missing folder `missing` on the way to `scopeProject` is a deleted worktree of
- * `root`: the path lies in one of the root's own worktree containers and what is gone is the
- * container itself or a worktree folder directly in it — not something deeper (a clone deleted from
- * inside a live worktree could have been another repository).
+ * Whether `container` (a worktree container of `root`, present on disk) holds nothing but the root's
+ * own linked worktrees — any other folder or link in it (a per-repository layer such as
+ * `ORG-REPO/`, a clone) means it may hold several repositories' worktrees. Files are ignored.
+ */
+function ownContainer(root, container) {
+    let entries;
+    try {
+        entries = fs.readdirSync(container, { withFileTypes: true });
+    }
+    catch {
+        return false;
+    }
+    return entries.every((e) => {
+        if (e.isSymbolicLink())
+            return false;
+        if (!e.isDirectory())
+            return true;
+        const g = dotGitOf(path.join(container, e.name));
+        return g.kind === 'linked' && g.main === root;
+    });
+}
+/**
+ * Whether `scopeProject`, whose first missing folder on the way down from `root` is `missing`, is a
+ * deleted worktree of `root`: the path IS a worktree folder directly in one of the root's worktree
+ * containers, that container is still there and holds only the root's own linked worktrees. A deeper
+ * path (a clone inside the deleted worktree?), a gone container, or a container that also holds
+ * other folders (an umbrella of several repositories' worktrees?) cannot be told apart on disk — left out.
  */
 function deletedWorktreeOf(root, scopeProject, missing) {
     return WORKTREE_CONTAINERS.some((c) => {
         const base = root + c; // '<root>/.claude/worktrees/'
-        return scopeProject.startsWith(base) && (base.startsWith(missing + '/') || path.dirname(missing) + '/' === base);
+        return scopeProject === missing && path.dirname(missing) + '/' === base && ownContainer(root, base.slice(0, -1));
     });
 }
 /**
@@ -222,10 +243,10 @@ function deletedWorktreeOf(root, scopeProject, missing) {
  * a folder on the way (or the path itself) is a symbolic link (it can point
  * into another repository), or has its own `.git` that is not a
  * linked worktree of a family root (a separate clone, a submodule). A folder
- * that no longer exists ends the walk: the path stays in the family only under
- * a worktree container of the root (`<root>/.claude/worktrees/…`,
- * `<root>/.auto-issue-worktrees/…` — a deleted worktree of this repository,
- * see deletedWorktreeOf). A folder that cannot be read excludes the path.
+ * that no longer exists ends the walk: the path stays in the family only when
+ * it is itself a deleted worktree folder in a worktree container of the root
+ * (`<root>/.claude/worktrees/<w>`, `<root>/.auto-issue-worktrees/<w>` — see
+ * deletedWorktreeOf). A folder that cannot be read excludes the path.
  * Any other deleted path may have been another repository, and nothing on disk
  * can tell, so it is left out — at the cost of facts from deleted plain
  * sub-folders of the repository.
@@ -259,7 +280,7 @@ function excludedUnderRoot(root, scopeProject, roots) {
  * exact match the injection has always used; family=true matches a root or a
  * path under it — on a '/' boundary, so `<repo>` never matches
  * `<repo>-extra`, never inside a repository nested under a root, and a
- * deleted path only inside a worktree container of the root. A
+ * deleted path only when it is a deleted worktree folder of the root (deletedWorktreeOf). A
  * path with '.' or '..' segments matches only exactly. A null project sees
  * every scope.
  */
