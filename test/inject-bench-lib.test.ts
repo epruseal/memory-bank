@@ -317,7 +317,7 @@ describe('decision', () => {
     expect(judge, 'a failed first call is asked again in full (its controls too)').toContain('const items = scoredMainItems(prior, MODEL);');
     expect(judge, 'and a re-judge asks the scored main items only').toContain('const itemsNow = scoredMainItems(loadJudgments(), MODEL);');
     expect(judge, '--judge checks its arguments, then retires, before it asks anything').toMatch(/const limit = intArg\('--limit'[^\n]*\n  closeTornTail\(JUDGMENTS\);\n  closeTornTail\(JUDGE_CALLS\);\n  const \{ sample, lines \} = await loadBench\(\);\n  const retired = await retireStale\(sample, lines\);\n/);
-    expect(judge, 'retiring records the marked calls in the bindings, then marks them, then the rows go').toMatch(/write\(BINDINGS, JSON\.stringify\(\{ \.\.\.\(doc \?\? \{ version: 5 \}\), retired \}[^\n]*\n  write\(JUDGE_CALLS, calls\.map[^\n]*\n  const rest = [^\n]*\n  write\(JUDGMENTS, rest/);
+    expect(judge, 'retiring records the marked calls in the bindings, then marks them, then the rows go').toMatch(/write\(BINDINGS, JSON\.stringify\(\{ \.\.\.\(doc \?\? \{ version: 6 \}\), retired, retiredRows: [^\n]*\n  write\(JUDGE_CALLS, calls\.map[^\n]*\n  const rest = [^\n]*\n  write\(JUDGMENTS, rest/);
     expect(replay).toContain('const reading = affectedReadings(widened(p.project), asOf.visibleFactId);');
     expect(replay).toContain('if (reading.registered) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
     expect(replay).toContain('const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();');

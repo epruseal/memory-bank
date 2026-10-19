@@ -483,11 +483,17 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     db.prepare("UPDATE facts SET fact = 'rewritten by a later consolidation' WHERE id = 'cs5'").run();
     db.close();
     writeMeta();
-    // what a run cut off between its two writes leaves: q5's calls marked, q5's rows still in judgments.jsonl
+    // what a run cut off after its first two writes leaves: the bindings name q5's rows and marked calls, the calls are
+    // marked, q5's rows are still in judgments.jsonl
     const keys5 = new Set(fs.readFileSync(file, 'utf8').split('\n').filter((l) => l && JSON.parse(l).qid === 'q5').map((l) => crypto.createHash('sha256').update(l).digest('hex')));
     expect(keys5.size).toBe(2);
     const mark = '2026-10-19T00:00:00.000Z';
-    fs.writeFileSync(callsFile, fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => { const c = JSON.parse(l); return JSON.stringify(keys5.has(c.key) ? { ...c, retired: mark } : c); }).join('\n') + '\n');
+    const marked = fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => { const c = JSON.parse(l); return keys5.has(c.key) ? { ...c, retired: mark } : c; });
+    fs.writeFileSync(callsFile, marked.map((c) => JSON.stringify(c)).join('\n') + '\n');
+    const bindingsFile = path.join(out, 'judgment-bindings.json');
+    const doc = JSON.parse(fs.readFileSync(bindingsFile, 'utf8'));
+    const entries = marked.filter((c) => c.retired).map((c) => ({ sha: crypto.createHash('sha256').update(JSON.stringify(c)).digest('hex'), key: c.key, file: c.file }));
+    fs.writeFileSync(bindingsFile, JSON.stringify({ ...doc, retired: entries, retiredRows: [...keys5] }));
     const r = await run(['--retire-stale', '--out', out]);
     expect(r.status, r.stdout + r.stderr).toBe(0);
     expect(JSON.parse(r.stdout.trim().split('\n')[0])).toEqual({ retired: 2 });
@@ -563,6 +569,47 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.status, r.stdout + r.stderr).toBe(0);
     expect(JSON.parse(r.stdout.trim().split('\n')[0]), 'the refused row, q9\'s main row and its re-judge').toEqual({ retired: 3 });
     expect(lastJson(r)).toMatchObject({ answeredByOther: 0, unmatchedScored: 0 });
+    expect(JSON.parse(fs.readFileSync(path.join(out, 'judgment-bindings.json'), 'utf8')).refused, 'recorded with its prompt (V6 counts it)').toEqual([{ key: crypto.createHash('sha256').update(line).digest('hex'), qid: 'q9' }]);
+    // the refused row written back (its original bytes): it goes again on its own — it retires nothing else
+    fs.appendFileSync(file, line + '\n');
+    const back = await run(['--retire-stale', '--out', out]);
+    expect(JSON.parse(back.stdout.trim().split('\n')[0])).toEqual({ retired: 1 });
+    // q9's re-judge asked again with the same bytes (the seeds are fixed) and answered by the other model again: the
+    // retired call and its transcript are no candidates, so the new row binds only by its own record — refused again
+    const rejudge = JSON.parse(lines.find((l) => JSON.parse(l).qid === 'q9' && JSON.parse(l).pass === 'rejudge') as string);
+    const again = JSON.stringify({ ...rejudge, at: '2026-10-20T10:00:00.000Z' });
+    fs.appendFileSync(file, again + '\n');
+    keepSelf(again, 9, rejudge.items, rejudge.bound.seed, rejudge.reply);
+    const relabeled = labelItems(rejudge.items.map((it: Item) => ({ ...it, text: judged(it.factId) })), rejudge.bound.seed);
+    fs.writeFileSync(path.join(llmDir(), 'again.jsonl'), [
+      JSON.stringify({ type: 'user', timestamp: '2026-10-20T09:59:58.000Z', message: { role: 'user', content: judgeMessage(promptOf(9), relabeled) } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-10-20T09:59:58.000Z', message: { model: 'fallback-model', content: [{ type: 'text', text: rejudge.reply }] } }),
+    ].join('\n') + '\n');
+    const reasked = await bind();
+    expect(reasked.status).toBe(1);
+    expect(lastJson(reasked), 'not bound to the retired re-judge call of the same bytes').toMatchObject({ answeredByOther: 1, matched: 0 });
+  });
+
+  it('V6 counts every refusal the bindings recorded for a sampled prompt as a failed call, its row retired or not', async () => {
+    const bindingsFile = path.join(out, 'judgment-bindings.json');
+    const doc = JSON.parse(fs.readFileSync(bindingsFile, 'utf8'));
+    fs.writeFileSync(bindingsFile, JSON.stringify({ ...doc, refused: [{ key: 'a-retired-row', qid: 'q3' }, { key: 'another-retired-row', qid: 'q-not-sampled' }] }));
+    const r = await report();
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.report.judge, 'one call more (its row is gone), one failure').toMatchObject({ calls: 252, failures: 1 });
+  });
+
+  it('a row written into judgments.jsonl by hand retires nothing: the report stops on it, and its prompt\'s real rows stay', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    // a made-up main row of q5 whose "control" g5 is a line shown now — were it a retiring cause, q5's real rows would go
+    const madeUp = JSON.stringify({ qid: 'q5', pass: 'main', model: 'test-model', scores: { g5: 2 }, items: [{ factId: 'g5', kind: 'control_same' }] });
+    fs.appendFileSync(file, madeUp + '\n');
+    const before = fs.readFileSync(file, 'utf8');
+    const r = await run(['--retire-stale', '--out', out]);
+    expect(JSON.parse(r.stdout.trim().split('\n')[0])).toEqual({ retired: 0 });
+    expect(r.status, 'the made-up row binds nothing').toBe(1);
+    expect(fs.readFileSync(file, 'utf8'), 'nothing was taken out').toBe(before);
+    expect((await report()).stderr).toMatch(/whose controls are lines shown now/);
   });
 
   it('rows written before bindings: --bind-legacy keeps a binding judged on other text, so the row is still retired whichever runs first', async () => {
@@ -610,7 +657,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(fs.readFileSync(file, 'utf8').split('\n').filter((l) => l && JSON.parse(l).qid === 'q7')).toEqual([]);
   });
 
-  it('retiring cut off after recording the marked calls in the bindings: the next run writes the same lines', async () => {
+  it('retiring cut off after recording in the bindings — and the snapshot put back since: the next run still takes the recorded rows out and writes the same marks', async () => {
     const file = path.join(out, 'judgments.jsonl');
     const callsFile = path.join(out, 'judge-calls.jsonl');
     const bindingsFile = path.join(out, 'judgment-bindings.json');
@@ -622,10 +669,17 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     const marked = fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((c) => keys5.has(c.key)).map((c) => JSON.stringify({ ...c, retired: true }));
     expect(marked).toHaveLength(4);
     const doc = JSON.parse(fs.readFileSync(bindingsFile, 'utf8'));
-    fs.writeFileSync(bindingsFile, JSON.stringify({ ...doc, retired: marked.map((l) => crypto.createHash('sha256').update(l).digest('hex')) }));
+    const entries = marked.map((l) => ({ sha: crypto.createHash('sha256').update(l).digest('hex'), key: JSON.parse(l).key, file: JSON.parse(l).file }));
+    fs.writeFileSync(bindingsFile, JSON.stringify({ ...doc, retired: entries, retiredRows: [...keys5] }));
     expect((await report()).stderr, 'recorded, not yet written').toMatch(/4 retired calls the bindings recorded that are gone from judge-calls\.jsonl/);
+    // the snapshot put back: q5's rows are no longer stale, yet the recorded retiring is finished
+    const back = new Database(path.join(out, 'snapshot.sqlite'));
+    back.prepare("UPDATE facts SET fact = ? WHERE id = 'cs5'").run(factText('cs5'));
+    back.close();
+    writeMeta();
     const r = await run(['--retire-stale', '--out', out]);
     expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout.trim().split('\n')[0])).toEqual({ retired: 2 });
     expect(lastJson(r)).toMatchObject({ retiredLost: 0, keptWithoutRow: 0, unmatchedScored: 0 });
   });
 

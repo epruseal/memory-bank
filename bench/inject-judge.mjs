@@ -241,33 +241,43 @@ function readKept() {
 async function retireStale(sample, lines) {
   const promptOf = new Map(sample.map((p) => [p.qid, p]));
   const textOf = await judgedTextOf();
+  const { parseJsonResponse } = await import(dist('llm.js'));
   const doc = fs.existsSync(BINDINGS) ? JSON.parse(fs.readFileSync(BINDINGS, 'utf8')) : null;
   const legacy = doc?.rows ?? {};
-  const refused = new Set(doc?.refused ?? []);
+  const refused = new Set((doc?.refused ?? []).map((r) => r.key));
+  const retiredRows = new Set(doc?.retiredRows ?? []);
+  const kept = readKept();
+  const selfOf = selfRecords(kept);
+  const keptOf = firstPerKey(kept);
   const rows = loadJudgments();
   const stale = new Set();
   const staleQ = new Set();
   for (const j of rows) {
+    // a row retired before — a run cut off before it took the row out, or the row written back — goes, and nothing else
+    if (retiredRows.has(j.key)) { stale.add(j.key); continue; }
     const p = promptOf.get(j.qid);
     if (!p || !j.scores || !Array.isArray(j.items)) continue;   // a failed row is never retired (V6 counts it for good)
+    // only a row bound to its own call can retire anything: a row written into judgments.jsonl by hand stops the
+    // report and stays (else one appended line would have its prompt's real rows judged again)
     const b = j.bound ?? legacy[j.key];   // --bind-legacy keeps a binding judged on other text, for this comparison
+    const holds = j.bound ? selfCallHolds(j, selfOf.get(j.key), textOf, parseJsonResponse) : Boolean(b) && keptCallHolds(j, b, keptOf.get(j.key), textOf, parseJsonResponse);
+    if (!holds) continue;
     const shown = new Set(VARIANTS.flatMap((v) => (lines[v].get(j.qid) ?? []).map((l) => l.id)));
     const off = refused.has(j.key) || j.items.some((it) => it.kind !== 'line' && shown.has(it.factId))
-      || (b && judgeMessageSha(p, j.items, b.seed, textOf) !== b.message);
+      || judgeMessageSha(p, j.items, b.seed, textOf) !== b.message;
     if (!off) continue;
     stale.add(j.key);
     if (j.pass === 'main') staleQ.add(j.qid);
   }
   for (const j of rows) if (j.scores && staleQ.has(j.qid)) stale.add(j.key);
   if (!stale.size) return 0;
-  const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
   const write = (file, body) => { const tmp = `${file}.tmp-${process.pid}`; fs.writeFileSync(tmp, body); fs.renameSync(tmp, file); };
-  // The mark is the same in every run, so the marked lines are known before they are written. Their hashes go to the
-  // bindings first (a retired call recorded there must stay in judge-calls.jsonl), then the marks, then the rows go:
-  // cut off anywhere, the rows are still there and still stale, and the next run writes the same lines.
-  const calls = readKept().map((c) => (stale.has(c.key) && !c.retired ? { ...c, retired: true } : c));
-  const retired = [...new Set([...(doc?.retired ?? []), ...calls.filter((c) => c.retired).map((c) => sha(JSON.stringify(c)))])];
-  write(BINDINGS, JSON.stringify({ ...(doc ?? { version: 5 }), retired }, null, 1) + '\n');
+  // The bindings record first which rows go and which marked lines (hashes) will be in judge-calls.jsonl — a retired
+  // call recorded there must stay — then the marks, then the rows go. Cut off anywhere, the next run takes the
+  // recorded rows out (stale or not by then) and writes the same marks (the mark is the same in every run).
+  const calls = kept.map((c) => (stale.has(c.key) && !c.retired ? { ...c, retired: true } : c));
+  const retired = mergeRetired(doc?.retired ?? [], retiredEntries(calls));
+  write(BINDINGS, JSON.stringify({ ...(doc ?? { version: 6 }), retired, retiredRows: [...new Set([...retiredRows, ...stale])] }, null, 1) + '\n');
   write(JUDGE_CALLS, calls.map((c) => JSON.stringify(c)).join('\n') + (calls.length ? '\n' : ''));
   const rest = fs.readFileSync(JUDGMENTS, 'utf8').split('\n').filter(Boolean).filter((l) => !stale.has(rowKey(l)));
   write(JUDGMENTS, rest.join('\n') + (rest.length ? '\n' : ''));
@@ -456,10 +466,10 @@ async function llmCalls() {
   return { calls, unreadable, folder: true };
 }
 
-/** The calls --judge kept for itself (`self/<key>`), by row key. */
+/** The calls --judge kept for itself (`self/<key>`), by row key — a retired one binds nothing again. */
 function selfRecords(lines) {
   const out = new Map();
-  for (const c of lines) if (c.file === `self/${c.key}` && !out.has(c.key)) out.set(c.key, c);
+  for (const c of lines) if (c.file === `self/${c.key}` && !c.retired && !out.has(c.key)) out.set(c.key, c);
   return out;
 }
 
@@ -484,12 +494,22 @@ function answeredBefore(callAt, rowAt) {
   return c <= r + 60_000 && c >= r - ANSWER_WINDOW_MS;
 }
 
-/** Kept judge calls by row key, the first line of a key winning (the bound call; older calls of that key follow it). */
+/** Kept judge calls by row key, the first line of a key winning (the bound call; older calls of that key follow it) — retired ones left out. */
 function firstPerKey(lines) {
   const out = new Map();
-  for (const c of lines) if (!out.has(c.key)) out.set(c.key, c);
+  for (const c of lines) if (!c.retired && !out.has(c.key)) out.set(c.key, c);
   return out;
 }
+
+/** How many of the retired calls the bindings recorded (`{sha, key, file}` of each marked line) are gone from judge-calls.jsonl. */
+function retiredLost(entries, keptLines) {
+  const lines = new Set(keptLines.map((c) => crypto.createHash('sha256').update(JSON.stringify(c)).digest('hex')));
+  return entries.filter((e) => !lines.has(e.sha)).length;
+}
+
+/** Entries of retired calls, one per marked line. */
+const retiredEntries = (lines) => lines.filter((c) => c.retired).map((c) => ({ sha: crypto.createHash('sha256').update(JSON.stringify(c)).digest('hex'), key: c.key, file: c.file }));
+const mergeRetired = (a, b) => [...new Map([...a, ...b].map((e) => [e.sha, e])).values()];
 
 /**
  * Whether `c` (the call --judge kept under a failed row's key) is that row's failed call: the message the row
@@ -532,13 +552,15 @@ async function bindLegacy() {
   const keptBefore = firstPerKey(keptLines);
   const selfOf = selfRecords(keptLines);
   const onDisk = new Set(recorded.map((c) => c.file));
-  const keptOnly = [...new Map(keptLines.filter((c) => !onDisk.has(c.file)).map((c) => [c.file, { file: c.file, message: c.message, reply: c.reply, model: c.model }])).values()];
-  const calls = [...recorded, ...keptOnly];
+  // a retired call binds no row again — nor does the transcript it was kept from (the same bytes asked again)
+  const retiredFiles = new Set(keptLines.filter((c) => c.retired).map((c) => c.file));
+  const keptOnly = [...new Map(keptLines.filter((c) => !c.retired && !onDisk.has(c.file)).map((c) => [c.file, { file: c.file, message: c.message, reply: c.reply, model: c.model }])).values()];
+  const calls = [...recorded.filter((c) => !retiredFiles.has(c.file)), ...keptOnly];
   const callsByFirst = indexCalls(calls);
   const rows = loadJudgments();
   // Rows without their own binding were written before rows carried one: a closed set, listed by the first --bind-legacy.
   const legacyRows = new Set(beforeDoc?.legacyRows ?? rows.filter((j) => !j.bound).map((j) => j.key));
-  const refused = new Set(beforeDoc?.refused ?? []);
+  const refused = new Map((beforeDoc?.refused ?? []).map((r) => [r.key, r]));
   const itemCount = new Map();
   for (const j of rows) if (j.pass === 'main' && j.items) itemCount.set(j.qid, (itemCount.get(j.qid) ?? 0) + j.items.length);
   const bindings = {};
@@ -588,7 +610,7 @@ async function bindLegacy() {
     if (found.call.file.startsWith('self/') && recorded.some((c) => c.message === found.call.message && c.reply === found.call.reply && c.model !== j.model && answeredBefore(c.at, j.at))) {
       counts.answeredByOther++;
       counts.unmatchedScored++;
-      refused.add(j.key);
+      refused.set(j.key, { key: j.key, qid: j.qid });
       continue;
     }
     used.add(found.call.file);
@@ -609,14 +631,13 @@ async function bindLegacy() {
     counts.keptUnbound++;
     if (!rowKeys.has(c.key) && !c.retired) counts.keptWithoutRow++;   // its row was edited or removed (the report stops)
   }
-  // retired calls are recorded here once seen, and stay recorded: one gone from judge-calls.jsonl stops every run
-  const retired = [...new Set([...(beforeDoc?.retired ?? []), ...keptLines.filter((c) => c.retired).map((c) => sha(JSON.stringify(c)))])];
-  const keptShas = new Set(evidence.map(sha));
-  counts.retiredLost = retired.filter((s) => !keptShas.has(s)).length;
+  // retired calls are recorded once seen, and stay recorded: one gone from judge-calls.jsonl stops every run
+  counts.retiredLost = retiredLost(beforeDoc?.retired ?? [], keptLines);
+  const retired = mergeRetired(beforeDoc?.retired ?? [], retiredEntries(keptLines));
   const write = (file, body) => { const tmp = `${file}.tmp-${process.pid}`; fs.writeFileSync(tmp, body); fs.renameSync(tmp, file); };
   write(JUDGE_CALLS, evidence.join('\n') + (evidence.length ? '\n' : ''));
   write(BINDINGS, JSON.stringify({
-    version: 5, generatedAt: new Date().toISOString(), legacyRows: [...legacyRows].filter((k) => rowKeys.has(k)), retired, refused: [...refused],
+    version: 6, generatedAt: new Date().toISOString(), legacyRows: [...legacyRows].filter((k) => rowKeys.has(k)), retired, retiredRows: beforeDoc?.retiredRows ?? [], refused: [...refused.values()],
     generator: { ...gitState(REPO), judge: fileSha(fileURLToPath(import.meta.url)), lib: fileSha(path.join(here, 'inject-bench-lib.mjs')) },
     transcripts: { calls: recorded.length, keptOnly: keptOnly.length, unreadableLines: unreadable }, counts, evidence: { file: path.basename(JUDGE_CALLS), sha256: fileSha(JUDGE_CALLS) }, rows: bindings,
   }, null, 1) + '\n');
@@ -647,8 +668,6 @@ async function report() {
     for (const it of j.items) kinds.set(`${j.qid}|${it.factId}`, it.kind);
   }
   const score = (qid, id) => main.get(qid)?.get(id);
-  const calls = judgments.length;
-  const failures = judgments.filter((j) => j.failed).length;
   // Every scored row is bound to the message the judge received (system text, prompt, fact texts),
   // rebuilt now from this sample and snapshot — a row judged on other text never counts.
   const textOf = await judgedTextOf();
@@ -663,7 +682,12 @@ async function report() {
   const selfOf = selfRecords(keptLines);
   const rowKeys = new Set(allJudgments.map((j) => j.key));
   const legacyRows = new Set(bindingsDoc?.legacyRows ?? []);
-  const refused = new Set(bindingsDoc?.refused ?? []);
+  const refused = new Set((bindingsDoc?.refused ?? []).map((r) => r.key));
+  // V6 counts another model's answer as a failed call — the requested model did not answer, as a refusal without a
+  // fallback fails — every refusal the bindings recorded for a sampled prompt, its row retired and asked again or not
+  const refusedOf = (bindingsDoc?.refused ?? []).filter((r) => inSample.has(r.qid));
+  const calls = judgments.length + refusedOf.filter((r) => !rowKeys.has(r.key)).length;
+  const failures = judgments.filter((j) => j.failed).length + refusedOf.length;
   // one row per line, and a prompt's scored main rows never judge one fact twice (a fill-in row asks only the lines
   // its prompt was missing) — else which row's score or kind is read would be a choice
   const lineCount = new Map();
@@ -682,7 +706,6 @@ async function report() {
   const { callPath } = await llmFolders();
   const shownIds = (q) => new Set(VARIANTS.flatMap((v) => (lines[v].get(q) ?? []).map((l) => l.id)));
   const rebuilt = (j, seed) => judgeMessageSha(promptOf.get(j.qid), j.items ?? [], seed, textOf);
-  const keptShas = new Set(keptLines.map((c) => sha(JSON.stringify(c))));
   const binding = {
     inline: 0, transcript: 0, unbound: 0, drifted: 0, noReply: 0, noCall: 0, badItems: 0, callReused: 0, retried: 0,
     transcriptChecked: 0, transcriptGone: 0, transcriptMismatch: 0, staleLines: 0, staleRows: 0,
@@ -694,7 +717,7 @@ async function report() {
     keptWithoutRow: keptLines.filter((c) => !rowKeys.has(c.key) && !c.retired).length,
     retiredCalls: keptLines.filter((c) => c.retired).length,
     // a retired call, once the bindings recorded it, stays in judge-calls.jsonl (else retiring and asking again would leave no trace)
-    retiredLost: (bindingsDoc?.retired ?? []).filter((s) => !keptShas.has(s)).length,
+    retiredLost: retiredLost(bindingsDoc?.retired ?? [], keptLines),
     duplicateRows: [...lineCount.values()].reduce((t, n) => t + n - 1, 0),
     overlapItems, noSelfRecord: 0, notLegacy: 0, answeredByOther: 0, legacyListed: legacyRows.size,
     selfRecorded: 0, recordedJudgeCalls: 0, smokeCalls: 0, callsWithoutRow: 0,
@@ -1008,7 +1031,7 @@ function writeDoc(file, r, reportSha) {
     `판정 호출 ${r.judge.calls}회, 실패 ${r.judge.failures}회, 끊긴 마지막 줄 ${r.judge.tornTail}개, 표본 밖 판정 행 ${r.judge.outsideSample}개(집계 제외). 대조군 판정 2: 같은 scope ${r.judge.controls.same[0]}/${r.judge.controls.same[1]}, 다른 프로젝트 ${r.judge.controls.other[0]}/${r.judge.controls.other[1]}. 재채점 일치 ${r.judge.agreement.agree}/${r.judge.agreement.pairs}(재채점 프롬프트 ${r.judge.agreement.prompts}개).`,
     `참고(판정 규칙 밖): 대조군을 뺀 줄만의 재채점 일치 ${r.judge.agreement.lines[0]}/${r.judge.agreement.lines[1]}. 판정 2 의 재현성은 처음 판정 ${r.judge.agreement.j2.main}개·재채점 ${r.judge.agreement.j2.rejudge}개·양쪽 ${r.judge.agreement.j2.both}개(양성 일치 ${fmt(r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge ? (2 * r.judge.agreement.j2.both) / (r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge) : null)}). 부트스트랩 구간은 판정 잡음을 담지 않는다.`,
     `V4 는 두 번의 재생이 이 보고가 읽은 줄 파일과 바이트 단위로 같아야 통과한다(줄 파일 sha256 앞 12자: ${VARIANTS.map((vn) => `${vn} ${r.lineSha[vn].slice(0, 12)}`).join(' · ')}).`,
-    `결속: 이 보고는 재생이 시작할 때 기록한(끝날 때 다시 재어 같았던) 표본·스냅샷(WAL 포함) 해시와, 재생이 불러온 모듈 ${r.inputs.code.bound.modules}개·패키지 ${r.inputs.code.bound.packages}개(하위 의존 포함, 버전)·네이티브 바이너리 ${r.inputs.code.bound.native}개·임베딩 모델(\`${r.inputs.code.bound.model}\`) 파일 ${r.inputs.code.bound.modelFiles}개의 해시를 지금 다시 계산해 같을 때만 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)}). 재생의 Node 버전(\`${r.inputs.code.bound.node ?? '기록 없음'}\`)은 기록만 한다(보고는 줄을 만들지 않아 비교하지 않는다). 표시된 줄은 모두 판정돼 있어야 하고, 판정 행은 판정기가 받은 메시지(판정 지시문·프롬프트·사실 문장)를 지금 스냅샷으로 다시 만든 것과 바이트가 같아야 한다 — 판정 행 ${r.judge.binding.inline + r.judge.binding.transcript}개 모두 판정 호출 기록의 호출 하나와 결속된다: 판정 때 시드·메시지·받은 답을 기록한 행 ${r.judge.binding.inline}개(그 기록이 결속과 같고 답의 점수가 행 점수여야 한다)와 기록 없이 호출 기록에서 찾은 행 ${r.judge.binding.transcript}개. 결속한 호출(메시지·답)은 \`judge-calls.jsonl\` 에 보존하고, 보고가 그 파일이 결속 파일이 가리키는 해시인지와 답의 점수·모델이 행과 같은지 다시 보며, 원래 대화 기록이 남아 있으면 그것과도 대조한다(대조 ${r.judge.binding.transcriptChecked}개·원본 없음 ${r.judge.binding.transcriptGone}개). \`--judge\` 는 행마다 그 호출(성공·실패, 어느 경로든)을 행 키와 함께 보존 호출 파일에 바로 남긴다 — 대화 기록이 없는 호출(API 키 경로)은 그 기록으로 결속된다(${r.judge.binding.selfRecorded}개). 판정 파일은 덧붙이기만 하므로, 보존 호출이 가리키는 행이 판정 파일에 없으면(행을 고치거나 지움 — 실패 행 포함) 보고가 멈춘다. 같은 줄이 두 번 있거나, 한 프롬프트의 점수 main 행끼리 같은 사실을 두 번 판정했거나, 판정 때 쓴 행에 그 행 직후 남긴 호출이 없거나(행 사본), 자기 결속이 없는 옛 행이 첫 \`--bind-legacy\` 가 적은 목록(${r.judge.binding.legacyListed}개)에 없어도 멈춘다. 다시 만든 스냅샷과 어긋난 점수 행(대조군이 지금 표시된 줄인 행, 다른 모델이 답해 거부된 행 포함)은 \`--judge\`(또는 \`--retire-stale\`)가 은퇴시키고 다시 묻는다 — 그 프롬프트의 점수 행 전부(재채점 포함)를 함께 은퇴시켜 대조군까지 처음부터 다시 묻고, \`--bind-legacy\` 는 어긋난 결속을 지우지 않고 남겨 은퇴가 그 행을 찾게 한다. 은퇴한 행의 보존 호출 ${r.judge.binding.retiredCalls}개는 표시만 하고 남기며, 결속 파일이 표시를 달기 전에 그 줄을 먼저 기록해 보존 호출 파일에서 지우면 멈춘다(실패 행은 은퇴하지 않는다). 판정 실패율(V6)이 세는 행은 모두 점수 또는 실패 하나이고, 실패 행은 그 행 키로 남은 실패 호출(답이 유효하지 않음)이 있어야 한다. 참고로 대화 기록(24시간 보관 — \`MEMORY_BANK_LLM_TRANSCRIPT_TTL_HOURS\`)에 남은 판정 호출 ${r.judge.binding.recordedJudgeCalls}개 중 스모크 ${r.judge.binding.smokeCalls}개, 어떤 행의 메시지에도 없는 호출 ${r.judge.binding.callsWithoutRow}개(다른 \`--out\` 폴더의 판정이나 행을 쓰기 전에 끊긴 호출일 수 있다 — 멈추지 않는다)${r.judge.binding.transcriptsFolder ? '' : '(대화 기록 폴더가 없어 세지 못함)'}. 한 호출은 한 행만 결속하고, 행의 항목은 점수 키와 같아야 하며 대조군으로 적힌 항목은 지금 표시된 줄이 아니어야 한다. 지금 어느 변형도 표시하지 않는 줄 항목 ${r.judge.binding.staleLines}개(${r.judge.binding.staleRows}행)는 이전 재생이 표시해 판정된 캐시다 — 줄 점수로 읽지 않고, 재채점 일치(V3)에는 두 번 판정된 쌍으로 들어간다. 재생 코드 \`${r.inputs.code.replay?.git ? r.inputs.code.replay.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.replay?.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.replay?.dirty === false ? '(src·bench·dist 깨끗함)' : ''}. 기록만 하는 값: 판정 파일 ${r.inputs.judgments.slice(0, 12)}, 보고를 낸 코드 \`${r.inputs.code.report.git ? r.inputs.code.report.git.slice(0, 7) : '확인 불가'}\`.`,
+    `결속: 이 보고는 재생이 시작할 때 기록한(끝날 때 다시 재어 같았던) 표본·스냅샷(WAL 포함) 해시와, 재생이 불러온 모듈 ${r.inputs.code.bound.modules}개·패키지 ${r.inputs.code.bound.packages}개(하위 의존 포함, 버전)·네이티브 바이너리 ${r.inputs.code.bound.native}개·임베딩 모델(\`${r.inputs.code.bound.model}\`) 파일 ${r.inputs.code.bound.modelFiles}개의 해시를 지금 다시 계산해 같을 때만 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)}). 재생의 Node 버전(\`${r.inputs.code.bound.node ?? '기록 없음'}\`)은 기록만 한다(보고는 줄을 만들지 않아 비교하지 않는다). 표시된 줄은 모두 판정돼 있어야 하고, 판정 행은 판정기가 받은 메시지(판정 지시문·프롬프트·사실 문장)를 지금 스냅샷으로 다시 만든 것과 바이트가 같아야 한다 — 판정 행 ${r.judge.binding.inline + r.judge.binding.transcript}개 모두 판정 호출 기록의 호출 하나와 결속된다: 판정 때 시드·메시지·받은 답을 기록한 행 ${r.judge.binding.inline}개(그 기록이 결속과 같고 답의 점수가 행 점수여야 한다)와 기록 없이 호출 기록에서 찾은 행 ${r.judge.binding.transcript}개. 결속한 호출(메시지·답)은 \`judge-calls.jsonl\` 에 보존하고, 보고가 그 파일이 결속 파일이 가리키는 해시인지와 답의 점수·모델이 행과 같은지 다시 보며, 원래 대화 기록이 남아 있으면 그것과도 대조한다(대조 ${r.judge.binding.transcriptChecked}개·원본 없음 ${r.judge.binding.transcriptGone}개). \`--judge\` 는 행마다 그 호출(성공·실패, 어느 경로든)을 행 키와 함께 보존 호출 파일에 바로 남긴다 — 대화 기록이 없는 호출(API 키 경로)은 그 기록으로 결속된다(${r.judge.binding.selfRecorded}개). 판정 파일은 덧붙이기만 하므로, 보존 호출이 가리키는 행이 판정 파일에 없으면(행을 고치거나 지움 — 실패 행 포함) 보고가 멈춘다. 같은 줄이 두 번 있거나, 한 프롬프트의 점수 main 행끼리 같은 사실을 두 번 판정했거나, 판정 때 쓴 행에 그 행 직후 남긴 호출이 없거나(행 사본), 자기 결속이 없는 옛 행이 첫 \`--bind-legacy\` 가 적은 목록(${r.judge.binding.legacyListed}개)에 없어도 멈춘다. 다시 만든 스냅샷과 어긋난 점수 행(대조군이 지금 표시된 줄인 행, 다른 모델이 답해 거부된 행 포함)은 \`--judge\`(또는 \`--retire-stale\`)가 은퇴시키고 다시 묻는다 — main 행이면 그 프롬프트의 점수 행 전부(보충 행·재채점 포함)를 함께 은퇴시켜 대조군까지 처음부터 다시 묻고(재채점 행은 혼자), 은퇴의 계기는 자기 호출과 결속이 맞는 행뿐이라 판정 파일에 손으로 쓴 행은 아무것도 은퇴시키지 못하고 멈춘 채 남는다. 은퇴한 호출과 그 대화 기록은 다시 묻는 행의 결속 후보가 되지 않는다. \`--bind-legacy\` 는 어긋난 결속을 지우지 않고 남겨 은퇴가 그 행을 찾게 한다. 은퇴한 행의 보존 호출 ${r.judge.binding.retiredCalls}개는 표시만 하고 남기며, 결속 파일이 표시를 달기 전에 그 줄을 먼저 기록해 보존 호출 파일에서 지우면 멈춘다(실패 행은 은퇴하지 않는다). 판정 실패율(V6)이 세는 행은 모두 점수 또는 실패 하나이고, 실패 행은 그 행 키로 남은 실패 호출(답이 유효하지 않음)이 있어야 한다. 참고로 대화 기록(24시간 보관 — \`MEMORY_BANK_LLM_TRANSCRIPT_TTL_HOURS\`)에 남은 판정 호출 ${r.judge.binding.recordedJudgeCalls}개 중 스모크 ${r.judge.binding.smokeCalls}개, 어떤 행의 메시지에도 없는 호출 ${r.judge.binding.callsWithoutRow}개(다른 \`--out\` 폴더의 판정이나 행을 쓰기 전에 끊긴 호출일 수 있다 — 멈추지 않는다)${r.judge.binding.transcriptsFolder ? '' : '(대화 기록 폴더가 없어 세지 못함)'}. 한 호출은 한 행만 결속하고, 행의 항목은 점수 키와 같아야 하며 대조군으로 적힌 항목은 지금 표시된 줄이 아니어야 한다. 지금 어느 변형도 표시하지 않는 줄 항목 ${r.judge.binding.staleLines}개(${r.judge.binding.staleRows}행)는 이전 재생이 표시해 판정된 캐시다 — 줄 점수로 읽지 않고, 재채점 일치(V3)에는 두 번 판정된 쌍으로 들어간다. 재생 코드 \`${r.inputs.code.replay?.git ? r.inputs.code.replay.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.replay?.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.replay?.dirty === false ? '(src·bench·dist 깨끗함)' : ''}. 기록만 하는 값: 판정 파일 ${r.inputs.judgments.slice(0, 12)}, 보고를 낸 코드 \`${r.inputs.code.report.git ? r.inputs.code.report.git.slice(0, 7) : '확인 불가'}\`.`,
     `보충 판정 행(대조군 없이 빠진 줄만 다시 부른 main 행) ${r.judge.fillRows}개 — 다른 main 행과 같이 읽는다. 대조군이 하나도 판정되지 않은 프롬프트 ${r.judge.promptsWithoutControls}개. 답이 형식에 어긋나 다시 물어 점수를 얻은 판정 행 ${r.judge.binding.retried}개(결속은 첫 메시지 — 다시 묻기는 형식 지적 한 줄만 덧붙인다. 호출이 예외로 실패해 같은 메시지를 다시 보낸 경우는 세지 않는다).`,
     '',
     ...['train', 'heldout', 'all'].flatMap((split) => [
@@ -1057,7 +1080,7 @@ function writeDoc(file, r, reportSha) {
     '- 지워진 경로(cwd·사실 경로 모두)는 어느 저장소의 가족도 아니다 — 지워진 경로가 어느 저장소에 속했는지는 지금 디스크로 알 수 없어서다(다른 저장소였을 수 있다). 그래서 지운 worktree 에서 쓴 사실은 가족으로 들어오지 않고, cwd 가 지워진 프롬프트의 가족 효과는 재지 못한다. worktree 보관 폴더(`.claude/worktrees/`·`.auto-issue-worktrees/`) 안에서는 그 저장소의 연결 worktree 만 가족이다 — 사실 경로도 cwd 도(보관 폴더가 다른 저장소의 worktree 를 담을 수 있다). 저장소 루트와 경로 사이(루트 포함)에 심링크가 있는 경로도 가족 밖이다 — 루트보다 위의 링크는 보지 않는다(scope 는 경로다). `.bare/` 에 둔 bare 저장소(`.bare/worktrees/…`)의 worktree 끼리는 묶지 않는다(각자 한 가족).',
     '- 가족 판정은 재생할 때의 디스크(폴더·`.git`)를 읽고, 보고는 그 디스크 상태를 결속하지 않는다 — 재생 뒤 worktree 를 지우거나 만들면 같은 입력으로 다시 재생한 줄이 달라질 수 있다(재생이 cwd 마다 찾은 루트는 \`replay-meta.json\` 의 roots 에 남는다).',
     '- 판정 결속은 위조를 막는 서명이 아니다. 잡는 것은 한 파일만 바뀐 경우다: 판정 파일만 고치거나 지우거나 덧붙이면(분류 바꿔 적기, 같은 줄 반복, 행 사본, 실패 행 지우기·지어내기 포함) 멈춘다. 두 파일을 맞춰 바꾸는 위조는 알아채지 못한다 — 판정 파일과 보존 호출 파일을 고친 뒤 \`--bind-legacy\` 를 돌리거나(결속 파일은 그것이 다시 쓴다), 결속 파일을 지워 옛 행 목록을 다시 만들게 하는 것. 이 벤치의 파일은 모두 같은 사람이 쓰는 로컬 파일이고, 외부 증거인 대화 기록은 24시간 뒤 지워진다. 그 안에서도 보존 호출이 대화 기록에 없는 파일 이름을 대면 원본 대조를 피한다. 스냅샷을 바꿨다 되돌리면 은퇴와 다시 묻기로 판정을 다시 뽑을 수 있다 — 은퇴한 보존 호출 수가 0이 아니면 그 까닭을 본다(이 수를 지우려면 보존 호출 파일과 결속 파일을 함께 바꿔야 한다 — 두 파일 위조).',
-    '- \`--judge\` 가 스스로 남긴 호출 기록의 모델은 요청한 모델이다(callHaiku 는 답한 모델을 돌려주지 않는다). 대화 기록이 있으면 결속 단계가 다른 모델의 답(거절 뒤 대체 모델)을 거부하고, 대화 기록이 없는 호출(API 키 경로)은 요청한 모델로 믿는다. 같은 메시지·답 바이트라도 그 행을 쓰기 전 10분 안에 답한 대화 기록만 같은 호출로 본다 — 다른 모델로 같은 날 다시 잴 때 그 창 안에 같은 바이트의 답이 있으면(동시에 돌린 두 측정) 거짓으로 거부된다. 한 번 거부한 행은 결속 파일에 남아(대화 기록이 지워진 뒤에도) 다음 \`--judge\` 가 은퇴시키고 다시 묻는다.',
+    '- \`--judge\` 가 스스로 남긴 호출 기록의 모델은 요청한 모델이다(callHaiku 는 답한 모델을 돌려주지 않는다). 대화 기록이 있으면 결속 단계가 다른 모델의 답(거절 뒤 대체 모델)을 거부하고, 대화 기록이 없는 호출(API 키 경로)은 요청한 모델로 믿는다. 같은 메시지·답 바이트라도 그 행을 쓰기 전 10분 안에 답한 대화 기록만 같은 호출로 본다 — 다른 모델로 같은 날 다시 잴 때 그 창 안에 같은 바이트의 답이 있으면(동시에 돌린 두 측정) 거짓으로 거부된다. 한 번 거부한 행은 결속 파일에 남아(대화 기록이 지워진 뒤에도) 다음 \`--judge\` 가 은퇴시키고 다시 묻으며, 판정 실패율(V6)은 그 거부를 실패 호출로 센다(대체 모델이 없는 거절이 실패 행이 되는 것과 같다 — 거듭 거부되는 프롬프트는 실패가 쌓여 계획의 정지 규칙으로 간다).',
     '- \`--judge\` 가 행을 쓴 직후 그 호출을 남기기 전에 끊기면(동기 쓰기 두 번 사이) 그 행은 자기 기록이 없어 멈춘다 — 정지 메시지대로 그 행을 판정 파일에서 지우고 \`--judge\` 로 다시 묻는다.',
     '- 보관 폴더 이름 비교는 macOS 에서 볼륨과 상관없이 대소문자를 접는다 — 대소문자를 구분하는 볼륨의 `.Claude/Worktrees` 같은 별개 폴더도 보관 폴더로 보아 빼는 쪽으로 틀린다(들이는 쪽으로는 틀리지 않는다). Windows 경로(구분자 `\\`)에서는 가족을 만들지 않는다(정확 경로 scope 그대로).',
     '- 정렬은 ±180초 안의 가장 이른 행을 고르고 여러 행이 맞는 경우를 세지 않는다. 프롬프트 길이 비교는 UTF-16 길이(JS)와 코드포인트 수(SQLite)가 달라 이모지가 든 프롬프트는 빠진다.',
