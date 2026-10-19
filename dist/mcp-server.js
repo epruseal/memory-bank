@@ -53092,7 +53092,26 @@ function formatRepeatContext(matches) {
 // src/inject-log.ts
 import fs5 from "fs";
 import path3 from "path";
+import { createHash } from "crypto";
 var MAX_LOG_BYTES = 5 * 1024 * 1024;
+function shortId(id) {
+  return id.slice(0, 12);
+}
+function sessionKey(sessionId) {
+  return sessionId ? createHash("sha256").update(sessionId).digest("hex").slice(0, 12) : void 0;
+}
+var cachedVersion;
+function pluginVersion() {
+  if (cachedVersion === void 0) {
+    try {
+      const pkg = JSON.parse(fs5.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+      cachedVersion = typeof pkg.version === "string" ? pkg.version : null;
+    } catch {
+      cachedVersion = null;
+    }
+  }
+  return cachedVersion ?? void 0;
+}
 function getInjectLogPath() {
   const dir = path3.join(getIndexDir(), "logs");
   if (!fs5.existsSync(dir)) {
@@ -53185,7 +53204,7 @@ function injectionQuery(prompt) {
 }
 
 // src/fact-text.ts
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 var FACT_CHAR_CAP = 160;
 function truncateFact(text) {
   const t = text.replace(/\s+/g, " ").trim();
@@ -53193,7 +53212,7 @@ function truncateFact(text) {
 }
 function factTextKey(fact) {
   const norm = fact.fact.replace(/\s+/g, " ").trim().toLowerCase();
-  return "t:" + createHash("sha1").update(norm).digest("hex").slice(0, 16);
+  return "t:" + createHash2("sha1").update(norm).digest("hex").slice(0, 16);
 }
 
 // src/inject-select.ts
@@ -53262,7 +53281,9 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
     entrypoint: meta3.entrypoint || void 0,
     has_session: Boolean(sessionId),
     fallback_reason: meta3.fallback_reason || void 0,
-    req_id: meta3.req_id || void 0
+    req_id: meta3.req_id || void 0,
+    session_key: sessionKey(sessionId),
+    plugin_version: pluginVersion()
   };
   const gate = injectionQuery(userPrompt);
   if (gate.reason !== null) {
@@ -53283,6 +53304,10 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
       const selection = selectInjectFacts(db, embedding, baseline, project);
       timings.search_ms = selection.timings.search_ms;
       const candidates = selection.candidates;
+      const decision = {
+        top_margins: selection.topMargins.map((m2) => Math.round(m2 * 1e3) / 1e3),
+        gated_ids: selection.gated.map((g) => shortId(g.fact.id))
+      };
       if (selection.gated.length === 0) {
         appendInjectLog({
           ...base,
@@ -53291,6 +53316,7 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
           status: "no-match",
           candidates,
           injected: 0,
+          ...decision,
           duration_ms: Date.now() - t0
         });
         return { context: "", ledgerKeys: [] };
@@ -53324,6 +53350,7 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
           injected: 0,
           deduped: dedupedCount,
           text_deduped: textDeduped,
+          ...decision,
           duration_ms: Date.now() - t0
         });
         return { context: "", ledgerKeys: [] };
@@ -53360,6 +53387,8 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
         from_vec: fromVec,
         from_rel: fromRel,
         chars: block.length,
+        ...decision,
+        injected_ids: injectedItems.map((item) => shortId(item.fact.id)),
         duration_ms: Date.now() - t0
       });
       return { context: block, ledgerKeys };

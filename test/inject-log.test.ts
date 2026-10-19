@@ -66,6 +66,25 @@ describe('inject-log', () => {
     expect(JSON.parse(lines[0]).status).toBe('skipped');
   });
 
+  it('decision helpers: shortId is 12 chars, sessionKey is a sha256 prefix, pluginVersion is package.json', async () => {
+    const { shortId, sessionKey, pluginVersion } = await import('../src/inject-log.js');
+    const { createHash } = await import('crypto');
+    expect(shortId('0123456789abcdef-rest')).toBe('0123456789ab');
+    expect(sessionKey('sess-1')).toBe(createHash('sha256').update('sess-1').digest('hex').slice(0, 12));
+    expect(sessionKey(undefined)).toBeUndefined();
+    expect(sessionKey('')).toBeUndefined();
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'));
+    expect(pluginVersion()).toBe(pkg.version);
+  });
+
+  it('a field holding a newline cannot split the JSONL line', async () => {
+    const { appendInjectLog, getInjectLogPath } = await import('../src/inject-log.js');
+    appendInjectLog({ status: 'skipped', project: '/tmp/a\n{"status":"injected"}\u2028x', reason: 'r\r\nq' });
+    const raw = fs.readFileSync(getInjectLogPath(), 'utf8');
+    expect(raw.trim().split('\n')).toHaveLength(1);
+    expect(JSON.parse(raw).project).toContain('\n');
+  });
+
   it('never throws when the log directory is not writable', async () => {
     const { appendInjectLog } = await import('../src/inject-log.js');
     // Point config dir at a path whose parent is a file — mkdir will fail internally.

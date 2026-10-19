@@ -1,7 +1,7 @@
 import { getSearchDb } from './search.js';
 import { generateEmbedding, initEmbeddings, queryBaseline } from './embeddings.js';
 import { detectRepeat, formatRepeatContext } from './repeat-detector.js';
-import { appendInjectLog } from './inject-log.js';
+import { appendInjectLog, pluginVersion, sessionKey, shortId } from './inject-log.js';
 import { loadLedger } from './inject-ledger.js';
 import { injectionQuery } from './prompt-gate.js';
 import { factTextKey } from './fact-text.js';
@@ -44,6 +44,8 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
         has_session: Boolean(sessionId),
         fallback_reason: meta.fallback_reason || undefined,
         req_id: meta.req_id || undefined,
+        session_key: sessionKey(sessionId),
+        plugin_version: pluginVersion(),
     };
     const gate = injectionQuery(userPrompt);
     if (gate.reason !== null) {
@@ -69,10 +71,14 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
             const selection = selectInjectFacts(db, embedding, baseline, project);
             timings.search_ms = selection.timings.search_ms;
             const candidates = selection.candidates;
+            const decision = {
+                top_margins: selection.topMargins.map((m) => Math.round(m * 1000) / 1000),
+                gated_ids: selection.gated.map((g) => shortId(g.fact.id)),
+            };
             if (selection.gated.length === 0) {
                 appendInjectLog({
                     ...base, ...queryLen, ...timings, status: 'no-match',
-                    candidates, injected: 0, duration_ms: Date.now() - t0,
+                    candidates, injected: 0, ...decision, duration_ms: Date.now() - t0,
                 });
                 return { context: '', ledgerKeys: [] };
             }
@@ -102,7 +108,7 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
                 appendInjectLog({
                     ...base, ...queryLen, ...timings, status: 'deduped',
                     candidates, injected: 0, deduped: dedupedCount,
-                    text_deduped: textDeduped, duration_ms: Date.now() - t0,
+                    text_deduped: textDeduped, ...decision, duration_ms: Date.now() - t0,
                 });
                 return { context: '', ledgerKeys: [] };
             }
@@ -133,6 +139,7 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
                 candidates, injected: injectedCount,
                 deduped: dedupedCount, text_deduped: textDeduped,
                 from_vec: fromVec, from_rel: fromRel, chars: block.length,
+                ...decision, injected_ids: injectedItems.map((item) => shortId(item.fact.id)),
                 duration_ms: Date.now() - t0,
             });
             return { context: block, ledgerKeys };

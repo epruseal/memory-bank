@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 import { getIndexDir } from './paths.js';
 /**
  * Observability log for the UserPromptSubmit context injection pipeline.
@@ -12,6 +13,28 @@ import { getIndexDir } from './paths.js';
  * Logging is strictly best-effort: it must never throw or block injection.
  */
 const MAX_LOG_BYTES = 5 * 1024 * 1024; // rotate at 5MB
+/** Log form of a fact id — 12 chars keep lines short and are unique enough for joins. */
+export function shortId(id) {
+    return id.slice(0, 12);
+}
+/** sha256(session id) prefix, or undefined without a session id. */
+export function sessionKey(sessionId) {
+    return sessionId ? createHash('sha256').update(sessionId).digest('hex').slice(0, 12) : undefined;
+}
+let cachedVersion;
+/** Version from the package.json next to dist/ (works for dist/*.js and the bundled server alike); undefined when unreadable. */
+export function pluginVersion() {
+    if (cachedVersion === undefined) {
+        try {
+            const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+            cachedVersion = typeof pkg.version === 'string' ? pkg.version : null;
+        }
+        catch {
+            cachedVersion = null;
+        }
+    }
+    return cachedVersion ?? undefined;
+}
 export function getInjectLogPath() {
     const dir = path.join(getIndexDir(), 'logs');
     if (!fs.existsSync(dir)) {

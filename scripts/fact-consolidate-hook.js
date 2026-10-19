@@ -28,6 +28,8 @@
  *
  * The printed facts are recorded in the session's injection ledger, so the
  * per-prompt injection does not repeat a fact this block already showed.
+ * Each run appends one `via:'session-start'` line to the injection log (status,
+ * count, chars, ids, session_key, source) — the block was invisible before.
  *
  * Session continuity and the intent profile are opt-in
  * (MEMORY_BANK_SESSION_CONTINUITY=1, MEMORY_BANK_INTENT_PROFILE=1). They compared
@@ -44,6 +46,7 @@ import { openReadOnlyDatabase } from '../dist/db.js';
 import { getTopFacts } from '../dist/fact-db.js';
 import { factTextKey, truncateFact } from '../dist/fact-text.js';
 import { loadLedger, appendLedger } from '../dist/inject-ledger.js';
+import { appendInjectLog, pluginVersion, sessionKey, shortId } from '../dist/inject-log.js';
 import { readHookInput } from '../dist/hook-stdin.js';
 import { ensureNativeAbi } from '../dist/node-abi.js';
 
@@ -72,6 +75,15 @@ async function main() {
   try { input = JSON.parse(raw); } catch { /* not JSON — fall back to env */ }
 
   const project = input.cwd || process.env.CWD || process.env.PROJECT_DIR || process.cwd();
+  const t0 = Date.now();
+  const logBase = {
+    via: 'session-start',
+    project,
+    has_session: Boolean(input.session_id),
+    session_key: sessionKey(input.session_id),
+    source: typeof input.source === 'string' ? input.source : undefined,
+    plugin_version: pluginVersion(),
+  };
 
   try {
     // 1. Key facts — read-only, before any worker is started (header). A read
@@ -80,6 +92,7 @@ async function main() {
       const db = openReadOnlyDatabase();
       const shown = [];
       let delivered = false;
+      let block = '';
       if (db) try {
         const lines = [];
         let chars = 0;
@@ -91,7 +104,8 @@ async function main() {
           chars += line.length + 1;
         }
         if (lines.length > 0) {
-          delivered = await writeOut(['', '# Project Key Facts (auto-recalled)', ...lines].join('\n') + '\n');
+          block = ['', '# Project Key Facts (auto-recalled)', ...lines].join('\n') + '\n';
+          delivered = await writeOut(block);
         }
       } finally {
         db.close();
@@ -101,8 +115,15 @@ async function main() {
         appendLedger(input.session_id, loadLedger(input.session_id),
           shown.flatMap((f) => [f.id, factTextKey(f)]));
       }
+      const ids = shown.map((f) => shortId(f.id));
+      if (!db) appendInjectLog({ ...logBase, status: 'skipped', reason: 'no-db', duration_ms: Date.now() - t0 });
+      else if (shown.length === 0) appendInjectLog({ ...logBase, status: 'no-match', injected: 0, duration_ms: Date.now() - t0 });
+      else if (delivered) appendInjectLog({ ...logBase, status: 'injected', injected: shown.length, chars: block.length, injected_ids: ids, duration_ms: Date.now() - t0 });
+      else appendInjectLog({ ...logBase, status: 'error', injected: 0, error: 'stdout write failed', gated_ids: ids, duration_ms: Date.now() - t0 });
     } catch (error) {
-      console.error('fact-consolidate: key facts unavailable:', error instanceof Error ? error.message : error);
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('fact-consolidate: key facts unavailable:', message);
+      appendInjectLog({ ...logBase, status: 'error', error: message.slice(0, 300), duration_ms: Date.now() - t0 });
     }
 
     // 2. Offload slow work to detached children this hook never waits for:

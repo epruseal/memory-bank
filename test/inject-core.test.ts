@@ -104,6 +104,44 @@ describe('computeInjectResult', () => {
     expect(last.repeat_ms, '반복 감지는 기본 꺼짐').toBeUndefined();
   }, 30_000);
 
+  it('log fields: injected 줄에 margin·게이트 통과 id·주입 id·세션 키·버전이 남는다', async () => {
+    const { createHash } = await import('crypto');
+    const sid = 'sess-fields-0001';
+    const out = await injectAndRecord(
+      'Which tool runs our database migrations and in what file format?',
+      '/tmp/proj', 'daemon', sid,
+    );
+    expect(out).toContain('Flyway');
+    const last = readLog().at(-1)!;
+    expect(last.status).toBe('injected');
+    const margins = last.top_margins as number[];
+    expect(margins.length).toBe(last.candidates);
+    for (const m of margins) expect(Math.round(m * 1000) / 1000).toBe(m);
+    expect(margins[0]).toBeGreaterThanOrEqual(0.045);
+    const gated = last.gated_ids as string[];
+    const injected = last.injected_ids as string[];
+    expect(gated.length).toBeGreaterThan(0);
+    for (const id of [...gated, ...injected]) expect(id).toHaveLength(12);
+    expect(injected).toHaveLength(Number(last.injected));
+    expect(last.session_key).toBe(createHash('sha256').update(sid).digest('hex').slice(0, 12));
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'package.json'), 'utf8'));
+    expect(last.plugin_version).toBe(pkg.version);
+  }, 30_000);
+
+  it('log fields: no-match 줄은 빈 gated_ids 와 후보별 margin, 세션 없으면 session_key 없음', async () => {
+    const out = await injectAndRecord(
+      'Write a haiku about autumn leaves falling on a quiet mountain temple roof',
+      '/tmp/proj', 'fallback', undefined,
+    );
+    expect(out).toBe('');
+    const last = readLog().at(-1)!;
+    expect(last.status).toBe('no-match');
+    expect(last.gated_ids).toEqual([]);
+    expect((last.top_margins as number[]).length).toBe(last.candidates);
+    expect(last.injected_ids).toBeUndefined();
+    expect('session_key' in last).toBe(false);
+  }, 30_000);
+
   it('같은 세션의 다음 프롬프트는 세 번째 사본(새 id)도 본문 키로 거른다', async () => {
     await addFact(DEPLOY); // 첫 주입 이후 새 id 로 같은 문장이 또 저장됨
     const out = await injectAndRecord(

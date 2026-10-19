@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
 import { getIndexDir } from './paths.js';
 
 /**
@@ -31,9 +32,10 @@ export interface InjectLogEntry {
   error?: string;
   /**
    * Which execution path served this injection: warm MCP-server daemon, cold
-   * fallback, or the thin hook client itself (prompt skipped before any search).
+   * fallback, the thin hook client itself (prompt skipped before any search), or
+   * the SessionStart key-facts block (scripts/fact-consolidate-hook.js).
    */
-  via?: 'daemon' | 'fallback' | 'client';
+  via?: 'daemon' | 'fallback' | 'client' | 'session-start';
   /** status='skipped' only — why (short prompt, task notification, slash command …). */
   reason?: string;
   /** Length of the text actually searched, when it differs from the prompt (prompt-gate.ts). */
@@ -59,6 +61,45 @@ export interface InjectLogEntry {
   from_rel?: number;
   /** Facts dropped because the same text was already in the block or the session ledger. */
   text_deduped?: number;
+  /**
+   * sim − baseline of each KNN candidate, rank order, 3 decimals — the gate's
+   * input, so a margin change can be replayed against the log.
+   */
+  top_margins?: number[];
+  /** Ids (first 12 chars) that cleared the gate, BEFORE the session ledger — what a prompt would have pulled in. */
+  gated_ids?: string[];
+  /** Ids (first 12 chars) actually in the delivered block. */
+  injected_ids?: string[];
+  /** sha256(session_id) first 12 hex chars — groups one session's lines without storing its id. */
+  session_key?: string;
+  /** package.json version of the code that wrote the line. */
+  plugin_version?: string;
+  /** via='session-start' only — the SessionStart source Claude Code reports (startup, resume, clear, compact). */
+  source?: string;
+}
+
+/** Log form of a fact id — 12 chars keep lines short and are unique enough for joins. */
+export function shortId(id: string): string {
+  return id.slice(0, 12);
+}
+
+/** sha256(session id) prefix, or undefined without a session id. */
+export function sessionKey(sessionId: string | null | undefined): string | undefined {
+  return sessionId ? createHash('sha256').update(sessionId).digest('hex').slice(0, 12) : undefined;
+}
+
+let cachedVersion: string | null | undefined;
+/** Version from the package.json next to dist/ (works for dist/*.js and the bundled server alike); undefined when unreadable. */
+export function pluginVersion(): string | undefined {
+  if (cachedVersion === undefined) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown };
+      cachedVersion = typeof pkg.version === 'string' ? pkg.version : null;
+    } catch {
+      cachedVersion = null;
+    }
+  }
+  return cachedVersion ?? undefined;
 }
 
 export function getInjectLogPath(): string {

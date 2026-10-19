@@ -131,6 +131,55 @@ describe('SessionStart 훅', () => {
     }
   });
 
+  it('session-start 로그: 출력한 블록을 via session-start 한 줄로 남긴다(개수·글자 수·id·세션 키·source)', async () => {
+    const { createHash } = await import('node:crypto');
+    const logFile = path.join(tmp, 'conversation-index', 'logs', 'inject-context.jsonl');
+    const out = execFileSync(process.execPath, ['scripts/fact-consolidate-hook.js'], {
+      cwd: REPO, encoding: 'utf8', timeout: 30_000,
+      input: JSON.stringify({ session_id: 'ss-log-0001', cwd: PROJECT, hook_event_name: 'SessionStart', source: 'startup' }),
+      env: hookEnv(),
+    });
+    const last = JSON.parse(fs.readFileSync(logFile, 'utf8').trim().split('\n').at(-1)!);
+    const db = new Database(path.join(tmp, 't.sqlite'), { readonly: true });
+    const row = db.prepare("SELECT id FROM facts WHERE fact LIKE 'Release notes%'").get() as { id: string };
+    db.close();
+    const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8'));
+    expect(last).toMatchObject({
+      via: 'session-start', status: 'injected', injected: 1, source: 'startup', project: PROJECT,
+      has_session: true, injected_ids: [row.id.slice(0, 12)], plugin_version: pkg.version,
+      session_key: createHash('sha256').update('ss-log-0001').digest('hex').slice(0, 12),
+    });
+    expect(last.chars).toBe(out.length);
+  });
+
+  it('session-start 로그: 보일 사실이 없으면 no-match', () => {
+    const logFile = path.join(tmp, 'conversation-index', 'logs', 'inject-context.jsonl');
+    const out = execFileSync(process.execPath, ['scripts/fact-consolidate-hook.js'], {
+      cwd: REPO, encoding: 'utf8', timeout: 30_000,
+      input: JSON.stringify({ session_id: 'ss-log-0002', cwd: '/tmp/mb-ss-no-facts-here', hook_event_name: 'SessionStart', source: 'resume' }),
+      env: hookEnv(),
+    });
+    expect(out).not.toContain('# Project Key Facts');
+    const last = JSON.parse(fs.readFileSync(logFile, 'utf8').trim().split('\n').at(-1)!);
+    expect(last).toMatchObject({ via: 'session-start', status: 'no-match', injected: 0, source: 'resume' });
+  });
+
+  it('session-start 로그: unwritable 로그 폴더여도 블록은 그대로 출력된다', () => {
+    const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-ss-nolog-'));
+    try {
+      fs.mkdirSync(path.join(cfg, 'conversation-index'), { recursive: true });
+      fs.writeFileSync(path.join(cfg, 'conversation-index', 'logs'), 'a file where the log folder should be');
+      const out = execFileSync(process.execPath, ['scripts/fact-consolidate-hook.js'], {
+        cwd: REPO, encoding: 'utf8', timeout: 30_000,
+        input: JSON.stringify({ session_id: 'ss-log-0003', cwd: PROJECT, hook_event_name: 'SessionStart' }),
+        env: hookEnv({ MEMORY_BANK_CONFIG_DIR: cfg }),
+      });
+      expect(out).toContain('Release notes are written in Korean');
+    } finally {
+      fs.rmSync(cfg, { recursive: true, force: true });
+    }
+  });
+
   it('정적 import 사슬에 임베딩 모델(@xenova/transformers)이 없다', () => {
     const seen = new Set<string>();
     const bare = new Set<string>();
