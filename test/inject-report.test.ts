@@ -148,7 +148,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.report.c2.byRepo.largest).toEqual({ prompts: 14, differs: 7, gain: 7, cwdRoots: 1 });
     expect(r.report.c2.byRepo.withoutLargest).toEqual({ measurable: false, n: 26, gain: 13 });
     expect(r.report.c2.blockDiffers).toEqual({ prompts: 20, cwds: 3, repos: 3 });
-    expect(r.report.judge.binding).toEqual({ inline: 251, transcript: 0, retried: 0, transcriptChecked: 0, transcriptGone: 0, ...NO_DRIFT });
+    expect(r.report.judge.binding).toEqual({ inline: 251, transcript: 0, retried: 0, transcriptChecked: 0, transcriptGone: 0, staleLines: 0, staleRows: 0, ...NO_DRIFT });
     expect(r.report.judge.fillRows, 'the q7 row without controls').toBe(1);
     expect(r.report.judge.promptsWithoutControls, 'q7 also has its first row with controls').toBe(0);
     const docText = fs.readFileSync(doc, 'utf8');
@@ -219,7 +219,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     const otherScore = (reply: string) => JSON.stringify(JSON.parse(reply).map((x: { id: string; score: number }, n: number) => (n === 0 ? { ...x, score: (x.score + 1) % 3 } : x)));
     const NOT_KEPT = /1 whose kept judge call is missing or does not give the row's scores/;
     forge({ ...keptLines[0], reply: otherScore(keptLines[0].reply) }, false);
-    expect((await report()).stderr, 'the reply bytes differ from the ones bound — and the kept file from the one named').toMatch(/1 whose kept judge call is missing or does not give the row's scores, 0 whose items .*and judge-calls\.jsonl is not the file the bindings name/);
+    expect((await report()).stderr, 'the reply bytes differ from the ones bound — and the kept file from the one named').toMatch(/1 whose kept judge call is missing or does not give the row's scores, 0 whose score keys .*and judge-calls\.jsonl is not the file the bindings name/);
     forge({ ...keptLines[0], reply: otherScore(keptLines[0].reply) }, true);
     expect((await report()).stderr, 'a consistent forgery of the reply: its scores still differ from the row').toMatch(NOT_KEPT);
     forge({ ...keptLines[0], message: `${keptLines[0].message} (and one more thing)` }, true);
@@ -260,21 +260,21 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect((await report()).stderr, 'a bindings file without its calls').toMatch(/2 whose kept judge call is missing/);
   });
 
-  it('a row the judge wrote must carry the reply that gives its scores, items that are its score keys, and kinds that fit the shown lines', async () => {
+  it('a row the judge wrote must carry the reply that gives its scores and items that are its score keys; no control is a line shown now', async () => {
     const cases: Array<[string, (row: Record<string, any>) => Record<string, unknown>, RegExp]> = [
       // a legacy row given an inline binding by hand: no reply behind it
       ['inline binding without a reply', (row) => ({ ...row, reply: undefined }), /1 judged rows without the reply that gives their scores/],
       ['reply with other scores', (row) => ({ ...row, reply: replyFor(row.items, { ...row.scores, cs3: 2 }, row.bound.seed) }), /1 judged rows without the reply/],
       ['scores changed, reply kept', (row) => ({ ...row, scores: { ...row.scores, cs3: 2 } }), /1 judged rows without the reply/],
-      ['a score key outside the items', (row) => ({ ...row, scores: { ...row.scores, g99: 2 } }), /1 whose items or scores do not fit the shown lines/],
-      ['a control relabelled as a line', (row) => {
-        const items = row.items.map((it: { factId: string; kind: string }) => (it.factId === 'cs3' ? { ...it, kind: 'line' } : it));
-        return { ...row, items, bound: bound(3, items, row.bound.seed), reply: replyFor(items, row.scores, row.bound.seed) };
-      }, /1 whose items or scores do not fit the shown lines/],
+      ['a score key outside the items', (row) => ({ ...row, scores: { ...row.scores, g99: 2 } }), /1 whose score keys are not their items or whose controls are lines shown now/],
+      ['an item without a score', (row) => {
+        const { cs3: _cs3, ...scores } = row.scores;
+        return { ...row, scores, reply: replyFor(row.items, { ...scores, cs3: 0 }, row.bound.seed) };
+      }, /1 whose score keys are not their items/],
       ['a shown line relabelled as a control', (row) => {
         const items = row.items.map((it: { factId: string; kind: string }) => (it.factId === 'f3' ? { ...it, kind: 'control_same' } : it));
         return { ...row, items, bound: bound(3, items, row.bound.seed), reply: replyFor(items, row.scores, row.bound.seed) };
-      }, /1 whose items or scores do not fit the shown lines/],
+      }, /1 whose score keys are not their items or whose controls are lines shown now/],
     ];
     for (const [name, change, message] of cases) {
       fs.rmSync(out, { recursive: true, force: true });
@@ -285,6 +285,21 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
       expect(r.status, name).toBe(1);
       expect(r.stderr, name).toMatch(message);
     }
+  });
+
+  it('a line no variant shows now (judged for an earlier replay) is counted and named in the doc, never read as a line', async () => {
+    // indistinguishable from a control relabelled as a line — the judge never sees kinds; the count makes it visible
+    const file = path.join(out, 'judgments.jsonl');
+    rewrite(file, 3, (row) => {
+      const items = row.items.map((it: { factId: string; kind: string }) => (it.factId === 'cs3' ? { ...it, kind: 'line' } : it));
+      return { ...row, items, bound: bound(3, items, row.bound.seed), reply: replyFor(items, row.scores, row.bound.seed) };
+    });
+    const doc = path.join(out, 'doc.md');
+    const r = await report(doc);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.report.judge.binding).toMatchObject({ staleLines: 1, staleRows: 1, ...NO_DRIFT });
+    expect(r.report.judge.controls.same[1], 'one control fewer').toBe(N - 1);
+    expect(fs.readFileSync(doc, 'utf8')).toContain('지금 어느 변형도 표시하지 않는 줄 항목 1개(1행)');
   });
 
   it('a judged prompt with no control in any scored main row is counted (V1/V2 then rest on fewer pairs)', async () => {
