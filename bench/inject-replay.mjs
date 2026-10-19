@@ -264,8 +264,9 @@ async function replay() {
   const kwFacts = (ident) => { if (!kwCache.has(ident)) kwCache.set(ident, kwScan.all(ident)); return kwCache.get(ident); };
   const byId = db.prepare('SELECT * FROM facts WHERE id = ?');
 
-  // C2 'affected' (pre-registered): the family predicate is wider than the exact match and the widened
-  // paths hold facts — facts this prompt could see (as-of), through the same predicate the selection uses.
+  // C2 'affected', through the same predicate the selection uses: the family predicate is wider than the
+  // exact match and the widened paths hold facts. Registered reading (decides): the prompt's cwd has such
+  // facts active now. Post-hoc reading (reported, plan Deviations 2): facts this prompt could see (as-of).
   const projectFacts = db.prepare("SELECT id, scope_project FROM facts WHERE is_active = 1 AND scope_type = 'project'").all();
   const widenedOf = new Map();
   const widened = (project) => {
@@ -277,11 +278,11 @@ async function replay() {
     return widenedOf.get(project);
   };
   const affected = new Set();
-  const isAffected = (p, asOf) => widened(p.project).some((id) => asOf.visibleFactId(id));
+  const isAffectedAsOf = (p, asOf) => widened(p.project).some((id) => asOf.visibleFactId(id));
 
   await initEmbeddings();
   const out = Object.fromEntries(variants.map((v) => [v, []]));
-  const meta = { prompts: sample.length, hard: [], affected: [], kw: { identifiers: 0, picked: 0, bypassSkipped: 0 } };
+  const meta = { prompts: sample.length, hard: [], affectedRegistered: [], affectedAsOf: [], kw: { identifiers: 0, picked: 0, bypassSkipped: 0 } };
   for (const p of sample) {
     const e = await generateEmbedding(p.query, 'query');
     const baseline = await queryBaseline(e);
@@ -324,7 +325,8 @@ async function replay() {
       });
       if (v === 'v0' && lines.length === 0) meta.hard.push(p.qid);
     }
-    if (isAffected(p, asOf)) { affected.add(p.qid); meta.affected.push(p.qid); }
+    if (widened(p.project).length > 0) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }
+    if (isAffectedAsOf(p, asOf)) meta.affectedAsOf.push(p.qid);
   }
   db.close();
   const hashes = {};
@@ -334,12 +336,15 @@ async function replay() {
     hashes[v] = crypto.createHash('sha256').update(body).digest('hex');
   }
   if (!suffix) writeJson(path.join(OUT, 'replay-meta.json'), { ...meta, generatedAt: new Date().toISOString(), hashes });
-  console.log(JSON.stringify({ prompts: sample.length, variants, hard: meta.hard.length, affected: affected.size, kw: meta.kw, hashes }));
+  console.log(JSON.stringify({ prompts: sample.length, variants, hard: meta.hard.length, affected: affected.size, affectedAsOf: meta.affectedAsOf.length, kw: meta.kw, hashes }));
 }
 
 // ------------------------------------------------------------------ determinism
 
 function checkDeterminism() {
+  // Order: --build → --replay → --check-determinism (it compares two fresh runs with the lines files the judge reads).
+  const missing = VARIANTS.filter((v) => !fs.existsSync(path.join(OUT, `lines-${v}.jsonl`)));
+  if (missing.length) fail(`no lines file for ${missing.join(', ')} in ${OUT} — run --replay first (order: --build → --replay → --check-determinism)`);
   const self = fileURLToPath(import.meta.url);
   for (const s of ['.det-a', '.det-b']) {
     execFileSync(process.execPath, [self, '--replay', '--out', OUT, '--suffix', s], { stdio: ['ignore', 'ignore', 'inherit'] });

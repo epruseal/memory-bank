@@ -101,17 +101,30 @@ export function foldSample(aligned, gate) {
 /** As-of index from the snapshot: fact id → created (epoch ms), fact id → sessions it was extracted in. */
 export function buildFactIndex(db) {
   const factCreated = new Map();
-  for (const f of db.prepare('SELECT id, created_at FROM facts').iterate()) factCreated.set(f.id, toEpoch(f.created_at));
+  const byText = new Map();
+  for (const f of db.prepare('SELECT id, fact, created_at FROM facts').iterate()) {
+    factCreated.set(f.id, toEpoch(f.created_at));
+    const ids = byText.get(f.fact);
+    if (ids) ids.push(f.id); else byText.set(f.fact, [f.id]);
+  }
   const factSessions = new Map();
   for (const r of db.prepare('SELECT fact_id, session_id FROM bench_fact_sessions').iterate()) {
     const s = factSessions.get(r.fact_id);
     if (s) s.add(r.session_id); else factSessions.set(r.fact_id, new Set([r.session_id]));
   }
-  // Latest rewrite of each fact (consolidation EVOLUTION keeps created_at and sources, replaces the text).
+  // Latest rewrite of each fact. Consolidation EVOLUTION keeps created_at and sources and replaces the
+  // revised fact's text. CONTRADICTION with a merged text rewrites the NEW fact while the revision row
+  // names the old one (src/consolidator.ts applyConsolidationResult) — so a fact that already existed
+  // and now holds a revision row's new text counts as rewritten then too. A CONTRADICTION that kept the
+  // new fact's own text leaves an identical row, so that fact is hidden too (conservative: hidden, never
+  // replayed with a later text).
   const factRevised = new Map();
-  for (const r of db.prepare('SELECT fact_id, created_at FROM fact_revisions').iterate()) {
+  const bump = (id, t) => { if (!(factRevised.get(id) >= t)) factRevised.set(id, t); };
+  for (const r of db.prepare('SELECT fact_id, new_fact, created_at FROM fact_revisions').iterate()) {
     const t = toEpoch(r.created_at);
-    if (Number.isFinite(t) && !(factRevised.get(r.fact_id) >= t)) factRevised.set(r.fact_id, t);
+    if (!Number.isFinite(t)) continue;
+    bump(r.fact_id, t);
+    for (const id of byText.get(r.new_fact) ?? []) if (id !== r.fact_id && factCreated.get(id) <= t) bump(id, t);
   }
   return { factCreated, factSessions, factRevised };
 }
@@ -455,16 +468,27 @@ export const leakFold = (t) => String(t).normalize('NFC').toLowerCase().replace(
  * 400 chars in): a copied prompt or fact shows up wherever the quote starts. Windows shorter
  * than 12 chars are skipped (too common to mean a leak).
  */
+/** Leak probes: folded 40-char windows every 20 chars over the whole text — any copied run of 59+ chars holds one whole. */
 export function leakProbes(texts) {
   const out = new Set();
   for (const t of texts) {
     const f = leakFold(t);
-    for (let i = 0; i < Math.min(f.length, 400); i += 40) {
+    for (let i = 0; i < f.length; i += 20) {
       const w = f.slice(i, i + 40).trim();
       if (w.length >= 12) out.add(w);
     }
   }
   return [...out];
+}
+
+/** Repository of a cwd for grouping: the last family root (the main repository for a linked worktree), else the cwd. */
+export function repoOf(roots, project) {
+  return roots.length ? roots[roots.length - 1] : project;
+}
+
+/** Variants whose replay-meta hash is not the sha256 of the lines file read now (the meta's lists belong to other bytes). */
+export function unboundMeta(metaHashes, lineSha) {
+  return Object.keys(lineSha).filter((v) => metaHashes?.[v] !== lineSha[v]);
 }
 
 /** Prompts whose shown id list differs between two variants' lines (`Map qid → [{id}]`). */

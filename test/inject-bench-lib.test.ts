@@ -1,8 +1,15 @@
 import { describe, it, expect } from 'vitest';
+import Database from 'better-sqlite3';
+import { spawnSync } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import {
   THRESHOLDS, alignWindow, bootstrapDelta, decide, decideC2, decideC3, decisionsBlock, extractIdentifiers, foldSample,
   isBypassFact, kwLines, leakProbes, lostJ2Rel, makeAsOf, meanDelta, parseDecisionsBlock, perPromptCounts, aggregate,
   ratioDelta, searchedLogRows, splitOf, toEpoch, validateJudgeReply, validity, labelItems, leakFold, blockDiffers,
+  buildFactIndex, repoOf, unboundMeta,
 } from '../bench/inject-bench-lib.mjs';
 
 /**
@@ -80,6 +87,30 @@ describe('as-of', () => {
     expect(asOf.visibleFactId('mine')).toBe(false);
     expect(asOf.visibleFactId('unknown')).toBe(false);
     expect(makeAsOf(index, { ts: '2026-10-01T00:00:00Z', sessionId: 's2' }).visibleFactId('mine')).toBe(true);
+  });
+  it('a CONTRADICTION merge that rewrote the NEW fact counts as its rewrite (the revision row names the old fact)', () => {
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE facts (id TEXT, fact TEXT, created_at TEXT);
+             CREATE TABLE bench_fact_sessions (fact_id TEXT, session_id TEXT);
+             CREATE TABLE fact_revisions (fact_id TEXT, new_fact TEXT, created_at TEXT);`);
+    const fact = db.prepare('INSERT INTO facts VALUES (?, ?, ?)');
+    fact.run('old', 'deploy target is heroku', '2026-09-01T00:00:00Z');
+    fact.run('new', 'deploy target is vercel, merged', '2026-09-10T00:00:00Z');
+    fact.run('later', 'deploy target is vercel, merged', '2026-10-10T00:00:00Z');
+    fact.run('evolved', 'cache ttl is 60s', '2026-09-01T00:00:00Z');
+    fact.run('other', 'unrelated sentence', '2026-09-01T00:00:00Z');
+    const rev = db.prepare('INSERT INTO fact_revisions VALUES (?, ?, ?)');
+    rev.run('old', 'deploy target is vercel, merged', '2026-10-05T00:00:00Z');
+    rev.run('evolved', 'cache ttl is 60s', '2026-10-06T00:00:00Z');
+    const idx = buildFactIndex(db);
+    db.close();
+    expect(idx.factRevised.get('old')).toBe(toEpoch('2026-10-05T00:00:00Z'));
+    expect(idx.factRevised.get('new'), 'the merged text landed on the new fact').toBe(toEpoch('2026-10-05T00:00:00Z'));
+    expect(idx.factRevised.has('later'), 'created after the revision — its text is its own').toBe(false);
+    expect(idx.factRevised.get('evolved')).toBe(toEpoch('2026-10-06T00:00:00Z'));
+    expect(idx.factRevised.has('other')).toBe(false);
+    expect(makeAsOf(idx, { ts: '2026-10-01T00:00:00Z', sessionId: 's9' }).visibleFactId('new')).toBe(false);
+    expect(makeAsOf(idx, { ts: '2026-10-07T00:00:00Z', sessionId: 's9' }).visibleFactId('new')).toBe(true);
   });
   it('compares relation times as instants — SQLite "YYYY-MM-DD HH:MM:SS" and ISO alike', () => {
     expect(asOf.visibleRelation({ created_at: '2026-09-30 23:59:59' })).toBe(true);
@@ -228,12 +259,43 @@ describe('decision', () => {
     expect(parseDecisionsBlock(md)).toEqual({ verdict: 'valid', production: { relMargin: 0.045, scopeFamily: false } });
     expect(parseDecisionsBlock('no block')).toBeNull();
   });
-  it('leak probes are folded 40-char windows every 40 chars (first 400), short ones skipped', () => {
-    expect(leakProbes(['  How   do we deploy the billing service to production today please', 'short']))
-      .toEqual(['how do we deploy the billing service to', 'production today please']);
+  it('leak probes are folded 40-char windows every 20 chars over the whole text — every 59-char run holds one', () => {
+    expect(leakProbes(['  How   do we deploy the billing service to production today please', 'short'])[0])
+      .toBe('how do we deploy the billing service to');
+    expect(leakProbes(['short'])).toEqual([]);
     const long = Array.from({ length: 600 }, (_, i) => String.fromCharCode(0x4e00 + i)).join(''); // no window repeats
     const probes = leakProbes([long]);
-    expect(probes.length, 'windows stop 400 chars in').toBe(10);
+    expect(probes.length).toBe(30);
+    for (let i = 0; i + 59 <= long.length; i++) expect(probes.some((w) => long.slice(i, i + 59).includes(w)), `offset ${i}`).toBe(true);
+    expect(probes.some((w) => w.endsWith(long.slice(-5))), 'windows reach the end of the text').toBe(true);
+  });
+  it('--check-determinism without lines files names the run order instead of crashing', () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-det-'));
+    try {
+      const script = fileURLToPath(new URL('../bench/inject-replay.mjs', import.meta.url));
+      const r = spawnSync(process.execPath, [script, '--check-determinism', '--out', out], { encoding: 'utf8' });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/run --replay first \(order: --build → --replay → --check-determinism\)/);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+  it('the report decides C2 on the registered reading and refuses meta lists of other bytes (scripts pinned)', () => {
+    const judge = fs.readFileSync(fileURLToPath(new URL('../bench/inject-judge.mjs', import.meta.url)), 'utf8');
+    const replay = fs.readFileSync(fileURLToPath(new URL('../bench/inject-replay.mjs', import.meta.url)), 'utf8');
+    expect(judge).toContain('const unbound = unboundMeta(meta.hashes, lineSha);\n  if (unbound.length) fail(');
+    expect(judge).toContain('const affected = usable(meta.affectedRegistered);\n  const c2stats = c2For(affected);');
+    expect(judge).toContain('const c2 = decideC2(c2stats);');
+    expect(judge, 'grouped by repository, not by worktree').toContain('const repoOfQ = (q) => repoOf(resolveRepoRoots(projectOf.get(q)), projectOf.get(q));');
+    expect(replay).toContain('if (widened(p.project).length > 0) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
+  });
+  it('repoOf groups a linked worktree with its repository; unboundMeta names variants whose meta hash differs', () => {
+    expect(repoOf(['/r/.wt/a', '/r'], '/r/.wt/a/src')).toBe('/r');
+    expect(repoOf(['/r'], '/r/docs')).toBe('/r');
+    expect(repoOf([], '/x')).toBe('/x');
+    expect(unboundMeta({ v0: 'a', family: 'b' }, { v0: 'a', family: 'c', kw: 'd' })).toEqual(['family', 'kw']);
+    expect(unboundMeta(undefined, { v0: 'a' })).toEqual(['v0']);
+    expect(unboundMeta({ v0: 'a' }, { v0: 'a' })).toEqual([]);
   });
   it('leak fold catches a copy that differs in case, Unicode form, markdown escapes or spacing', () => {
     const fact = 'Release notes are written in Korean — 릴리즈 노트는 한국어로 쓴다 and attached to the GitHub release';

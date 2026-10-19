@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -35,6 +36,7 @@ beforeAll(() => {
   S = path.join(tmp, 'proj', 'memory-bank-cloud');
   makeRepo(R);
   fs.mkdirSync(path.join(R, 'docs', 'deep'), { recursive: true });
+  fs.mkdirSync(path.join(R, 'src'), { recursive: true });
   makeRepo(S);
   W = path.join(R, '.auto-issue-worktrees', 'issue-1');
   linkWorktree(W, R, 'issue-1');
@@ -122,6 +124,39 @@ describe('resolveRepoRoots', () => {
     expect(resolveRepoRoots(path.join(tmp, '.claude', 'worktrees', 'gone-2'))).toEqual([]);
   });
 
+  it('on a case-insensitive file system a differently cased home is still the home', (ctx) => {
+    const home = path.join(tmp, 'home3');
+    makeRepo(home);
+    fs.mkdirSync(path.join(home, 'notes'), { recursive: true });
+    vi.spyOn(os, 'homedir').mockReturnValue(home);
+    const upper = home.toUpperCase();
+    if (!fs.existsSync(path.join(upper, 'NOTES')) || (process.platform !== 'darwin' && process.platform !== 'win32')) ctx.skip();
+    expect(resolveRepoRoots(path.join(upper, 'NOTES')), 'the same home folder, other case').toEqual([]);
+    expect(resolveRepoRoots(path.join(home, 'notes'))).toEqual([]);
+  });
+
+  it('the root cache expires — a folder that became a repository is seen within a minute', () => {
+    const later = path.join(tmp, 'becomes-repo');
+    fs.mkdirSync(later, { recursive: true });
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    expect(resolveRepoRoots(later)).toEqual([]);
+    makeRepo(later);
+    now += 30_000;
+    expect(resolveRepoRoots(later), 'still the cached answer').toEqual([]);
+    now += 31_000;
+    expect(resolveRepoRoots(later)).toEqual([later]);
+  });
+
+  it('a gitdir back-reference that is not a regular file (a FIFO) is never read', (ctx) => {
+    const wt = path.join(tmp, 'fifo-wt');
+    linkWorktree(wt, R, 'fifo');
+    const back = path.join(R, '.git', 'worktrees', 'fifo', 'gitdir');
+    fs.rmSync(back);
+    if (spawnSync('mkfifo', [back]).status !== 0) ctx.skip();
+    expect(resolveRepoRoots(wt), 'reading it would block the hook; the main repository is not linked').toEqual([wt]);
+  });
+
   it('the account home counts even when HOME points elsewhere', () => {
     const home = path.join(tmp, 'home2');
     makeRepo(home);
@@ -165,6 +200,20 @@ describe('scopeMatcher', () => {
     const foreign = path.join(R, 'other-wt');
     linkWorktree(foreign, S, 'foreign');
     expect(m(foreign), 'a worktree of another repository placed under R').toBe(false);
+  });
+
+  it('a deleted path under a root stays in the family only inside a worktree container of that root', () => {
+    const m = scopeMatcher(path.join(R, 'docs'), true);
+    expect(m(path.join(R, '.claude', 'worktrees', 'gone-agent'))).toBe(true);
+    expect(m(path.join(R, '.auto-issue-worktrees', 'gone-9', 'src'))).toBe(true);
+    expect(m(path.join(R, '.claude', 'other', 'x')), 'not a container').toBe(false);
+    expect(m(path.join(R, 'never-existed', 'x')), 'a deleted plain folder could have been another repository').toBe(false);
+    const clone = path.join(R, 'tmp', 'other-repo');
+    makeRepo(clone);
+    expect(m(clone), 'while it exists it is a nested repository').toBe(false);
+    fs.rmSync(clone, { recursive: true, force: true });
+    expect(scopeMatcher(path.join(R, 'docs'), true)(clone), 'deleted, it is still left out').toBe(false);
+    expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(R, 'tmp')), 'positive control: the folder that remains').toBe(true);
   });
 
   it('a path with . or .. segments matches only exactly', () => {

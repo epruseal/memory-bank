@@ -55,10 +55,12 @@ export interface InjectSelectOptions {
  * decisions block and fails when this drifts from it):
  *  - relMargin null: every candidate margin lost more than 10% of the relation
  *    lines judged directly useful, so the relation gate was rejected;
- *  - scopeFamily true: on the 111 prompts the family widens (facts visible at the
- *    prompt's time), judged-useful lines per prompt rose +0.14 (95% CI 0.05–0.26),
- *    precision(=2) Δ +0.03 (CI −0.02–0.08); the gain spans 5 repository roots and
- *    stays above 0 without the largest one (+0.08, CI 0.01–0.19).
+ *  - scopeFamily true: on the 127 prompts whose cwd the family widens (the
+ *    registered reading), judged-useful lines per prompt rose +0.13 (95% CI
+ *    0.05–0.23), precision(=2) Δ +0.03 (CI −0.02–0.07). Limit: the whole gain
+ *    (16 lines) came from ONE repository — its main folder and linked worktrees;
+ *    the 22 affected prompts of the other repositories gained nothing and are
+ *    too few (< 30) to judge on their own.
  */
 export const PRODUCTION_SELECT_OPTIONS: Readonly<InjectSelectOptions> = Object.freeze({
   relMargin: null,

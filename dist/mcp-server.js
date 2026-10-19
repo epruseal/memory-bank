@@ -52021,6 +52021,7 @@ import os2 from "os";
 import path3 from "path";
 var WORKTREE_CONTAINERS = ["/.auto-issue-worktrees/", "/.claude/worktrees/"];
 var CACHE_LIMIT = 256;
+var CACHE_TTL_MS = 6e4;
 var cache = /* @__PURE__ */ new Map();
 function lstat(p) {
   try {
@@ -52040,8 +52041,15 @@ function homes() {
   }
   return out;
 }
+function fold(p) {
+  return process.platform === "darwin" || process.platform === "win32" ? p.toLowerCase() : p;
+}
 function tooBroad(root) {
-  return root === path3.parse(root).root || homes().some((home) => home === root || home.startsWith(root + path3.sep));
+  const r = fold(root);
+  return root === path3.parse(root).root || homes().some((h) => {
+    const home = fold(h);
+    return home === r || home.startsWith(r + path3.sep);
+  });
 }
 function isRepoRoot(root) {
   return isDir(path3.join(root, ".git")) && lstat(path3.join(root, ".git", "HEAD"))?.isFile() === true;
@@ -52051,9 +52059,11 @@ function mainRootOf(worktreeTop, adminDir) {
   if (!parts) return null;
   const root = parts[1];
   if (!isRepoRoot(root)) return null;
+  const backFile = path3.join(adminDir, "gitdir");
+  if (lstat(backFile)?.isFile() !== true) return null;
   let back;
   try {
-    back = fs3.readFileSync(path3.join(adminDir, "gitdir"), "utf8").trim();
+    back = fs3.readFileSync(backFile, "utf8").trim();
   } catch {
     return null;
   }
@@ -52101,18 +52111,20 @@ function resolveUncached(cwd) {
   }
 }
 function resolveRepoRoots(cwd) {
+  const now = Date.now();
   const hit = cache.get(cwd);
-  if (hit) return hit;
+  if (hit && now - hit.at < CACHE_TTL_MS) return hit.roots;
   const roots = resolveUncached(cwd);
   if (cache.size >= CACHE_LIMIT) cache.clear();
-  cache.set(cwd, roots);
+  cache.set(cwd, { roots, at: now });
   return roots;
 }
-function insideNestedRepo(root, scopeProject, roots) {
+function excludedUnderRoot(root, scopeProject, roots) {
   let dir = root;
   for (const seg of scopeProject.slice(root.length + 1).split("/")) {
     if (!seg) continue;
     dir = path3.join(dir, seg);
+    if (!lstat(dir)) return !WORKTREE_CONTAINERS.some((c) => scopeProject.startsWith(root + c));
     const g = dotGitOf(dir);
     if (g.kind === "none") continue;
     if (g.kind === "linked" && g.main !== null && roots.includes(g.main)) continue;
@@ -52128,7 +52140,7 @@ function scopeMatcher(project, family) {
   const memo2 = /* @__PURE__ */ new Map();
   const inFamily = (s) => {
     if (s.split("/").some((seg) => seg === "." || seg === "..")) return false;
-    return roots.some((r) => s === r || s.startsWith(r + "/") && !insideNestedRepo(r, s, roots));
+    return roots.some((r) => s === r || s.startsWith(r + "/") && !excludedUnderRoot(r, s, roots));
   };
   return (scopeProject) => {
     if (scopeProject === project) return true;

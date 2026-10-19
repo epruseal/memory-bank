@@ -17,9 +17,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  CONTROL_PER_KIND, JUDGE_SYSTEM, REJUDGE_PROMPTS, VARIANTS, aggregate, bootstrapDelta, decide, decideC2,
+  CONTROL_PER_KIND, JUDGE_SYSTEM, REJUDGE_PROMPTS, THRESHOLDS, VARIANTS, aggregate, bootstrapDelta, decide, decideC2,
   decideC3, decisionsBlock, judgeUserMessage, labelItems, leakProbes, lostJ2Rel, meanDelta, perPromptCounts, ratioDelta,
-  seededRandom, validateJudgeReply, validity, makeAsOf, isBypassFact, buildFactIndex, blockDiffers, leakFold,
+  seededRandom, validateJudgeReply, validity, makeAsOf, isBypassFact, buildFactIndex, blockDiffers, leakFold, repoOf, unboundMeta,
 } from './inject-bench-lib.mjs';
 import crypto from 'node:crypto';
 
@@ -336,6 +336,10 @@ async function report() {
   const lineSha = Object.fromEntries(VARIANTS.map((v) => [v, crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, `lines-${v}.jsonl`))).digest('hex')]));
   const deterministic = det !== null && det.identical === true
     && VARIANTS.every((v) => det.variants?.[v]?.a === lineSha[v] && det.variants?.[v]?.b === lineSha[v]);
+  // The affected / hard lists come from replay-meta.json — they must belong to these lines files.
+  const unbound = unboundMeta(meta.hashes, lineSha);
+  if (unbound.length) fail(`replay-meta.json hashes do not match the lines files for ${unbound.join(', ')} — re-run --replay (all variants, no suffix)`);
+  if (!Array.isArray(meta.affectedRegistered) || !Array.isArray(meta.affectedAsOf)) fail('replay-meta.json has no affectedRegistered / affectedAsOf — re-run --replay');
   const bySplit = { train: sample.filter((p) => p.split === 'train').map((p) => p.qid), heldout: sample.filter((p) => p.split === 'heldout').map((p) => p.qid) };
   bySplit.all = [...bySplit.train, ...bySplit.heldout];
 
@@ -362,41 +366,50 @@ async function report() {
       };
     }
   }
-  const affected = usable(meta.affected);
-  const c2stats = {
-    affected: affected.length,
-    j2Delta: bootstrapDelta(pairsOf(affected, 'family'), meanDelta('j2'), { seed: 'c2:j2' }),
-    precisionJ2Delta: bootstrapDelta(pairsOf(affected, 'family'), ratioDelta('j2', 'lines'), { seed: 'c2:pj2' }),
-  };
-  // Where the family block actually differs from v0 (reading aid for C2 — the rule counts 'affected' as registered).
-  const differs = blockDiffers(affected, lines.family, lines.v0);
-  const differsRoots = new Map();
-  for (const q of differs) {
-    const project = sample.find((p) => p.qid === q).project;
-    const root = resolveRepoRoots(project)[0] ?? project;
-    differsRoots.set(root, (differsRoots.get(root) ?? 0) + 1);
-  }
-  c2stats.blockDiffers = {
-    prompts: differs.length,
-    cwds: new Set(differs.map((q) => sample.find((p) => p.qid === q).project)).size,
-    roots: differsRoots.size,
-    largestRootShare: differs.length ? Math.max(...differsRoots.values()) / differs.length : null,
-  };
-  // Sensitivity (reading aid): the same delta without the root holding the largest share of the grade-2 gain.
-  const rootOf = (q) => { const project = sample.find((p) => p.qid === q).project; return resolveRepoRoots(project)[0] ?? project; };
-  const gainByRoot = new Map();
+  const c2For = (qids) => ({
+    affected: qids.length,
+    j2Delta: bootstrapDelta(pairsOf(qids, 'family'), meanDelta('j2'), { seed: 'c2:j2' }),
+    precisionJ2Delta: bootstrapDelta(pairsOf(qids, 'family'), ratioDelta('j2', 'lines'), { seed: 'c2:pj2' }),
+  });
+  // The rule decides on the registered reading (the prompt's cwd has facts in the widened paths, active now);
+  // the as-of reading is post-hoc (plan Deviations 2) and reported with its own decision, which decides nothing.
+  const affected = usable(meta.affectedRegistered);
+  const c2stats = c2For(affected);
+  const asOfQids = usable(meta.affectedAsOf);
+  c2stats.asOf = { ...c2For(asOfQids), decision: decideC2(c2For(asOfQids)).decision };
+  // Where the effect lives (reading aid). Grouped by repository — a linked worktree counts with its main
+  // repository (the last family root) — and by cwd root (the worktree / folder itself).
+  const projectOf = new Map(sample.map((p) => [p.qid, p.project]));
+  const repoOfQ = (q) => repoOf(resolveRepoRoots(projectOf.get(q)), projectOf.get(q));
+  const rootOfQ = (q) => resolveRepoRoots(projectOf.get(q))[0] ?? projectOf.get(q);
+  const differs = new Set(blockDiffers(affected, lines.family, lines.v0));
+  const byRepo = new Map();
   for (const q of affected) {
-    const d = counts.family.get(q).j2 - counts.v0.get(q).j2;
-    if (d) gainByRoot.set(rootOf(q), (gainByRoot.get(rootOf(q)) ?? 0) + d);
+    const r = byRepo.get(repoOfQ(q)) ?? { prompts: 0, differs: 0, gain: 0, roots: new Set() };
+    r.prompts++;
+    if (differs.has(q)) r.differs++;
+    r.gain += counts.family.get(q).j2 - counts.v0.get(q).j2;
+    r.roots.add(rootOfQ(q));
+    byRepo.set(repoOfQ(q), r);
   }
-  const totalGain = [...gainByRoot.values()].reduce((a, b) => a + b, 0);
-  const topRoot = [...gainByRoot.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
-  const rest = affected.filter((q) => rootOf(q) !== topRoot);
-  c2stats.gainByRoot = {
-    total: totalGain,
-    roots: [...gainByRoot.values()].sort((a, b) => b - a),
-    largestShare: totalGain ? Math.max(...gainByRoot.values()) / totalGain : null,
-    withoutLargest: bootstrapDelta(pairsOf(rest, 'family'), meanDelta('j2'), { seed: 'c2:j2:loo' }),
+  const repos = [...byRepo.entries()].sort((a, b) => b[1].gain - a[1].gain || b[1].prompts - a[1].prompts);
+  const totalGain = repos.reduce((t, [, r]) => t + r.gain, 0);
+  const [topRepo, top] = repos[0] ?? [null, null];
+  const rest = affected.filter((q) => repoOfQ(q) !== topRepo);
+  c2stats.blockDiffers = {
+    prompts: differs.size,
+    cwds: new Set([...differs].map((q) => projectOf.get(q))).size,
+    repos: new Set([...differs].map(repoOfQ)).size,
+  };
+  c2stats.byRepo = {
+    repos: repos.length,
+    totalGain,
+    gainByRepo: repos.map(([, r]) => r.gain),
+    largest: top && { prompts: top.prompts, differs: top.differs, gain: top.gain, cwdRoots: top.roots.size },
+    // Without the repository holding the largest gain: below the registered minimum the delta is not judged.
+    withoutLargest: rest.length >= THRESHOLDS.C2_min_affected
+      ? { measurable: true, ...bootstrapDelta(pairsOf(rest, 'family'), meanDelta('j2'), { seed: 'c2:j2:loo' }) }
+      : { measurable: false, n: rest.length, gain: rest.reduce((t, q) => t + counts.family.get(q).j2 - counts.v0.get(q).j2, 0) },
   };
   const hard = usable(meta.hard);
   const hardGain = Object.fromEntries(VARIANTS.map((v) => [v, hard.reduce((t, q) => t + counts[v].get(q).j2, 0)]));
@@ -507,9 +520,10 @@ function writeDoc(file, r) {
     '',
     '## C2 저장소 가족 scope',
     '',
-    `영향 프롬프트 ${r.c2.affected}개(두 분할 합침 — 사전 등록 정의: 가족 술어가 넓어지고 넓어진 경로에 그 프롬프트 시점에 보이는 사실이 있는 프롬프트). 판정2/프롬프트 Δ ${ci(r.c2.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.precisionJ2Delta)}.`,
-    `참고(판정 규칙 밖): 그중 family 블록이 v0 와 실제로 다른 프롬프트 ${r.c2.blockDiffers.prompts}개 — cwd ${r.c2.blockDiffers.cwds}곳, 저장소 루트 ${r.c2.blockDiffers.roots}곳, 가장 많은 루트의 몫 ${fmt(r.c2.blockDiffers.largestRootShare)}.`,
-    `참고: 판정 2 이득 ${r.c2.gainByRoot.total}줄의 루트별 몫 [${r.c2.gainByRoot.roots.join(', ')}](가장 큰 루트 ${fmt(r.c2.gainByRoot.largestShare)}). 그 루트를 뺀 프롬프트 ${r.c2.gainByRoot.withoutLargest.n}개의 판정2/프롬프트 Δ ${ci(r.c2.gainByRoot.withoutLargest)}. 프롬프트 단위 부트스트랩이라 같은 cwd 끼리의 상관은 반영하지 않는다.`,
+    `영향 프롬프트 ${r.c2.affected}개(두 분할 합침 — 사전 등록 문장 그대로: 가족 술어가 넓어지고 넓어진 경로에 지금 활성인 사실이 있는 cwd 의 프롬프트). 판정2/프롬프트 Δ ${ci(r.c2.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.precisionJ2Delta)}.`,
+    `사후 해석(판정 규칙 밖 — 계획 Deviations 2, 결정에 쓰지 않음): 그 프롬프트 시점에 보이는 사실로 세면 영향 ${r.c2.asOf.affected}개, 판정2/프롬프트 Δ ${ci(r.c2.asOf.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.asOf.precisionJ2Delta)} → 같은 규칙이면 \`${r.c2.asOf.decision}\`.`,
+    `참고(판정 규칙 밖): family 블록이 v0 와 실제로 다른 프롬프트 ${r.c2.blockDiffers.prompts}개 — cwd ${r.c2.blockDiffers.cwds}곳, 저장소 ${r.c2.blockDiffers.repos}곳(연결 worktree 는 본 저장소로 셈).`,
+    `일반화 한계: 영향 프롬프트는 저장소 ${r.c2.byRepo.repos}곳에 걸치지만, 판정 2 이득 ${r.c2.byRepo.totalGain}줄의 저장소별 몫은 [${r.c2.byRepo.gainByRepo.join(', ')}]이다. 이득이 가장 큰 저장소 하나(cwd 루트 ${r.c2.byRepo.largest?.cwdRoots ?? 0}곳 — 본체와 연결 worktree)에 영향 프롬프트 ${r.c2.byRepo.largest?.prompts ?? 0}개, 블록이 달라진 프롬프트 ${r.c2.byRepo.largest?.differs ?? 0}개, 이득 ${r.c2.byRepo.largest?.gain ?? 0}줄이 있다. ${r.c2.byRepo.withoutLargest.measurable ? `그 저장소를 뺀 프롬프트 ${r.c2.byRepo.withoutLargest.n}개의 판정2/프롬프트 Δ ${ci(r.c2.byRepo.withoutLargest)}.` : `그 저장소를 빼면 영향 프롬프트 ${r.c2.byRepo.withoutLargest.n}개(이득 ${r.c2.byRepo.withoutLargest.gain}줄)로 사전 등록 최소 ${THRESHOLDS.C2_min_affected}개에 못 미쳐 판정할 수 없다 — 다른 저장소에서의 효과는 이번 표본으로 말할 수 없다.`} 프롬프트 단위 부트스트랩이라 같은 cwd·저장소끼리의 상관은 반영하지 않는다(구간이 실제보다 좁을 수 있다).`,
     `결정: \`${d.C2.decision}\` — ${d.C2.reason ?? ''}`,
     '',
     '## C4 식별자 어휘 레인 (측정만, 운영 변경 없음)',
@@ -525,10 +539,10 @@ function writeDoc(file, r) {
     '## 한계',
     '',
     '- 판정기는 LLM 이다. 사람 라벨이 아니고, 길이·언어 편향이 있을 수 있다. 대조군(V1·V2)과 재채점(V3)으로만 보정했다.',
-    '- 재생은 세션 원장(이미 보여 준 사실)을 재현하지 않는다. 비활성 전환은 복원하지 못한다(지금 상태로 읽음). 프롬프트 뒤에 문장이 바뀐 사실(통합의 EVOLUTION)은 그때의 벡터가 없어 숨긴다.',
-    '- 지워진 worktree 경로는 앞쪽 폴더가 저장소 루트일 때만 그 저장소의 가족으로 푼다. 여러 저장소의 worktree 를 담은 상위 폴더 아래에서 지워진 경로는 가족이 없다(완전 일치) — 그런 프롬프트의 가족 효과는 재지 못한다.',
+    '- 재생은 세션 원장(이미 보여 준 사실)을 재현하지 않는다. 비활성 전환은 복원하지 못한다(지금 상태로 읽음). 프롬프트 뒤에 문장이 바뀐 사실은 그때의 벡터가 없어 숨긴다 — 통합의 EVOLUTION(개정 행의 사실), CONTRADICTION 병합(개정 행의 새 문장을 지금 가진 다른 사실 — 병합 없이 새 사실 문장을 그대로 쓴 경우까지 숨겨 보수적).',
+    '- 지워진 cwd 는 worktree 보관 폴더 앞쪽 폴더가 저장소 루트일 때만 그 저장소의 가족으로 푼다. 여러 저장소의 worktree 를 담은 상위 폴더 아래에서 지워진 cwd 는 가족이 없다(완전 일치) — 그런 프롬프트의 가족 효과는 재지 못한다. 루트 아래 지워진 사실 경로는 그 루트의 worktree 보관 폴더(`.claude/worktrees/`·`.auto-issue-worktrees/`) 아래일 때만 가족이다(다른 저장소였을 수 있는 경로는 뺀다).',
     '- 정렬은 ±180초 안의 가장 이른 행을 고르고 여러 행이 맞는 경우를 세지 않는다. 프롬프트 길이 비교는 UTF-16 길이(JS)와 코드포인트 수(SQLite)가 달라 이모지가 든 프롬프트는 빠진다.',
-    '- 누출 검사는 정규화(NFC·소문자·공백 접기·마크다운 이스케이프 제거)한 원문의 40자 창(앞 400자까지 40자 간격)을 이 문서에서 찾는다. 더 짧은 인용·의역은 잡지 못한다.',
+    '- 누출 검사는 정규화(NFC·소문자·공백 접기·마크다운 이스케이프 제거)한 원문 전체에서 20자 간격으로 뽑은 40자 창을 이 문서에서 찾는다 — 59자 이상 그대로 옮긴 인용은 반드시 잡는다. 더 짧은 인용·의역은 잡지 못한다.',
     '- 표본은 대화 색인에 남은 사람의 프롬프트다. 색인되지 않는 자동화 세션에 대한 결론이 아니다.',
     '',
     '## 결정 (기계 판독 — test/inject-select.test.ts 가 운영 상수와 대조)',
