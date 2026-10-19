@@ -134,7 +134,7 @@ node bench/inject-judge.mjs --smoke && node bench/inject-judge.mjs --judge
 node bench/inject-judge.mjs --report --doc docs/bench/<date>-inject-replay.md && node bench/inject-judge.mjs --leak-check docs/bench/<date>-inject-replay.md
 ```
 
-Prompt and fact text stay in `.bench-out/`; the report holds aggregates only. 2026-10-19 result (`docs/bench/2026-10-19-inject-replay.md`, 303 prompts): 55.4% of injected lines judged at least related, 20.5% directly useful; repository family scope kept (+0.126 directly useful lines per affected prompt, 95% CI 0.047–0.228), a query gate on relation neighbours rejected. The family gain came entirely from one repository (its main folder and linked worktrees); the other repositories' 22 affected prompts gained nothing and are too few to judge on their own.
+Prompt and fact text stay in `.bench-out/`; the report holds aggregates only. 2026-10-19 result (`docs/bench/2026-10-19-inject-replay.md`, 303 prompts): 55.4% of injected lines judged at least related, 20.5% directly useful; repository family scope kept (+0.126 directly useful lines per affected prompt, 95% CI 0.047–0.228), a query gate on relation neighbours rejected. The family gain came entirely from one repository (its main folder and linked worktrees) — +12 directly useful lines from worktrees placed inside the repository folder, +4 from linked worktrees placed outside it, 0 from the repository folder itself; the other repositories' 22 affected prompts gained nothing and are too few to judge on their own.
 
 **Troubleshooting**: if injection never fires, check those two files — an empty/absent JSONL log means the hook isn't running at all (stale plugin install, restart pending), while `"status":"error"` entries or err.log content pinpoint the failure.
 
