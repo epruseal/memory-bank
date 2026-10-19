@@ -6,6 +6,8 @@
 // pre-registered decision rules. inject-replay.mjs / inject-judge.mjs only do I/O.
 
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export const VARIANTS = ['v0', 'rel020', 'rel030', 'rel045', 'family', 'kw'];
 export const REL_VARIANTS = { rel020: 0.02, rel030: 0.03, rel045: 0.045 };
@@ -511,6 +513,50 @@ export function determinismEntry(a, b, used) {
 export function determinismBound(det, lineSha) {
   return det != null && det.identical === true
     && Object.keys(lineSha).every((v) => det.variants?.[v]?.a === lineSha[v] && det.variants?.[v]?.b === lineSha[v]);
+}
+
+/**
+ * Files whose bytes decide the replayed lines — recorded by --replay, compared by --report (a report on
+ * lines made by other code would carry the wrong code version). Paths relative to the repository.
+ */
+export const REPLAY_CODE_FILES = [
+  'bench/inject-replay.mjs', 'bench/inject-bench-lib.mjs',
+  'dist/inject-select.js', 'dist/project-family.js', 'dist/fact-db.js', 'dist/ontology-db.js', 'dist/embeddings.js', 'dist/db.js',
+];
+
+/** sha256 of each REPLAY_CODE_FILES entry under `repo`. */
+export function codeDigest(repo) {
+  return Object.fromEntries(REPLAY_CODE_FILES.map((f) => [f, crypto.createHash('sha256').update(fs.readFileSync(path.join(repo, f))).digest('hex')]));
+}
+
+/** Code files whose digest now differs from what the replay recorded. */
+export function driftedCode(recorded, now) {
+  return Object.keys(now).filter((f) => recorded?.[f] !== now[f]);
+}
+
+/** sha256 of a SQLite file together with its WAL (uncheckpointed pages are read by the replay too). */
+export function sqliteDigest(file) {
+  const h = crypto.createHash('sha256').update(fs.readFileSync(file));
+  const wal = `${file}-wal`;
+  if (fs.existsSync(wal)) h.update('\0wal\0').update(fs.readFileSync(wal));
+  return h.digest('hex');
+}
+
+/**
+ * Where a prompt's cwd sits in its repository, from the family roots recorded at replay time:
+ * the repository folder itself or a sub-folder, a worktree inside the repository folder (live or
+ * deleted, under a worktree container), or a linked worktree placed outside it.
+ */
+export function placementOf(project, roots) {
+  if (!roots.length) return 'no-family';
+  const repo = roots[roots.length - 1];
+  if (roots.length > 1) return roots[0].startsWith(repo + '/') ? 'worktree-inside' : 'worktree-outside';
+  return ['/.auto-issue-worktrees/', '/.claude/worktrees/'].some((c) => project.startsWith(repo + c)) ? 'worktree-inside' : 'repo-folder';
+}
+
+/** Ids of the project facts the family adds for `project`: in the family, not the exact path (none without roots). */
+export function widenedFactIds(projectFacts, project, inFamily, hasRoots) {
+  return hasRoots ? projectFacts.filter((f) => f.scope_project !== project && inFamily(f.scope_project)).map((f) => f.id) : [];
 }
 
 /** Project-scoped facts the C2 'affected' readings look at — active now (the registered reading counts these). */

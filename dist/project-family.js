@@ -25,24 +25,37 @@ import path from 'path';
  * ancestor of one, or '/': a home directory that is itself a git work tree
  * would otherwise make every non-repo folder under it one family with every
  * project. Relative paths (slug-form projects) have no family, and neither has
- * a cwd whose last component is a symbolic link (read as a path that no longer
- * exists — facts are left out, never pulled in).
+ * a cwd whose last component is a symbolic link or a file. A path that cannot
+ * be read (EACCES, EIO) counts as no family / outside it, never as absent.
  */
 const WORKTREE_CONTAINERS = ['/.auto-issue-worktrees/', '/.claude/worktrees/'];
 const CACHE_LIMIT = 256;
 /** A daemon outlives a folder: the same path can become another repository (or none). */
 const CACHE_TTL_MS = 60_000;
 const cache = new Map();
+/** A path that exists but cannot be read (EACCES, EIO, …) — never read as "absent" (that would be fail-open). */
+const UNREADABLE = Symbol('unreadable');
+/** lstat of a path: null only when it does not exist (ENOENT / ENOTDIR), UNREADABLE on any other error. */
 function lstat(p) {
     try {
         return fs.lstatSync(p);
     }
-    catch {
-        return null;
+    catch (e) {
+        const code = e.code;
+        return code === 'ENOENT' || code === 'ENOTDIR' ? null : UNREADABLE;
     }
 }
+function stat(p) {
+    const st = lstat(p);
+    return st === UNREADABLE ? null : st;
+}
 function isDir(p) {
-    return lstat(p)?.isDirectory() === true;
+    return stat(p)?.isDirectory() === true;
+}
+/** A git HEAD: a regular file, or a symbolic link (git's core.preferSymlinkRefs) — never a folder. */
+function isHead(p) {
+    const st = stat(p);
+    return st !== null && (st.isFile() || st.isSymbolicLink());
 }
 function homes() {
     const out = [path.resolve(os.homedir())];
@@ -64,9 +77,9 @@ function tooBroad(root) {
         return home === r || home.startsWith(r + path.sep);
     });
 }
-/** A main repository root: `<root>/.git` is a directory (not a symlink) holding a HEAD file. */
+/** A main repository root: `<root>/.git` is a directory (not a symlink) holding a HEAD. */
 function isRepoRoot(root) {
-    return isDir(path.join(root, '.git')) && lstat(path.join(root, '.git', 'HEAD'))?.isFile() === true;
+    return isDir(path.join(root, '.git')) && isHead(path.join(root, '.git', 'HEAD'));
 }
 /**
  * Main repository root behind a linked worktree whose `.git` file names
@@ -83,7 +96,7 @@ function mainRootOf(worktreeTop, adminDir) {
     if (!isRepoRoot(root))
         return null;
     const backFile = path.join(adminDir, 'gitdir');
-    if (lstat(backFile)?.isFile() !== true)
+    if (stat(backFile)?.isFile() !== true)
         return null; // never read a FIFO or a device (the hook would block)
     let back;
     try {
@@ -99,6 +112,8 @@ function mainRootOf(worktreeTop, adminDir) {
 /** What `<dir>/.git` makes of dir. */
 function dotGitOf(dir) {
     const st = lstat(path.join(dir, '.git'));
+    if (st === UNREADABLE)
+        return { kind: 'invalid' }; // cannot tell — fail closed
     if (!st)
         return { kind: 'none' };
     if (st.isDirectory())
@@ -117,7 +132,7 @@ function dotGitOf(dir) {
         return { kind: 'invalid' };
     const adminDir = path.resolve(dir, m[1]);
     // A git dir holds a HEAD file (git's own test) — `gitdir: .` or any other plain folder is not one.
-    if (!isDir(adminDir) || lstat(path.join(adminDir, 'HEAD'))?.isFile() !== true)
+    if (!isDir(adminDir) || !isHead(path.join(adminDir, 'HEAD')))
         return { kind: 'invalid' };
     return { kind: 'linked', main: mainRootOf(dir, adminDir) };
 }
@@ -125,7 +140,12 @@ function resolveUncached(cwd) {
     if (!path.isAbsolute(cwd))
         return [];
     const start = path.resolve(cwd);
-    if (!isDir(start)) {
+    const own = lstat(start);
+    // Something there that is not a folder — a symbolic link, a file, an unreadable entry — has no family
+    // (a link under a worktree container must not borrow the container's repository).
+    if (own !== null && (own === UNREADABLE || !own.isDirectory()))
+        return [];
+    if (own === null) {
         // A deleted worktree (replayed history): its container names the repo — when the
         // folder in front of the container is itself a repository root (an umbrella folder
         // holding worktrees of several repositories is not).
@@ -172,12 +192,25 @@ export function clearRepoRootCache() {
     cache.clear();
 }
 /**
+ * Whether the first missing folder `missing` on the way to `scopeProject` is a deleted worktree of
+ * `root`: the path lies in one of the root's own worktree containers and what is gone is the
+ * container itself or a worktree folder directly in it — not something deeper (a clone deleted from
+ * inside a live worktree could have been another repository).
+ */
+function deletedWorktreeOf(root, scopeProject, missing) {
+    return WORKTREE_CONTAINERS.some((c) => {
+        const base = root + c; // '<root>/.claude/worktrees/'
+        return scopeProject.startsWith(base) && (base.startsWith(missing + '/') || path.dirname(missing) + '/' === base);
+    });
+}
+/**
  * Whether `scopeProject`, strictly under `root`, is left out of the family:
  * a folder on the way (or the path itself) has its own `.git` that is not a
  * linked worktree of a family root (a separate clone, a submodule). A folder
  * that no longer exists ends the walk: the path stays in the family only under
  * a worktree container of the root (`<root>/.claude/worktrees/…`,
- * `<root>/.auto-issue-worktrees/…` — a deleted worktree of this repository).
+ * `<root>/.auto-issue-worktrees/…` — a deleted worktree of this repository,
+ * see deletedWorktreeOf). A folder that cannot be read excludes the path.
  * Any other deleted path may have been another repository, and nothing on disk
  * can tell, so it is left out — at the cost of facts from deleted plain
  * sub-folders of the repository.
@@ -188,8 +221,11 @@ function excludedUnderRoot(root, scopeProject, roots) {
         if (!seg)
             continue;
         dir = path.join(dir, seg);
-        if (!lstat(dir))
-            return !WORKTREE_CONTAINERS.some((c) => scopeProject.startsWith(root + c));
+        const st = lstat(dir);
+        if (st === UNREADABLE)
+            return true; // cannot tell — fail closed
+        if (!st)
+            return !deletedWorktreeOf(root, scopeProject, dir);
         const g = dotGitOf(dir);
         if (g.kind === 'none')
             continue;

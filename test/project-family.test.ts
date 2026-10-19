@@ -41,6 +41,7 @@ beforeAll(() => {
   makeRepo(S);
   W = path.join(R, '.auto-issue-worktrees', 'issue-1');
   linkWorktree(W, R, 'issue-1');
+  fs.mkdirSync(path.join(W, 'src'), { recursive: true });
   E = path.join(tmp, 'elsewhere', 'wt');
   linkWorktree(E, R, 'ext');
 });
@@ -106,6 +107,26 @@ describe('resolveRepoRoots', () => {
     const link = path.join(tmp, 'link-to-docs');
     fs.symlinkSync(path.join(R, 'docs'), link);
     expect(resolveRepoRoots(link)).toEqual([]);
+  });
+
+  it('a symbolic link inside a worktree container borrows nothing from the container\'s repository', () => {
+    fs.mkdirSync(path.join(R, '.claude', 'worktrees'), { recursive: true });
+    const lnk = path.join(R, '.claude', 'worktrees', 'lnk');
+    fs.symlinkSync(S, lnk);
+    expect(resolveRepoRoots(lnk)).toEqual([]);
+    expect(resolveRepoRoots(path.join(R, '.claude', 'worktrees', 'really-gone')), 'positive control: a missing worktree folder').toEqual([R]);
+  });
+
+  it('HEAD may be a symbolic link (core.preferSymlinkRefs) but never a folder', () => {
+    const L = path.join(tmp, 'head-symlink');
+    fs.mkdirSync(path.join(L, '.git', 'refs', 'heads'), { recursive: true });
+    fs.writeFileSync(path.join(L, '.git', 'refs', 'heads', 'main'), '0'.repeat(40) + '\n');
+    fs.symlinkSync('refs/heads/main', path.join(L, '.git', 'HEAD'));
+    expect(resolveRepoRoots(L)).toEqual([L]);
+    const D = path.join(tmp, 'head-folder');
+    fs.mkdirSync(path.join(D, '.git', 'HEAD'), { recursive: true });
+    fs.mkdirSync(path.join(D, 'p'), { recursive: true });
+    expect(resolveRepoRoots(path.join(D, 'p'))).toEqual([]);
   });
 
   it('the root cache is bounded: past 256 entries it starts over, so an old answer is recomputed', () => {
@@ -250,8 +271,37 @@ describe('scopeMatcher', () => {
     fs.rmSync(clone, { recursive: true, force: true });
     expect(scopeMatcher(path.join(R, 'docs'), true)(clone), 'deleted, it is still left out').toBe(false);
     expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(R, 'tmp')), 'positive control: the folder that remains').toBe(true);
+    // A clone deleted from inside a LIVE worktree of the root could have been another repository.
+    const live = path.join(R, '.claude', 'worktrees', 'live');
+    linkWorktree(live, R, 'live');
+    fs.mkdirSync(path.join(live, 'src'), { recursive: true });
+    expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(live, 'src')), 'positive control: the live worktree').toBe(true);
+    expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(live, 'gone-clone', 'x')), 'gone from inside a live worktree').toBe(false);
+    expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(W, 'gone-sub')), 'a deleted sub-folder of a live worktree').toBe(false);
     // A container below a sub-folder (a deleted nested repository's worktree) is not the root's container.
     expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(R, 'tmp', 'gone-clone', '.claude', 'worktrees', 'w')), 'not the root\'s own container').toBe(false);
+  });
+
+  it('a folder that cannot be read is never read as absent (fail closed)', (ctx) => {
+    if (process.getuid?.() === 0) ctx.skip();   // root reads through permissions
+    const Q = path.join(tmp, 'locked-repo');
+    makeRepo(Q);
+    fs.mkdirSync(path.join(Q, 'docs'), { recursive: true });
+    fs.mkdirSync(path.join(Q, '.claude', 'worktrees'), { recursive: true });
+    const gone = path.join(Q, '.claude', 'worktrees', 'gone', 'x');
+    expect(scopeMatcher(path.join(Q, 'docs'), true)(gone), 'positive control: readable, a deleted worktree').toBe(true);
+    const locked = path.join(Q, 'locked');
+    fs.mkdirSync(locked, { recursive: true });
+    expect(scopeMatcher(path.join(Q, 'docs'), true)(locked), 'positive control: a readable plain folder').toBe(true);
+    fs.chmodSync(path.join(Q, '.claude'), 0o000);
+    fs.chmodSync(locked, 0o000);
+    try {
+      expect(scopeMatcher(path.join(Q, 'docs'), true)(gone), 'unreadable container').toBe(false);
+      expect(scopeMatcher(path.join(Q, 'docs'), true)(locked), 'a folder whose .git cannot be looked at').toBe(false);
+    } finally {
+      fs.chmodSync(path.join(Q, '.claude'), 0o755);
+      fs.chmodSync(locked, 0o755);
+    }
   });
 
   it('a path with . or .. segments matches only exactly', () => {

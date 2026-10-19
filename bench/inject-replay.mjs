@@ -19,7 +19,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  VARIANTS, REL_VARIANTS, PROJECT_FACTS_SQL, affectedReadings, determinismEntry, alignWindow, buildFactIndex, extractIdentifiers, foldSample, kwLines, makeAsOf, searchedLogRows,
+  VARIANTS, REL_VARIANTS, PROJECT_FACTS_SQL, affectedReadings, determinismEntry, codeDigest, sqliteDigest, widenedFactIds, alignWindow, buildFactIndex, extractIdentifiers, foldSample, kwLines, makeAsOf, searchedLogRows,
 } from './inject-bench-lib.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -269,11 +269,11 @@ async function replay() {
   // facts active now. Post-hoc reading (reported, plan Deviations 2): facts this prompt could see (as-of).
   const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();
   const widenedOf = new Map();
+  const rootsOf = {};   // family roots of each cwd as resolved now — the report groups by these, not by a later disk
   const widened = (project) => {
     if (!widenedOf.has(project)) {
-      const inFamily = scopeMatcher(project, true);
-      widenedOf.set(project, resolveRepoRoots(project).length === 0 ? []
-        : projectFacts.filter((f) => f.scope_project !== project && inFamily(f.scope_project)).map((f) => f.id));
+      rootsOf[project] = resolveRepoRoots(project);
+      widenedOf.set(project, widenedFactIds(projectFacts, project, scopeMatcher(project, true), rootsOf[project].length > 0));
     }
     return widenedOf.get(project);
   };
@@ -335,10 +335,16 @@ async function replay() {
     fs.writeFileSync(path.join(OUT, `lines-${v}${suffix}.jsonl`), body);
     hashes[v] = crypto.createHash('sha256').update(body).digest('hex');
   }
-  // The inputs too: the report refuses lists made from another sample or snapshot.
-  const fileSha = (f) => crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, f))).digest('hex');
-  const inputs = { sample: fileSha('sample.json'), snapshot: fileSha('snapshot.sqlite') };
-  if (!suffix) writeJson(path.join(OUT, 'replay-meta.json'), { ...meta, generatedAt: new Date().toISOString(), hashes, inputs });
+  // The inputs and the code too: the report refuses lists made from another sample, snapshot or code.
+  const inputs = { sample: crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, 'sample.json'))).digest('hex'), snapshot: sqliteDigest(SNAPSHOT) };
+  let git = null;
+  let dirty = null;
+  try {
+    git = execFileSync('git', ['-C', REPO, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    dirty = execFileSync('git', ['-C', REPO, 'status', '--porcelain', '--', 'src', 'bench', 'dist'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() !== '';
+  } catch { /* no git — recorded as null */ }
+  const code = { git, dirty, files: codeDigest(REPO) };
+  if (!suffix) writeJson(path.join(OUT, 'replay-meta.json'), { ...meta, generatedAt: new Date().toISOString(), hashes, inputs, roots: rootsOf, code });
   console.log(JSON.stringify({ prompts: sample.length, variants, hard: meta.hard.length, affected: affected.size, affectedAsOf: meta.affectedAsOf.length, kw: meta.kw, hashes }));
 }
 

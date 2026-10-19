@@ -20,7 +20,7 @@ import {
   CONTROL_PER_KIND, JUDGE_SYSTEM, REJUDGE_PROMPTS, THRESHOLDS, VARIANTS, aggregate, bootstrapDelta, decide, decideC2,
   decideC3, decisionsBlock, judgeUserMessage, labelItems, leakProbes, lostJ2Rel, meanDelta, perPromptCounts, ratioDelta,
   seededRandom, validateJudgeReply, validity, makeAsOf, isBypassFact, buildFactIndex, blockDiffers, leakFold, repoOf, unboundMeta,
-  driftedInputs, missingRows, determinismBound,
+  driftedInputs, missingRows, determinismBound, codeDigest, driftedCode, sqliteDigest, placementOf,
 } from './inject-bench-lib.mjs';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -281,7 +281,6 @@ const ci = (c) => (c.point === null ? '—' : `${fmt(c.point)} [${fmt(c.lo)}, ${
 
 async function report() {
   const { sample, meta, lines } = await loadBench();
-  const { resolveRepoRoots } = await import(dist('project-family.js'));
   const inSample = new Set(sample.map((p) => p.qid));
   const allJudgments = loadJudgments();
   const torn = loadJudgments.torn;
@@ -343,21 +342,21 @@ async function report() {
   if (unbound.length) fail(`replay-meta.json hashes do not match the lines files for ${unbound.join(', ')} — re-run --replay (all variants, no suffix)`);
   if (!Array.isArray(meta.affectedRegistered) || !Array.isArray(meta.affectedAsOf)) fail('replay-meta.json has no affectedRegistered / affectedAsOf — re-run --replay');
   const fileSha = (f) => crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, f))).digest('hex');
-  const replayInputs = { sample: fileSha('sample.json'), snapshot: fileSha('snapshot.sqlite') };
+  const replayInputs = { sample: fileSha('sample.json'), snapshot: sqliteDigest(path.join(OUT, 'snapshot.sqlite')) };
   const drifted = driftedInputs(meta.inputs, replayInputs);
   if (drifted.length) fail(`replay-meta.json was made from another ${drifted.join(' and ')} — re-run --replay`);
   const gaps = missingRows(sample.map((p) => p.qid), lines);
   if (gaps.length) fail(`lines files miss sampled prompts (${gaps.map((g) => `${g.variant} ${g.missing}`).join(', ')}) — re-run --replay`);
+  // The code that made the lines must be the code on disk now (the report names one code version).
+  const codeChanged = driftedCode(meta.code?.files, codeDigest(REPO));
+  if (codeChanged.length) fail(`code changed since --replay (${codeChanged.join(', ')}) — re-run --replay and --check-determinism`);
+  const missingRoots = [...new Set(sample.map((p) => p.project))].filter((p) => !Array.isArray(meta.roots?.[p]));
+  if (missingRoots.length) fail(`replay-meta.json has no family roots for ${missingRoots.length} cwd(s) — re-run --replay`);
   const git = (...a) => { try { return execFileSync('git', ['-C', REPO, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };
-  const distSha = (m) => crypto.createHash('sha256').update(fs.readFileSync(dist(m))).digest('hex');
   const codeStatus = git('status', '--porcelain', '--', 'src', 'bench', 'dist');
   const inputs = {
     ...replayInputs, judgments: fileSha('judgments.jsonl'),
-    code: {
-      git: git('rev-parse', 'HEAD'),
-      dirty: codeStatus === null ? null : codeStatus !== '',
-      dist: Object.fromEntries(['inject-select.js', 'project-family.js', 'fact-db.js', 'ontology-db.js'].map((m) => [m, distSha(m)])),
-    },
+    code: { replay: meta.code, report: { git: git('rev-parse', 'HEAD'), dirty: codeStatus === null ? null : codeStatus !== '' } },
   };
   const bySplit = { train: sample.filter((p) => p.split === 'train').map((p) => p.qid), heldout: sample.filter((p) => p.split === 'heldout').map((p) => p.qid) };
   bySplit.all = [...bySplit.train, ...bySplit.heldout];
@@ -369,6 +368,8 @@ async function report() {
     counts[v] = r.counts;
     r.unjudged.forEach((q) => unjudged.add(q));
   }
+  // Every shown line must carry a judgment: a prompt left out would quietly shrink the sets the rules decide on.
+  if (unjudged.size) fail(`${unjudged.size} prompt(s) have shown lines without a judgment — run --judge first`);
   const usable = (qids) => qids.filter((q) => !unjudged.has(q));
   const pairsOf = (qids, a, b = 'v0') => usable(qids).map((q) => ({ base: counts[b].get(q), alt: counts[a].get(q) }));
   const stats = {};
@@ -399,8 +400,9 @@ async function report() {
   // Where the effect lives (reading aid). Grouped by repository — a linked worktree counts with its main
   // repository (the last family root) — and by cwd root (the worktree / folder itself).
   const projectOf = new Map(sample.map((p) => [p.qid, p.project]));
-  const repoOfQ = (q) => repoOf(resolveRepoRoots(projectOf.get(q)), projectOf.get(q));
-  const rootOfQ = (q) => resolveRepoRoots(projectOf.get(q))[0] ?? projectOf.get(q);
+  const rootsOfQ = (q) => meta.roots[projectOf.get(q)];   // as resolved at replay time
+  const repoOfQ = (q) => repoOf(rootsOfQ(q), projectOf.get(q));
+  const rootOfQ = (q) => rootsOfQ(q)[0] ?? projectOf.get(q);
   const differs = new Set(blockDiffers(affected, lines.family, lines.v0));
   const byRepo = new Map();
   for (const q of affected) {
@@ -415,6 +417,16 @@ async function report() {
   const totalGain = repos.reduce((t, [, r]) => t + r.gain, 0);
   const [topRepo, top] = repos[0] ?? [null, null];
   const rest = affected.filter((q) => repoOfQ(q) !== topRepo);
+  // Grade-2 gain by where the cwd sits in its repository (repository folder, worktree inside it, worktree outside it).
+  c2stats.byPlacement = {};
+  for (const q of affected) {
+    const k = placementOf(projectOf.get(q), rootsOfQ(q));
+    const b = c2stats.byPlacement[k] ?? { prompts: 0, differs: 0, gain: 0 };
+    b.prompts++;
+    if (differs.has(q)) b.differs++;
+    b.gain += counts.family.get(q).j2 - counts.v0.get(q).j2;
+    c2stats.byPlacement[k] = b;
+  }
   c2stats.blockDiffers = {
     prompts: differs.size,
     cwds: new Set([...differs].map((q) => projectOf.get(q))).size,
@@ -517,7 +529,7 @@ function writeDoc(file, r) {
     `판정 호출 ${r.judge.calls}회, 실패 ${r.judge.failures}회, 끊긴 마지막 줄 ${r.judge.tornTail}개, 표본 밖 판정 행 ${r.judge.outsideSample}개(집계 제외). 대조군 판정 2: 같은 scope ${r.judge.controls.same[0]}/${r.judge.controls.same[1]}, 다른 프로젝트 ${r.judge.controls.other[0]}/${r.judge.controls.other[1]}. 재채점 일치 ${r.judge.agreement.agree}/${r.judge.agreement.pairs}(재채점 프롬프트 ${r.judge.agreement.prompts}개).`,
     `참고(판정 규칙 밖): 대조군을 뺀 줄만의 재채점 일치 ${r.judge.agreement.lines[0]}/${r.judge.agreement.lines[1]}. 판정 2 의 재현성은 처음 판정 ${r.judge.agreement.j2.main}개·재채점 ${r.judge.agreement.j2.rejudge}개·양쪽 ${r.judge.agreement.j2.both}개(양성 일치 ${fmt(r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge ? (2 * r.judge.agreement.j2.both) / (r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge) : null)}). 부트스트랩 구간은 판정 잡음을 담지 않는다.`,
     `V4 는 두 번의 재생이 이 보고가 읽은 줄 파일과 바이트 단위로 같아야 통과한다(줄 파일 sha256 앞 12자: ${VARIANTS.map((vn) => `${vn} ${r.lineSha[vn].slice(0, 12)}`).join(' · ')}).`,
-    `결속: 이 보고는 재생이 기록한 표본·스냅샷 해시를 다시 계산해 같을 때만 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)} · 판정 ${r.inputs.judgments.slice(0, 12)}). 코드 \`${r.inputs.code.git ? r.inputs.code.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.dirty === false ? '(src·bench·dist 깨끗함)' : ''} · dist ${Object.entries(r.inputs.code.dist).map(([m, h]) => `${m} ${h.slice(0, 12)}`).join(' · ')}.`,
+    `결속: 이 보고는 재생이 기록한 표본·스냅샷(WAL 포함)·코드 파일 해시를 다시 계산해 같을 때만 내고, 표시된 줄이 모두 판정돼 있어야 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)}). 재생 코드 \`${r.inputs.code.replay?.git ? r.inputs.code.replay.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.replay?.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.replay?.dirty === false ? '(src·bench·dist 깨끗함)' : ''}. 기록만 하는 값: 판정 파일 ${r.inputs.judgments.slice(0, 12)}, 보고를 낸 코드 \`${r.inputs.code.report.git ? r.inputs.code.report.git.slice(0, 7) : '확인 불가'}\`.`,
     '',
     ...['train', 'heldout', 'all'].flatMap((split) => [
       `## 변형별 지표 — ${split}`,
@@ -542,7 +554,8 @@ function writeDoc(file, r) {
     '',
     `영향 프롬프트 ${r.c2.affected}개(두 분할 합침 — 사전 등록 문장 "넓어진 경로에 사실이 있는 cwd 의 프롬프트"의 cwd 단위 해석. 원문에 시점이 없어 사실은 지금 활성인 것으로 센다). 판정2/프롬프트 Δ ${ci(r.c2.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.precisionJ2Delta)}.`,
     `사후 해석(판정 규칙 밖 — 계획 Deviations 2, 결정에 쓰지 않음): 그 프롬프트 시점에 보이는 사실로 세면 영향 ${r.c2.asOf.affected}개, 판정2/프롬프트 Δ ${ci(r.c2.asOf.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.asOf.precisionJ2Delta)} → 같은 규칙이면 \`${r.c2.asOf.decision}\`.`,
-    `참고(판정 규칙 밖): family 블록이 v0 와 실제로 다른 프롬프트 ${r.c2.blockDiffers.prompts}개 — cwd ${r.c2.blockDiffers.cwds}곳, 저장소 ${r.c2.blockDiffers.repos}곳(연결 worktree 는 본 저장소로 셈).`,
+    `참고(판정 규칙 밖): family 블록이 v0 와 실제로 다른 프롬프트 ${r.c2.blockDiffers.prompts}개 — cwd ${r.c2.blockDiffers.cwds}곳, 저장소 ${r.c2.blockDiffers.repos}곳(연결 worktree 는 본 저장소로 셈, 루트는 재생 때 해석한 값).`,
+    `cwd 배치별(영향 프롬프트 · 블록이 달라진 프롬프트 · 판정 2 이득): ${['repo-folder', 'worktree-inside', 'worktree-outside'].map((k) => { const b = r.c2.byPlacement[k] ?? { prompts: 0, differs: 0, gain: 0 }; return `${{ 'repo-folder': '저장소 폴더(본체·하위 폴더)', 'worktree-inside': '저장소 안 worktree', 'worktree-outside': '저장소 밖 worktree' }[k]} ${b.prompts}·${b.differs}·${b.gain >= 0 ? '+' : ''}${b.gain}`; }).join(' / ')}.`,
     `일반화 한계: 영향 프롬프트는 저장소 ${r.c2.byRepo.repos}곳에 걸치지만, 판정 2 이득 ${r.c2.byRepo.totalGain}줄의 저장소별 몫은 [${r.c2.byRepo.gainByRepo.join(', ')}]이다. 이득이 가장 큰 저장소 하나(cwd 루트 ${r.c2.byRepo.largest?.cwdRoots ?? 0}곳 — 본체와 연결 worktree)에 영향 프롬프트 ${r.c2.byRepo.largest?.prompts ?? 0}개, 블록이 달라진 프롬프트 ${r.c2.byRepo.largest?.differs ?? 0}개, 이득 ${r.c2.byRepo.largest?.gain ?? 0}줄이 있다. ${r.c2.byRepo.withoutLargest.measurable ? `그 저장소를 뺀 프롬프트 ${r.c2.byRepo.withoutLargest.n}개의 판정2/프롬프트 Δ ${ci(r.c2.byRepo.withoutLargest)}.` : `그 저장소를 빼면 영향 프롬프트 ${r.c2.byRepo.withoutLargest.n}개(이득 ${r.c2.byRepo.withoutLargest.gain}줄)로 사전 등록 최소 ${THRESHOLDS.C2_min_affected}개에 못 미쳐 판정할 수 없다 — 다른 저장소에서의 효과는 이번 표본으로 말할 수 없다.`} 프롬프트 단위 부트스트랩이라 같은 cwd·저장소끼리의 상관은 반영하지 않는다(구간이 실제보다 좁을 수 있다).`,
     `결정: \`${d.C2.decision}\` — ${d.C2.reason ?? ''}`,
     '',

@@ -10,6 +10,7 @@ import {
   isBypassFact, kwLines, leakProbes, lostJ2Rel, makeAsOf, meanDelta, parseDecisionsBlock, perPromptCounts, aggregate,
   ratioDelta, searchedLogRows, splitOf, toEpoch, validateJudgeReply, validity, labelItems, leakFold, blockDiffers,
   buildFactIndex, repoOf, unboundMeta, driftedInputs, missingRows, determinismEntry, determinismBound, affectedReadings, PROJECT_FACTS_SQL,
+  placementOf, widenedFactIds, sqliteDigest, driftedCode, codeDigest, REPLAY_CODE_FILES,
 } from '../bench/inject-bench-lib.mjs';
 
 /**
@@ -288,7 +289,10 @@ describe('decision', () => {
     expect(judge).toContain('const unbound = unboundMeta(meta.hashes, lineSha);\n  if (unbound.length) fail(');
     expect(judge).toContain('const affected = usable(meta.affectedRegistered);\n  const c2stats = c2For(affected);');
     expect(judge).toContain('const c2 = decideC2(c2stats);');
-    expect(judge, 'grouped by repository, not by worktree').toContain('const repoOfQ = (q) => repoOf(resolveRepoRoots(projectOf.get(q)), projectOf.get(q));');
+    expect(judge, 'grouped by repository (replay-time roots), not by worktree').toContain('const repoOfQ = (q) => repoOf(rootsOfQ(q), projectOf.get(q));');
+    expect(judge, 'roots as resolved at replay time, never the disk at report time').toContain('const rootsOfQ = (q) => meta.roots[projectOf.get(q)];');
+    expect(judge).not.toContain('resolveRepoRoots');
+    expect(replay).toContain('widenedOf.set(project, widenedFactIds(projectFacts, project, scopeMatcher(project, true), rootsOf[project].length > 0));');
     expect(replay).toContain('const reading = affectedReadings(widened(p.project), asOf.visibleFactId);');
     expect(replay).toContain('if (reading.registered) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
     expect(replay).toContain('const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();');
@@ -311,6 +315,35 @@ describe('decision', () => {
     expect(driftedInputs({ sample: 'a', snapshot: 'b' }, { sample: 'a', snapshot: 'c' })).toEqual(['snapshot']);
     expect(driftedInputs(undefined, { sample: 'a' })).toEqual(['sample']);
     expect(missingRows(['q1', 'q2'], { v0: new Map([['q1', []], ['q2', []]]), kw: new Map([['q1', []]]) })).toEqual([{ variant: 'kw', missing: 1 }]);
+  });
+  it('placement, widened ids, code and SQLite digests (replay records, report compares)', () => {
+    expect(placementOf('/r/docs', ['/r'])).toBe('repo-folder');
+    expect(placementOf('/r', ['/r'])).toBe('repo-folder');
+    expect(placementOf('/r/.claude/worktrees/w', ['/r/.claude/worktrees/w', '/r'])).toBe('worktree-inside');
+    expect(placementOf('/r/.auto-issue-worktrees/gone/src', ['/r']), 'a deleted worktree inside the repository').toBe('worktree-inside');
+    expect(placementOf('/u/.auto-issue-worktrees/ORG-r/issue-1', ['/u/.auto-issue-worktrees/ORG-r/issue-1', '/r'])).toBe('worktree-outside');
+    expect(placementOf('/x', [])).toBe('no-family');
+    const facts = [{ id: 'a', scope_project: '/r' }, { id: 'b', scope_project: '/r/docs' }, { id: 'c', scope_project: '/other' }];
+    const inFamily = (s: string | null) => s === '/r' || (s ?? '').startsWith('/r/');
+    expect(widenedFactIds(facts, '/r/docs', inFamily, true), 'the exact path is not a widening').toEqual(['a']);
+    expect(widenedFactIds(facts, '/r/docs', inFamily, false)).toEqual([]);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-digest-'));
+    try {
+      const f = path.join(dir, 's.sqlite');
+      fs.writeFileSync(f, 'main');
+      const before = sqliteDigest(f);
+      fs.writeFileSync(`${f}-wal`, 'pages');
+      expect(sqliteDigest(f), 'uncheckpointed WAL pages change the digest').not.toBe(before);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    const repo = fileURLToPath(new URL('..', import.meta.url));
+    const now = codeDigest(repo);
+    expect(Object.keys(now)).toEqual(REPLAY_CODE_FILES);
+    expect(REPLAY_CODE_FILES, 'the replay\'s own code and the selection it runs').toEqual(expect.arrayContaining(['bench/inject-replay.mjs', 'dist/inject-select.js', 'dist/project-family.js', 'dist/ontology-db.js']));
+    expect(driftedCode(now, now)).toEqual([]);
+    expect(driftedCode({ ...now, 'dist/db.js': 'x' }, now)).toEqual(['dist/db.js']);
+    expect(driftedCode(undefined, now)).toEqual(REPLAY_CODE_FILES);
   });
   it('repoOf groups a linked worktree with its repository; unboundMeta names variants whose meta hash differs', () => {
     expect(repoOf(['/r/.wt/a', '/r'], '/r/.wt/a/src')).toBe('/r');

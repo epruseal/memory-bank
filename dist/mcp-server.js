@@ -14896,8 +14896,8 @@ async function runWalkGrep(pattern, root, signal) {
     hits.push(line);
     return true;
   };
-  const stat2 = await fs14.stat(root).catch(() => null);
-  if (stat2?.isFile()) {
+  const stat3 = await fs14.stat(root).catch(() => null);
+  if (stat3?.isFile()) {
     await grepFile(root, re2, push);
   } else {
     await walk2(root, "", (rel) => grepFile(path10.join(root, rel), re2, push), signal);
@@ -52023,15 +52023,25 @@ var WORKTREE_CONTAINERS = ["/.auto-issue-worktrees/", "/.claude/worktrees/"];
 var CACHE_LIMIT = 256;
 var CACHE_TTL_MS = 6e4;
 var cache = /* @__PURE__ */ new Map();
+var UNREADABLE = Symbol("unreadable");
 function lstat(p) {
   try {
     return fs3.lstatSync(p);
-  } catch {
-    return null;
+  } catch (e) {
+    const code = e.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? null : UNREADABLE;
   }
 }
+function stat(p) {
+  const st = lstat(p);
+  return st === UNREADABLE ? null : st;
+}
 function isDir(p) {
-  return lstat(p)?.isDirectory() === true;
+  return stat(p)?.isDirectory() === true;
+}
+function isHead(p) {
+  const st = stat(p);
+  return st !== null && (st.isFile() || st.isSymbolicLink());
 }
 function homes() {
   const out = [path3.resolve(os2.homedir())];
@@ -52052,7 +52062,7 @@ function tooBroad(root) {
   });
 }
 function isRepoRoot(root) {
-  return isDir(path3.join(root, ".git")) && lstat(path3.join(root, ".git", "HEAD"))?.isFile() === true;
+  return isDir(path3.join(root, ".git")) && isHead(path3.join(root, ".git", "HEAD"));
 }
 function mainRootOf(worktreeTop, adminDir) {
   const parts = /^(.*)\/\.git\/worktrees\/[^/]+$/.exec(adminDir);
@@ -52060,7 +52070,7 @@ function mainRootOf(worktreeTop, adminDir) {
   const root = parts[1];
   if (!isRepoRoot(root)) return null;
   const backFile = path3.join(adminDir, "gitdir");
-  if (lstat(backFile)?.isFile() !== true) return null;
+  if (stat(backFile)?.isFile() !== true) return null;
   let back;
   try {
     back = fs3.readFileSync(backFile, "utf8").trim();
@@ -52072,6 +52082,7 @@ function mainRootOf(worktreeTop, adminDir) {
 }
 function dotGitOf(dir) {
   const st = lstat(path3.join(dir, ".git"));
+  if (st === UNREADABLE) return { kind: "invalid" };
   if (!st) return { kind: "none" };
   if (st.isDirectory()) return isRepoRoot(dir) ? { kind: "root" } : { kind: "invalid" };
   if (!st.isFile()) return { kind: "invalid" };
@@ -52084,13 +52095,15 @@ function dotGitOf(dir) {
   const m2 = /^gitdir:\s*(.+?)\s*$/m.exec(content);
   if (!m2) return { kind: "invalid" };
   const adminDir = path3.resolve(dir, m2[1]);
-  if (!isDir(adminDir) || lstat(path3.join(adminDir, "HEAD"))?.isFile() !== true) return { kind: "invalid" };
+  if (!isDir(adminDir) || !isHead(path3.join(adminDir, "HEAD"))) return { kind: "invalid" };
   return { kind: "linked", main: mainRootOf(dir, adminDir) };
 }
 function resolveUncached(cwd) {
   if (!path3.isAbsolute(cwd)) return [];
   const start = path3.resolve(cwd);
-  if (!isDir(start)) {
+  const own2 = lstat(start);
+  if (own2 !== null && (own2 === UNREADABLE || !own2.isDirectory())) return [];
+  if (own2 === null) {
     for (const marker of WORKTREE_CONTAINERS) {
       const i = start.indexOf(marker);
       if (i > 0) {
@@ -52119,12 +52132,20 @@ function resolveRepoRoots(cwd) {
   cache.set(cwd, { roots, at: now });
   return roots;
 }
+function deletedWorktreeOf(root, scopeProject, missing) {
+  return WORKTREE_CONTAINERS.some((c) => {
+    const base = root + c;
+    return scopeProject.startsWith(base) && (base.startsWith(missing + "/") || path3.dirname(missing) + "/" === base);
+  });
+}
 function excludedUnderRoot(root, scopeProject, roots) {
   let dir = root;
   for (const seg of scopeProject.slice(root.length + 1).split("/")) {
     if (!seg) continue;
     dir = path3.join(dir, seg);
-    if (!lstat(dir)) return !WORKTREE_CONTAINERS.some((c) => scopeProject.startsWith(root + c));
+    const st = lstat(dir);
+    if (st === UNREADABLE) return true;
+    if (!st) return !deletedWorktreeOf(root, scopeProject, dir);
     const g = dotGitOf(dir);
     if (g.kind === "none") continue;
     if (g.kind === "linked" && g.main !== null && roots.includes(g.main)) continue;
@@ -53292,8 +53313,8 @@ function appendInjectLog(entry) {
   try {
     const logPath = getInjectLogPath();
     try {
-      const stat2 = fs6.statSync(logPath);
-      if (stat2.size > MAX_LOG_BYTES) {
+      const stat3 = fs6.statSync(logPath);
+      if (stat3.size > MAX_LOG_BYTES) {
         fs6.renameSync(logPath, `${logPath}.old`);
       }
     } catch {
@@ -55280,13 +55301,13 @@ function pruneLlmTranscripts(now = Date.now()) {
     for (const entry of entries) {
       if (entry !== LLM_WORKDIR_BASENAME && !entry.endsWith(`-${LLM_WORKDIR_BASENAME}`)) continue;
       const dir = path11.join(projectsDir, entry);
-      let stat2;
+      let stat3;
       try {
-        stat2 = fs15.lstatSync(dir);
+        stat3 = fs15.lstatSync(dir);
       } catch {
         continue;
       }
-      if (!stat2.isDirectory()) continue;
+      if (!stat3.isDirectory()) continue;
       let files;
       try {
         files = fs15.readdirSync(dir);
