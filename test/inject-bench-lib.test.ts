@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   THRESHOLDS, alignWindow, bootstrapDelta, decide, decideC2, decideC3, decisionsBlock, extractIdentifiers, foldSample,
   isBypassFact, kwLines, leakProbes, lostJ2Rel, makeAsOf, meanDelta, parseDecisionsBlock, perPromptCounts, aggregate,
-  ratioDelta, searchedLogRows, splitOf, toEpoch, validateJudgeReply, validity, labelItems,
+  ratioDelta, searchedLogRows, splitOf, toEpoch, validateJudgeReply, validity, labelItems, leakFold, blockDiffers,
 } from '../bench/inject-bench-lib.mjs';
 
 /**
@@ -60,8 +60,20 @@ describe('as-of', () => {
   const index = {
     factCreated: new Map([['old', toEpoch('2026-09-01T00:00:00Z')], ['new', toEpoch('2026-10-02T00:00:00Z')], ['mine', toEpoch('2026-09-01T00:00:00Z')]]),
     factSessions: new Map([['mine', new Set(['s1'])]]),
+    factRevised: new Map<string, number>(),
   };
   const asOf = makeAsOf(index, { ts: '2026-10-01T00:00:00Z', sessionId: 's1' });
+  it('hides a fact rewritten after the prompt (its text and vector are the later ones); an earlier rewrite is fine', () => {
+    const idx = {
+      ...index,
+      factCreated: new Map([...index.factCreated, ['evolved', toEpoch('2026-09-01T00:00:00Z')], ['settled', toEpoch('2026-09-01T00:00:00Z')]]),
+      factRevised: new Map([['evolved', toEpoch('2026-10-05T00:00:00Z')], ['settled', toEpoch('2026-09-15T00:00:00Z')]]),
+    };
+    const a = makeAsOf(idx, { ts: '2026-10-01T00:00:00Z', sessionId: 's9' });
+    expect(a.visibleFactId('evolved')).toBe(false);
+    expect(a.visibleFactId('settled')).toBe(true);
+    expect(makeAsOf(idx, { ts: '2026-10-06T00:00:00Z', sessionId: 's9' }).visibleFactId('evolved')).toBe(true);
+  });
   it('hides facts created after the prompt and facts extracted from the prompt’s own session', () => {
     expect(asOf.visibleFactId('old')).toBe(true);
     expect(asOf.visibleFactId('new')).toBe(false);
@@ -155,12 +167,12 @@ describe('metrics', () => {
 });
 
 describe('validity', () => {
-  const good = { controlSameJ2Rate: 0.05, controlOtherJ2Rate: 0.0, agreement: 0.9, agreementPairs: 150, deterministic: true, heldoutPrompts: 150, hardPrompts: 100, judgeCalls: 200, judgeFailures: 1 };
+  const good = { controlSameJ2Rate: 0.05, controlOtherJ2Rate: 0.0, agreement: 0.9, agreementPairs: 150, rejudgePrompts: 30, deterministic: true, heldoutPrompts: 150, hardPrompts: 100, judgeCalls: 200, judgeFailures: 1 };
   it('passes when every gate holds', () => {
     expect(validity(good).valid).toBe(true);
   });
   it.each([
-    ['V1', { controlSameJ2Rate: 0.11 }], ['V2', { controlOtherJ2Rate: 0.06 }], ['V3', { agreement: 0.84 }], ['V3', { agreementPairs: 99 }],
+    ['V1', { controlSameJ2Rate: 0.11 }], ['V2', { controlOtherJ2Rate: 0.06 }], ['V3', { agreement: 0.84 }], ['V3', { agreementPairs: 99 }], ['V3', { rejudgePrompts: 29 }],
     ['V4', { deterministic: false }], ['V5', { heldoutPrompts: 99 }], ['V5', { hardPrompts: 29 }], ['V6', { judgeFailures: 5 }],
     ['V1', { controlSameJ2Rate: null }],
   ])('fails %s', (gateName, change) => {
@@ -216,7 +228,23 @@ describe('decision', () => {
     expect(parseDecisionsBlock(md)).toEqual({ verdict: 'valid', production: { relMargin: 0.045, scopeFamily: false } });
     expect(parseDecisionsBlock('no block')).toBeNull();
   });
-  it('leak probes are the first 40 normalized chars of each text, short ones skipped', () => {
-    expect(leakProbes(['  how   do we deploy the billing service to production today please', 'short'])).toEqual(['how do we deploy the billing service to ']);
+  it('leak probes are folded 40-char windows every 40 chars (first 400), short ones skipped', () => {
+    expect(leakProbes(['  How   do we deploy the billing service to production today please', 'short']))
+      .toEqual(['how do we deploy the billing service to', 'production today please']);
+    const long = Array.from({ length: 600 }, (_, i) => String.fromCharCode(0x4e00 + i)).join(''); // no window repeats
+    const probes = leakProbes([long]);
+    expect(probes.length, 'windows stop 400 chars in').toBe(10);
+  });
+  it('leak fold catches a copy that differs in case, Unicode form, markdown escapes or spacing', () => {
+    const fact = 'Release notes are written in Korean — 릴리즈 노트는 한국어로 쓴다 and attached to the GitHub release';
+    const copy = `> release NOTES are written in korean — ${'릴리즈 노트는 한국어로 쓴다'.normalize('NFD')} and attached to the GitHub\\_release`;
+    const body = leakFold(copy);
+    expect(leakProbes([fact]).some((w) => body.includes(w))).toBe(true);
+    expect(leakProbes(['A completely different sentence about lunch menus on Fridays']).some((w) => body.includes(w))).toBe(false);
+  });
+  it('blockDiffers lists prompts whose shown ids differ', () => {
+    const a = new Map([['q1', [{ id: 'x' }]], ['q2', [{ id: 'x' }, { id: 'y' }]]]);
+    const b = new Map([['q1', [{ id: 'x' }]], ['q2', [{ id: 'y' }, { id: 'x' }]], ['q3', [{ id: 'z' }]]]);
+    expect(blockDiffers(['q1', 'q2', 'q3', 'q4'], a, b)).toEqual(['q2', 'q3']);
   });
 });

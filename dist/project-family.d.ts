@@ -8,6 +8,8 @@ export declare function clearRepoRootCache(): void;
  * and the replay bench. family=false (and family=true with no roots) is the
  * exact match the injection has always used; family=true matches a root or a
  * path under it — on a '/' boundary, so `memory-bank` never matches
- * `memory-bank-cloud`. A null project sees every scope.
+ * `memory-bank-cloud`, and never inside a repository nested under a root. A
+ * path with '.' or '..' segments matches only exactly. A null project sees
+ * every scope.
  */
 export declare function scopeMatcher(project: string | null, family: boolean): (scopeProject: string | null) => boolean;

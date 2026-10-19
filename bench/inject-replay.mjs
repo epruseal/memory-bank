@@ -3,7 +3,8 @@
 //
 //   node bench/inject-replay.mjs --build               sample (inject log ∩ exchanges ∩ current gate) + snapshot DB
 //   node bench/inject-replay.mjs --replay              every variant over the sample → lines-<variant>.jsonl
-//   node bench/inject-replay.mjs --check-determinism   two separate replays per variant, byte-compared
+//   node bench/inject-replay.mjs --check-determinism   two separate replays per variant, byte-compared with each other and with the lines files
+//   node bench/inject-replay.mjs --add-revisions       copy fact rewrites (fact_revisions) into a snapshot built before --build did
 //
 // The live DB is only ever opened read-only. Prompt and fact text stay under
 // .bench-out/ (gitignored); only aggregates leave it (inject-judge.mjs --report).
@@ -30,15 +31,15 @@ let args;
 try {
   args = parseCliArgs(process.argv.slice(2), {
     values: ['--out', '--db', '--log', '--suffix', '--variants'],
-    flags: ['--build', '--replay', '--check-determinism'],
+    flags: ['--build', '--replay', '--check-determinism', '--add-revisions'],
   });
 } catch (e) {
   console.error(`inject-replay: ${e.message}`);
   process.exit(2);
 }
-const modes = ['--build', '--replay', '--check-determinism'].filter((m) => args.flags.has(m));
+const modes = ['--build', '--replay', '--check-determinism', '--add-revisions'].filter((m) => args.flags.has(m));
 if (modes.length !== 1) {
-  console.error('inject-replay: give exactly one of --build, --replay, --check-determinism');
+  console.error('inject-replay: give exactly one of --build, --replay, --check-determinism, --add-revisions');
   process.exit(2);
 }
 const mode = modes[0];
@@ -47,6 +48,7 @@ try {
     '--build': ['--build', '--out', '--db', '--log'],
     '--replay': ['--replay', '--out', '--suffix', '--variants'],
     '--check-determinism': ['--check-determinism', '--out'],
+    '--add-revisions': ['--add-revisions', '--out', '--db'],
   }[mode], mode);
 } catch (e) {
   console.error(`inject-replay: ${e.message}`);
@@ -124,6 +126,7 @@ async function build() {
     const counts = {};
     counts.facts = copyTable('facts', ['embedding']); // the legacy float column is read by no selection path
     counts.ontology_relations = copyTable('ontology_relations');
+    counts.fact_revisions = copyTable('fact_revisions'); // as-of hides facts rewritten after a prompt
     // The vector tables take the live DDL and int8 scale record, whatever the code's fresh-DB default is
     // (live fact tables can be float32, int8@127 or int8@600 — the stored bytes are copied as they are).
     const liveHasScale = live.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_int8_scale'").get();
@@ -197,6 +200,40 @@ async function build() {
   }
 }
 
+// ------------------------------------------------------------------ add revisions
+
+/**
+ * Snapshots built before --build copied fact_revisions hold an empty table, so as-of could not
+ * see rewrites. Copy the live rows up to the snapshot's build time (later rewrites do not touch
+ * the snapshot's text) — once; the live DB is opened read-only.
+ */
+function addRevisions() {
+  const buildFile = path.join(OUT, 'build.json');
+  if (!fs.existsSync(buildFile) || !fs.existsSync(SNAPSHOT)) fail('no build.json / snapshot — run --build');
+  const buildInfo = JSON.parse(fs.readFileSync(buildFile, 'utf8'));
+  if (buildInfo.snapshot?.fact_revisions !== undefined) fail(`snapshot already holds fact revisions (${buildInfo.snapshot.fact_revisions})`);
+  const before = stamp(LIVE_DB);
+  const live = new Database(LIVE_DB, { readonly: true, fileMustExist: true });
+  const snap = new Database(SNAPSHOT, { fileMustExist: true });
+  try {
+    if (snap.prepare('SELECT COUNT(*) AS n FROM fact_revisions').get().n !== 0) fail('snapshot fact_revisions is not empty');
+    const bound = buildInfo.generatedAt;
+    const cols = live.prepare('SELECT name FROM pragma_table_info(?)').all('fact_revisions').map((c) => c.name)
+      .filter((c) => snap.prepare('SELECT name FROM pragma_table_info(?)').all('fact_revisions').some((x) => x.name === c));
+    const rows = live.prepare(`SELECT ${cols.join(',')} FROM fact_revisions WHERE created_at <= ?`).all(bound);
+    const ins = snap.prepare(`INSERT INTO fact_revisions (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`);
+    snap.transaction(() => { for (const r of rows) ins.run(...cols.map((c) => r[c])); })();
+    const after = stamp(LIVE_DB);
+    buildInfo.snapshot.fact_revisions = rows.length;
+    buildInfo.revisions = { added_at: new Date().toISOString(), bound, via: '--add-revisions', live_unchanged: before.mtimeMs === after.mtimeMs && before.size === after.size, handle_readonly: live.readonly };
+    writeJson(buildFile, buildInfo);
+    console.log(JSON.stringify({ fact_revisions: rows.length, bound, live_unchanged: buildInfo.revisions.live_unchanged }));
+  } finally {
+    live.close();
+    snap.close();
+  }
+}
+
 // ------------------------------------------------------------------ replay
 
 const round6 = (x) => (x === null ? null : Math.round(x * 1e6) / 1e6);
@@ -212,6 +249,8 @@ async function replay() {
   if (!/^[A-Za-z0-9._-]*$/.test(suffix)) fail('bad --suffix');
 
   const sample = JSON.parse(fs.readFileSync(path.join(OUT, 'sample.json'), 'utf8'));
+  const buildInfo = JSON.parse(fs.readFileSync(path.join(OUT, 'build.json'), 'utf8'));
+  if (typeof buildInfo.snapshot?.fact_revisions !== 'number') fail('snapshot holds no fact revisions — as-of cannot hide rewritten facts; run --add-revisions');
   const db = new Database(SNAPSHOT, { readonly: true, fileMustExist: true });
   sqliteVec.load(db);
   const { selectInjectFacts, formatInjectBlock } = await import(dist('inject-select.js'));
@@ -225,18 +264,20 @@ async function replay() {
   const kwFacts = (ident) => { if (!kwCache.has(ident)) kwCache.set(ident, kwScan.all(ident)); return kwCache.get(ident); };
   const byId = db.prepare('SELECT * FROM facts WHERE id = ?');
 
-  // C2 'affected': the family reaches project facts other than the cwd's own.
-  const familyReach = db.prepare(`SELECT COUNT(*) AS n FROM facts WHERE is_active = 1 AND scope_type = 'project'
-    AND scope_project != ? AND (scope_project = ? OR substr(scope_project, 1, length(?) + 1) = ? || '/')`);
-  const affected = new Set();
-  const affectedProjects = new Map();
-  const isAffected = (project) => {
-    if (!affectedProjects.has(project)) {
-      const roots = resolveRepoRoots(project);
-      affectedProjects.set(project, roots.some((r) => familyReach.get(project, r, r, r).n > 0));
+  // C2 'affected' (pre-registered): the family predicate is wider than the exact match and the widened
+  // paths hold facts — facts this prompt could see (as-of), through the same predicate the selection uses.
+  const projectFacts = db.prepare("SELECT id, scope_project FROM facts WHERE is_active = 1 AND scope_type = 'project'").all();
+  const widenedOf = new Map();
+  const widened = (project) => {
+    if (!widenedOf.has(project)) {
+      const inFamily = scopeMatcher(project, true);
+      widenedOf.set(project, resolveRepoRoots(project).length === 0 ? []
+        : projectFacts.filter((f) => f.scope_project !== project && inFamily(f.scope_project)).map((f) => f.id));
     }
-    return affectedProjects.get(project);
+    return widenedOf.get(project);
   };
+  const affected = new Set();
+  const isAffected = (p, asOf) => widened(p.project).some((id) => asOf.visibleFactId(id));
 
   await initEmbeddings();
   const out = Object.fromEntries(variants.map((v) => [v, []]));
@@ -283,7 +324,7 @@ async function replay() {
       });
       if (v === 'v0' && lines.length === 0) meta.hard.push(p.qid);
     }
-    if (isAffected(p.project)) { affected.add(p.qid); meta.affected.push(p.qid); }
+    if (isAffected(p, asOf)) { affected.add(p.qid); meta.affected.push(p.qid); }
   }
   db.close();
   const hashes = {};
@@ -303,12 +344,14 @@ function checkDeterminism() {
   for (const s of ['.det-a', '.det-b']) {
     execFileSync(process.execPath, [self, '--replay', '--out', OUT, '--suffix', s], { stdio: ['ignore', 'ignore', 'inherit'] });
   }
+  // Bound to the lines files the judge and report read: both re-runs must equal them, not just each other.
   const variants = {};
   for (const v of VARIANTS) {
     const h = (s) => crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, `lines-${v}${s}.jsonl`))).digest('hex');
     const a = h('.det-a');
     const b = h('.det-b');
-    variants[v] = { a, b, identical: a === b };
+    const used = h('');
+    variants[v] = { a, b, lines: used, identical: a === b && a === used };
   }
   const identical = Object.values(variants).every((x) => x.identical);
   writeJson(path.join(OUT, 'determinism.json'), { generatedAt: new Date().toISOString(), identical, variants });
@@ -318,4 +361,5 @@ function checkDeterminism() {
 
 if (mode === '--build') await build();
 else if (mode === '--replay') await replay();
+else if (mode === '--add-revisions') addRevisions();
 else checkDeterminism();

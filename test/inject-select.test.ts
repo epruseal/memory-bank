@@ -45,7 +45,10 @@ const QUERY = 'Which tool runs our database migrations and in what file format?'
 beforeAll(async () => {
   process.env.MEMORY_BANK_CONFIG_DIR = tmp;
   process.env.TEST_DB_PATH = path.join(tmp, 'test.db');
-  fs.mkdirSync(path.join(REPO, '.git'), { recursive: true });
+  for (const repo of [REPO, `${REPO}-cloud`]) {
+    fs.mkdirSync(path.join(repo, '.git'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+  }
   fs.mkdirSync(PROJECT, { recursive: true });
   sel = await import('../src/inject-select.js');
   embed = await import('../src/embeddings.js');
@@ -67,6 +70,8 @@ beforeAll(async () => {
   onto.createRelation(db, ids.seed, 'INFLUENCES', ids.krnear);
   // repo-family fixture: a fact scoped to the repo root, queried from its docs/ folder
   await add('rootfact', 'Release builds of this repository are signed with the hardware key kept by the release manager', { scope: REPO });
+  // a sibling repository whose name extends REPO's — must never reach REPO's family
+  await add('sibfact', 'Release builds of the cloud repository are signed with a hardware key kept in the office safe', { scope: `${REPO}-cloud` });
 }, 180_000);
 
 afterAll(() => {
@@ -157,7 +162,30 @@ describe('selectInjectFacts', () => {
     expect(got.relUnscored).toBe(unseen - sel.REL_SCORE_CAP);
     expect(got.relGatedOut).toBe(0);
     expect(got.lines.length).toBeLessThanOrEqual(sel.MAX_CONTEXT_FACTS);
+    // With every neighbour passing, the slots left after the vector hits go to the highest margins.
+    const relMargins = got.lines.filter((l) => l.origin === 'rel' && l.margin !== null).map((l) => l.margin!);
+    expect(relMargins.length, 'several scored neighbours compete for the slots').toBeGreaterThan(2);
+    expect(relMargins).toEqual([...relMargins].sort((a, b) => b - a));
+    const allScored = onto.getRelatedFacts(db, ids.hub, 1, 0.6, 0.2, PROJECT)
+      .filter((r) => !gatedIds.has(r.fact.id)).slice(0, sel.REL_SCORE_CAP)
+      .map((r) => sel.neighbourMargin(db, r.fact.id, e, baseline)!).sort((a, b) => b - a);
+    expect(relMargins).toEqual(allScored.slice(0, relMargins.length));
   }, 120_000);
+
+  it('relation gate: a neighbour two seeds share is scored and counted once', async () => {
+    await add('invA', 'The invoice PDF export job runs every night at two and writes to the billing bucket');
+    await add('invB', 'Invoice PDF exports that fail overnight are retried by the export job at six');
+    await add('lunchX', 'The rooftop garden is closed whenever it rains in the afternoon');
+    onto.createRelation(db, ids.invA, 'SUPPORTS', ids.lunchX);
+    onto.createRelation(db, ids.invB, 'SUPPORTS', ids.lunchX);
+    const { e, baseline } = await queryVec('When does the invoice PDF export job run and what happens when it fails?');
+    const got = sel.selectInjectFacts(db, e, baseline, PROJECT, { relMargin: 0.02, scopeFamily: false });
+    const seeds = got.gated.slice(0, 3).map((g) => g.fact.id);
+    expect(seeds, 'both invoice facts are seeds').toEqual(expect.arrayContaining([ids.invA, ids.invB]));
+    expect(sel.neighbourMargin(db, ids.lunchX, e, baseline)!, 'sanity: the garden fact is below the margin').toBeLessThan(0.02);
+    expect(got.lines.some((l) => l.fact.id === ids.lunchX)).toBe(false);
+    expect(got.relGatedOut, 'one neighbour, gated once').toBe(1);
+  }, 60_000);
 
   it('scope family: a repo-root fact reaches a sub-folder only with scopeFamily on', async () => {
     const { e, baseline } = await queryVec('Who holds the hardware key that signs release builds of this repository?');
@@ -165,8 +193,10 @@ describe('selectInjectFacts', () => {
     const on = sel.selectInjectFacts(db, e, baseline, PROJECT, { relMargin: null, scopeFamily: true });
     expect(off.lines.some((l) => l.fact.id === ids.rootfact)).toBe(false);
     expect(on.lines[0]?.fact.id).toBe(ids.rootfact);
-    const other = sel.selectInjectFacts(db, e, baseline, path.join(tmp, 'repo-cloud'), { relMargin: null, scopeFamily: true });
-    expect(other.lines.some((l) => l.fact.id === ids.rootfact), 'a sibling name is not the family').toBe(false);
+    expect(on.lines.some((l) => l.fact.id === ids.sibfact), 'the sibling repository\'s fact never reaches REPO/docs').toBe(false);
+    const sib = sel.selectInjectFacts(db, e, baseline, `${REPO}-cloud`, { relMargin: null, scopeFamily: true });
+    expect(sib.lines.some((l) => l.fact.id === ids.sibfact), 'positive control: it is a match from its own repository').toBe(true);
+    expect(sib.lines.some((l) => l.fact.id === ids.rootfact), 'a sibling name is not the family').toBe(false);
   }, 30_000);
 
   it('visibleFactId hides a fact from the KNN and from relation expansion (replay as-of)', async () => {

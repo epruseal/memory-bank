@@ -164,6 +164,78 @@ describe('SessionStart 훅', () => {
     expect(last).toMatchObject({ via: 'session-start', status: 'no-match', injected: 0, source: 'resume' });
   });
 
+  it('session-start 로그: DB 가 없으면 skipped/no-db 이고 블록이 없다', () => {
+    const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-ss-nodb-'));
+    try {
+      const out = execFileSync(process.execPath, ['scripts/fact-consolidate-hook.js'], {
+        cwd: REPO, encoding: 'utf8', timeout: 30_000,
+        input: JSON.stringify({ session_id: 'ss-log-0004', cwd: PROJECT, hook_event_name: 'SessionStart' }),
+        env: hookEnv({ MEMORY_BANK_CONFIG_DIR: cfg, MEMORY_BANK_DB_PATH: path.join(cfg, 'absent.sqlite') }),
+      });
+      expect(out).not.toContain('# Project Key Facts');
+      const lines = fs.readFileSync(path.join(cfg, 'conversation-index', 'logs', 'inject-context.jsonl'), 'utf8').trim().split('\n');
+      expect(lines.map((l) => JSON.parse(l))).toEqual([expect.objectContaining({ via: 'session-start', status: 'skipped', reason: 'no-db' })]);
+      expect(fs.existsSync(path.join(cfg, 'absent.sqlite')), '읽기 전용 훅이 DB 를 만들지 않는다').toBe(false);
+    } finally {
+      fs.rmSync(cfg, { recursive: true, force: true });
+    }
+  });
+
+  it('session-start 로그: 받는 쪽이 파이프를 닫아 전달에 실패하면 injected 가 아니라 error 로 남는다', async () => {
+    const { createHash } = await import('node:crypto');
+    const sid = 'ss-log-epipe';
+    await new Promise<void>((resolve) => {
+      const child = spawn(process.execPath, ['scripts/fact-consolidate-hook.js'], {
+        cwd: REPO, env: hookEnv(), stdio: ['pipe', 'pipe', 'ignore'],
+      });
+      child.stdout!.destroy();
+      child.on('exit', () => resolve());
+      child.stdin!.end(JSON.stringify({ session_id: sid, cwd: PROJECT, hook_event_name: 'SessionStart' }));
+    });
+    const key = createHash('sha256').update(sid).digest('hex').slice(0, 12);
+    const logFile = path.join(tmp, 'conversation-index', 'logs', 'inject-context.jsonl');
+    const mine = fs.readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((r) => r.session_key === key);
+    expect(mine).toEqual([expect.objectContaining({ via: 'session-start', status: 'error', error: 'stdout write failed', injected: 0 })]);
+    expect(mine[0].gated_ids).toHaveLength(1);
+    expect(mine[0].injected_ids).toBeUndefined();
+  });
+
+  it('문자열이 아닌 session_id 가 와도 블록을 출력하고 세션 키는 남기지 않는다', () => {
+    const logFile = path.join(tmp, 'conversation-index', 'logs', 'inject-context.jsonl');
+    const out = execFileSync(process.execPath, ['scripts/fact-consolidate-hook.js'], {
+      cwd: REPO, encoding: 'utf8', timeout: 30_000,
+      input: JSON.stringify({ session_id: 12345, cwd: PROJECT, hook_event_name: 'SessionStart' }),
+      env: hookEnv(),
+    });
+    expect(out).toContain('Release notes are written in Korean');
+    const last = JSON.parse(fs.readFileSync(logFile, 'utf8').trim().split('\n').at(-1)!);
+    expect(last).toMatchObject({ via: 'session-start', status: 'injected' });
+    expect(last.session_key).toBeUndefined();
+  });
+
+  it('session-start 로그: 블록을 전달한 뒤에 오류가 나도 전달한 개수와 id 를 error 줄에 남긴다', async () => {
+    const { createHash } = await import('node:crypto');
+    const sid = 'ss-log-close-fails';
+    const preload = path.join(tmp, 'close-throws.mjs');
+    fs.writeFileSync(preload, [
+      `import Database from ${JSON.stringify(path.join(REPO, 'node_modules', 'better-sqlite3', 'lib', 'index.js'))};`,
+      'const close = Database.prototype.close;',
+      "Database.prototype.close = function () { close.call(this); throw new Error('close failed after delivery'); };",
+    ].join('\n'));
+    const out = execFileSync(process.execPath, ['--import', preload, 'scripts/fact-consolidate-hook.js'], {
+      cwd: REPO, encoding: 'utf8', timeout: 30_000,
+      input: JSON.stringify({ session_id: sid, cwd: PROJECT, hook_event_name: 'SessionStart' }),
+      env: hookEnv(),
+    });
+    expect(out, '블록은 이미 전달됐다').toContain('Release notes are written in Korean');
+    const key = createHash('sha256').update(sid).digest('hex').slice(0, 12);
+    const logFile = path.join(tmp, 'conversation-index', 'logs', 'inject-context.jsonl');
+    const mine = fs.readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((r) => r.session_key === key);
+    expect(mine).toEqual([expect.objectContaining({ via: 'session-start', status: 'error', error: 'close failed after delivery', injected: 1 })]);
+    expect(mine[0].injected_ids).toHaveLength(1);
+    expect(mine[0].chars).toBe(out.length);
+  });
+
   it('session-start 로그: unwritable 로그 폴더여도 블록은 그대로 출력된다', () => {
     const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-ss-nolog-'));
     try {

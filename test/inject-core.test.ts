@@ -144,10 +144,12 @@ describe('computeInjectResult', () => {
 
   it('운영 주입은 저장소 가족 scope 를 쓴다: 저장소 루트에서 나온 사실이 하위 폴더 세션에 실린다', async () => {
     const repo = path.join(tmp, 'family-repo');
-    fs.mkdirSync(path.join(repo, '.git'), { recursive: true });
-    fs.mkdirSync(path.join(repo, 'docs'), { recursive: true });
     const sibling = `${repo}-cloud`;
-    fs.mkdirSync(path.join(sibling, '.git'), { recursive: true });
+    for (const r of [repo, sibling]) {
+      fs.mkdirSync(path.join(r, '.git'), { recursive: true });
+      fs.writeFileSync(path.join(r, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    }
+    fs.mkdirSync(path.join(repo, 'docs'), { recursive: true });
     const db = dbMod.initDatabase();
     try {
       const text = 'The family repo signs release builds with the hardware key held by the release manager';
@@ -155,14 +157,21 @@ describe('computeInjectResult', () => {
         fact: text, category: 'decision', scope_type: 'project', scope_project: repo,
         source_exchange_ids: [], embedding: await embed.generateEmbedding(text, 'passage'),
       });
+      const sibText = 'The family repo cloud twin signs release builds with a hardware key kept in the office safe';
+      factDb.insertFact(db, {
+        fact: sibText, category: 'decision', scope_type: 'project', scope_project: sibling,
+        source_exchange_ids: [], embedding: await embed.generateEmbedding(sibText, 'passage'),
+      });
     } finally {
       db.close();
     }
     const q = 'Who holds the hardware key that signs release builds of the family repo?';
     const fromDocs = await injectAndRecord(q, path.join(repo, 'docs'), 'daemon', 'sess-family-0001');
     expect(fromDocs, '하위 폴더 세션').toContain('hardware key held by the release manager');
+    expect(fromDocs.includes('kept in the office safe'), '이름이 이어진 형제 저장소의 사실은 하위 폴더 세션에 실리지 않는다').toBe(false);
     const fromSibling = await injectAndRecord(q, sibling, 'daemon', 'sess-family-0002');
     expect(fromSibling.includes('hardware key held by the release manager'), '이름이 이어진 형제 저장소는 가족이 아니다').toBe(false);
+    expect(fromSibling, '양성 대조: 형제 저장소 자신의 사실은 실린다').toContain('kept in the office safe');
   }, 30_000);
 
   it('같은 세션의 다음 프롬프트는 세 번째 사본(새 id)도 본문 키로 거른다', async () => {

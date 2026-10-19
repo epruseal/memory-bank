@@ -68,7 +68,11 @@ export interface InjectLogEntry {
   top_margins?: number[];
   /** Ids (first 12 chars) that cleared the gate, BEFORE the session ledger — what a prompt would have pulled in. */
   gated_ids?: string[];
-  /** Ids (first 12 chars) actually in the delivered block. */
+  /**
+   * Ids (first 12 chars) of the block handed to the host. The prompt path logs before it
+   * writes the block, so a delivery that then fails still carries them (its ledger stays
+   * empty); the SessionStart line logs after delivery and records a failed one as an error.
+   */
   injected_ids?: string[];
   /** sha256(session_id) first 12 hex chars — groups one session's lines without storing its id. */
   session_key?: string;
@@ -87,8 +91,8 @@ export function shortId(id: string): string {
 }
 
 /** sha256(session id) prefix, or undefined without a session id. */
-export function sessionKey(sessionId: string | null | undefined): string | undefined {
-  return sessionId ? createHash('sha256').update(sessionId).digest('hex').slice(0, 12) : undefined;
+export function sessionKey(sessionId: unknown): string | undefined {
+  return typeof sessionId === 'string' && sessionId ? createHash('sha256').update(sessionId).digest('hex').slice(0, 12) : undefined;
 }
 
 let cachedVersion: string | null | undefined;

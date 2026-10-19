@@ -19,8 +19,9 @@ import { fileURLToPath } from 'node:url';
 import {
   CONTROL_PER_KIND, JUDGE_SYSTEM, REJUDGE_PROMPTS, VARIANTS, aggregate, bootstrapDelta, decide, decideC2,
   decideC3, decisionsBlock, judgeUserMessage, labelItems, leakProbes, lostJ2Rel, meanDelta, perPromptCounts, ratioDelta,
-  seededRandom, validateJudgeReply, validity, makeAsOf, isBypassFact, buildFactIndex,
+  seededRandom, validateJudgeReply, validity, makeAsOf, isBypassFact, buildFactIndex, blockDiffers, leakFold,
 } from './inject-bench-lib.mjs';
+import crypto from 'node:crypto';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(here, '..');
@@ -155,13 +156,19 @@ async function loadBench() {
   return { sample, meta, lines };
 }
 
+/** Judgment rows. A torn LAST line (an interrupted append — that call is redone) is counted in
+ *  `loadJudgments.torn`; a broken line anywhere else is corruption and stops the run. */
 function loadJudgments() {
+  loadJudgments.torn = 0;
   if (!fs.existsSync(JUDGMENTS)) return [];
   const out = [];
-  for (const line of fs.readFileSync(JUDGMENTS, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* torn tail of an interrupted append — that call is redone */ }
-  }
+  const raw = fs.readFileSync(JUDGMENTS, 'utf8').split('\n').filter((l) => l.trim());
+  raw.forEach((line, i) => {
+    try { out.push(JSON.parse(line)); } catch {
+      if (i !== raw.length - 1) fail(`${JUDGMENTS}: line ${i + 1} of ${raw.length} is not JSON — not a torn tail`);
+      loadJudgments.torn += 1;
+    }
+  });
   return out;
 }
 
@@ -272,7 +279,11 @@ const ci = (c) => (c.point === null ? '—' : `${fmt(c.point)} [${fmt(c.lo)}, ${
 
 async function report() {
   const { sample, meta, lines } = await loadBench();
-  const judgments = loadJudgments();
+  const { resolveRepoRoots } = await import(dist('project-family.js'));
+  const inSample = new Set(sample.map((p) => p.qid));
+  const allJudgments = loadJudgments();
+  const torn = loadJudgments.torn;
+  const judgments = allJudgments.filter((j) => inSample.has(j.qid)); // rows of prompts no longer sampled never count
   const models = [...new Set(judgments.map((j) => j.model))];
   if (models.length !== 1) fail(`judgments.jsonl holds ${models.length} judge models (${models.join(', ')}) — one model per report`);
   const model = models[0];
@@ -298,18 +309,33 @@ async function report() {
     ctrl[kind][1]++;
     if (s === 2) ctrl[kind][0]++;
   }
-  // agreement (V3)
+  // agreement (V3) — plus, for reading only, lines alone and the grade-2 call the decisions count
   let agree = 0;
   let pairs = 0;
+  const lineAgree = [0, 0];
+  const j2 = { main: 0, rejudge: 0, both: 0 };
+  const rejudgePrompts = new Set();
   for (const j of judgments.filter((x) => x.pass === 'rejudge' && x.scores)) {
+    rejudgePrompts.add(j.qid);
     for (const [id, s] of Object.entries(j.scores)) {
       const m = score(j.qid, id);
       if (m === undefined) continue;
       pairs++;
       if (m === s) agree++;
+      if (kinds.get(`${j.qid}|${id}`) === 'line') {
+        lineAgree[1]++;
+        if (m === s) lineAgree[0]++;
+        if (m === 2) j2.main++;
+        if (s === 2) j2.rejudge++;
+        if (m === 2 && s === 2) j2.both++;
+      }
     }
   }
+  // V4 is bound to the bytes this report reads: both determinism re-runs equal these lines files.
   const det = fs.existsSync(path.join(OUT, 'determinism.json')) ? readJson('determinism.json') : null;
+  const lineSha = Object.fromEntries(VARIANTS.map((v) => [v, crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, `lines-${v}.jsonl`))).digest('hex')]));
+  const deterministic = det !== null && det.identical === true
+    && VARIANTS.every((v) => det.variants?.[v]?.a === lineSha[v] && det.variants?.[v]?.b === lineSha[v]);
   const bySplit = { train: sample.filter((p) => p.split === 'train').map((p) => p.qid), heldout: sample.filter((p) => p.split === 'heldout').map((p) => p.qid) };
   bySplit.all = [...bySplit.train, ...bySplit.heldout];
 
@@ -342,8 +368,42 @@ async function report() {
     j2Delta: bootstrapDelta(pairsOf(affected, 'family'), meanDelta('j2'), { seed: 'c2:j2' }),
     precisionJ2Delta: bootstrapDelta(pairsOf(affected, 'family'), ratioDelta('j2', 'lines'), { seed: 'c2:pj2' }),
   };
+  // Where the family block actually differs from v0 (reading aid for C2 — the rule counts 'affected' as registered).
+  const differs = blockDiffers(affected, lines.family, lines.v0);
+  const differsRoots = new Map();
+  for (const q of differs) {
+    const project = sample.find((p) => p.qid === q).project;
+    const root = resolveRepoRoots(project)[0] ?? project;
+    differsRoots.set(root, (differsRoots.get(root) ?? 0) + 1);
+  }
+  c2stats.blockDiffers = {
+    prompts: differs.length,
+    cwds: new Set(differs.map((q) => sample.find((p) => p.qid === q).project)).size,
+    roots: differsRoots.size,
+    largestRootShare: differs.length ? Math.max(...differsRoots.values()) / differs.length : null,
+  };
+  // Sensitivity (reading aid): the same delta without the root holding the largest share of the grade-2 gain.
+  const rootOf = (q) => { const project = sample.find((p) => p.qid === q).project; return resolveRepoRoots(project)[0] ?? project; };
+  const gainByRoot = new Map();
+  for (const q of affected) {
+    const d = counts.family.get(q).j2 - counts.v0.get(q).j2;
+    if (d) gainByRoot.set(rootOf(q), (gainByRoot.get(rootOf(q)) ?? 0) + d);
+  }
+  const totalGain = [...gainByRoot.values()].reduce((a, b) => a + b, 0);
+  const topRoot = [...gainByRoot.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+  const rest = affected.filter((q) => rootOf(q) !== topRoot);
+  c2stats.gainByRoot = {
+    total: totalGain,
+    roots: [...gainByRoot.values()].sort((a, b) => b - a),
+    largestShare: totalGain ? Math.max(...gainByRoot.values()) / totalGain : null,
+    withoutLargest: bootstrapDelta(pairsOf(rest, 'family'), meanDelta('j2'), { seed: 'c2:j2:loo' }),
+  };
   const hard = usable(meta.hard);
   const hardGain = Object.fromEntries(VARIANTS.map((v) => [v, hard.reduce((t, q) => t + counts[v].get(q).j2, 0)]));
+  const hardLines = Object.fromEntries(VARIANTS.map((v) => [v, hard.reduce((t, q) => {
+    const c = counts[v].get(q);
+    return { j2: t.j2 + c.j2, j1: t.j1 + c.j1, j0: t.j0 + c.j0 };
+  }, { j2: 0, j1: 0, j0: 0 })]));
   // C4 measured only
   const kwLines = [];
   for (const q of usable(bySplit.all)) for (const l of lines.kw.get(q) ?? []) if (l.origin === 'kw') kwLines.push({ q, id: l.id });
@@ -363,8 +423,8 @@ async function report() {
   const v = validity({
     controlSameJ2Rate: ctrl.control_same[1] ? ctrl.control_same[0] / ctrl.control_same[1] : null,
     controlOtherJ2Rate: ctrl.control_other[1] ? ctrl.control_other[0] / ctrl.control_other[1] : null,
-    agreement: pairs ? agree / pairs : null, agreementPairs: pairs,
-    deterministic: det ? det.identical === true : false,
+    agreement: pairs ? agree / pairs : null, agreementPairs: pairs, rejudgePrompts: rejudgePrompts.size,
+    deterministic,
     heldoutPrompts: usable(bySplit.heldout).length, hardPrompts: hard.length,
     judgeCalls: calls, judgeFailures: failures,
   });
@@ -374,8 +434,12 @@ async function report() {
   const result = {
     generatedAt: new Date().toISOString(), model,
     sample: { distinct: sample.length, train: bySplit.train.length, heldout: bySplit.heldout.length, unjudged: unjudged.size, hard: hard.length, affected: affected.length },
-    judge: { calls, failures, controls: { same: ctrl.control_same, other: ctrl.control_other }, agreement: { agree, pairs } },
-    validity: v, stats, c2: c2stats, c4, hardGain, decisions,
+    judge: {
+      calls, failures, tornTail: torn, outsideSample: allJudgments.length - judgments.length,
+      controls: { same: ctrl.control_same, other: ctrl.control_other },
+      agreement: { agree, pairs, prompts: rejudgePrompts.size, lines: lineAgree, j2 },
+    },
+    lineSha, validity: v, stats, c2: c2stats, c4, hardGain, hardLines, decisions,
   };
   fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(result, null, 1) + '\n');
   console.log(JSON.stringify({ verdict: decisions.verdict, validity: Object.fromEntries(Object.entries(v.gates).map(([k, g]) => [k, g.pass])), C3: c3.decision, C2: c2.decision, production: decisions.production }));
@@ -418,7 +482,9 @@ function writeDoc(file, r) {
     gateRow('V5', 'held-out·하드 부분집합 크기'),
     gateRow('V6', '판정 실패율'),
     '',
-    `판정 호출 ${r.judge.calls}회, 실패 ${r.judge.failures}회. 대조군 판정 2: 같은 scope ${r.judge.controls.same[0]}/${r.judge.controls.same[1]}, 다른 프로젝트 ${r.judge.controls.other[0]}/${r.judge.controls.other[1]}. 재채점 일치 ${r.judge.agreement.agree}/${r.judge.agreement.pairs}.`,
+    `판정 호출 ${r.judge.calls}회, 실패 ${r.judge.failures}회, 끊긴 마지막 줄 ${r.judge.tornTail}개, 표본 밖 판정 행 ${r.judge.outsideSample}개(집계 제외). 대조군 판정 2: 같은 scope ${r.judge.controls.same[0]}/${r.judge.controls.same[1]}, 다른 프로젝트 ${r.judge.controls.other[0]}/${r.judge.controls.other[1]}. 재채점 일치 ${r.judge.agreement.agree}/${r.judge.agreement.pairs}(재채점 프롬프트 ${r.judge.agreement.prompts}개).`,
+    `참고(판정 규칙 밖): 대조군을 뺀 줄만의 재채점 일치 ${r.judge.agreement.lines[0]}/${r.judge.agreement.lines[1]}. 판정 2 의 재현성은 처음 판정 ${r.judge.agreement.j2.main}개·재채점 ${r.judge.agreement.j2.rejudge}개·양쪽 ${r.judge.agreement.j2.both}개(양성 일치 ${fmt(r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge ? (2 * r.judge.agreement.j2.both) / (r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge) : null)}). 부트스트랩 구간은 판정 잡음을 담지 않는다.`,
+    `V4 는 두 번의 재생이 이 보고가 읽은 줄 파일과 바이트 단위로 같아야 통과한다(줄 파일 sha256 앞 12자: ${VARIANTS.map((vn) => `${vn} ${r.lineSha[vn].slice(0, 12)}`).join(' · ')}).`,
     '',
     ...['train', 'heldout', 'all'].flatMap((split) => [
       `## 변형별 지표 — ${split}`,
@@ -441,7 +507,9 @@ function writeDoc(file, r) {
     '',
     '## C2 저장소 가족 scope',
     '',
-    `영향 프롬프트 ${r.c2.affected}개(두 분할 합침). 판정2/프롬프트 Δ ${ci(r.c2.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.precisionJ2Delta)}.`,
+    `영향 프롬프트 ${r.c2.affected}개(두 분할 합침 — 사전 등록 정의: 가족 술어가 넓어지고 넓어진 경로에 그 프롬프트 시점에 보이는 사실이 있는 프롬프트). 판정2/프롬프트 Δ ${ci(r.c2.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.precisionJ2Delta)}.`,
+    `참고(판정 규칙 밖): 그중 family 블록이 v0 와 실제로 다른 프롬프트 ${r.c2.blockDiffers.prompts}개 — cwd ${r.c2.blockDiffers.cwds}곳, 저장소 루트 ${r.c2.blockDiffers.roots}곳, 가장 많은 루트의 몫 ${fmt(r.c2.blockDiffers.largestRootShare)}.`,
+    `참고: 판정 2 이득 ${r.c2.gainByRoot.total}줄의 루트별 몫 [${r.c2.gainByRoot.roots.join(', ')}](가장 큰 루트 ${fmt(r.c2.gainByRoot.largestShare)}). 그 루트를 뺀 프롬프트 ${r.c2.gainByRoot.withoutLargest.n}개의 판정2/프롬프트 Δ ${ci(r.c2.gainByRoot.withoutLargest)}. 프롬프트 단위 부트스트랩이라 같은 cwd 끼리의 상관은 반영하지 않는다.`,
     `결정: \`${d.C2.decision}\` — ${d.C2.reason ?? ''}`,
     '',
     '## C4 식별자 어휘 레인 (측정만, 운영 변경 없음)',
@@ -450,14 +518,17 @@ function writeDoc(file, r) {
     '',
     '## 하드 부분집합 (v0 가 0줄인 프롬프트에서 얻은 판정 2 줄)',
     '',
-    '| 변형 | 판정 2 줄 |',
-    '|---|---|',
-    ...VARIANTS.map((vn) => `| ${vn} | ${r.hardGain[vn]} |`),
+    '| 변형 | 판정 2 줄 | 판정 1 줄 | 판정 0 줄 |',
+    '|---|---|---|---|',
+    ...VARIANTS.map((vn) => `| ${vn} | ${r.hardLines[vn].j2} | ${r.hardLines[vn].j1} | ${r.hardLines[vn].j0} |`),
     '',
     '## 한계',
     '',
     '- 판정기는 LLM 이다. 사람 라벨이 아니고, 길이·언어 편향이 있을 수 있다. 대조군(V1·V2)과 재채점(V3)으로만 보정했다.',
-    '- 재생은 세션 원장(이미 보여 준 사실)을 재현하지 않는다. 비활성 전환·문장 갱신 이력도 복원하지 못한다(지금 상태로 읽음).',
+    '- 재생은 세션 원장(이미 보여 준 사실)을 재현하지 않는다. 비활성 전환은 복원하지 못한다(지금 상태로 읽음). 프롬프트 뒤에 문장이 바뀐 사실(통합의 EVOLUTION)은 그때의 벡터가 없어 숨긴다.',
+    '- 지워진 worktree 경로는 앞쪽 폴더가 저장소 루트일 때만 그 저장소의 가족으로 푼다. 여러 저장소의 worktree 를 담은 상위 폴더 아래에서 지워진 경로는 가족이 없다(완전 일치) — 그런 프롬프트의 가족 효과는 재지 못한다.',
+    '- 정렬은 ±180초 안의 가장 이른 행을 고르고 여러 행이 맞는 경우를 세지 않는다. 프롬프트 길이 비교는 UTF-16 길이(JS)와 코드포인트 수(SQLite)가 달라 이모지가 든 프롬프트는 빠진다.',
+    '- 누출 검사는 정규화(NFC·소문자·공백 접기·마크다운 이스케이프 제거)한 원문의 40자 창(앞 400자까지 40자 간격)을 이 문서에서 찾는다. 더 짧은 인용·의역은 잡지 못한다.',
     '- 표본은 대화 색인에 남은 사람의 프롬프트다. 색인되지 않는 자동화 세션에 대한 결론이 아니다.',
     '',
     '## 결정 (기계 판독 — test/inject-select.test.ts 가 운영 상수와 대조)',
@@ -475,7 +546,7 @@ function writeDoc(file, r) {
 function leakCheck() {
   const file = positional[0];
   if (!file) fail('--leak-check needs a file');
-  const body = fs.readFileSync(file, 'utf8').replace(/\s+/g, ' ');
+  const body = leakFold(fs.readFileSync(file, 'utf8'));
   const sample = readJson('sample.json');
   const db = new Database(path.join(OUT, 'snapshot.sqlite'), { readonly: true, fileMustExist: true });
   const judged = new Set(loadJudgments().flatMap((j) => (j.items ?? []).map((it) => it.factId)));

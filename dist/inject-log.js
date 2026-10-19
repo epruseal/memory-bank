@@ -19,7 +19,7 @@ export function shortId(id) {
 }
 /** sha256(session id) prefix, or undefined without a session id. */
 export function sessionKey(sessionId) {
-    return sessionId ? createHash('sha256').update(sessionId).digest('hex').slice(0, 12) : undefined;
+    return typeof sessionId === 'string' && sessionId ? createHash('sha256').update(sessionId).digest('hex').slice(0, 12) : undefined;
 }
 let cachedVersion;
 /** Version from the package.json next to dist/ (works for dist/*.js and the bundled server alike); undefined when unreadable. */

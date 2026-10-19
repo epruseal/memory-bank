@@ -30,8 +30,10 @@ export const REL_SCORE_CAP = 30;
  * decisions block and fails when this drifts from it):
  *  - relMargin null: every candidate margin lost more than 10% of the relation
  *    lines judged directly useful, so the relation gate was rejected;
- *  - scopeFamily true: on the 132 prompts the family widens, judged-useful lines
- *    per prompt rose +0.13 (95% CI 0.05–0.22) with precision not lower.
+ *  - scopeFamily true: on the 111 prompts the family widens (facts visible at the
+ *    prompt's time), judged-useful lines per prompt rose +0.14 (95% CI 0.05–0.26),
+ *    precision(=2) Δ +0.03 (CI −0.02–0.08); the gain spans 5 repository roots and
+ *    stays above 0 without the largest one (+0.08, CI 0.01–0.19).
  */
 export const PRODUCTION_SELECT_OPTIONS = Object.freeze({
     relMargin: null,
@@ -52,6 +54,7 @@ const isSafetyEdge = (relation) => relation.relation_type === 'CONTRADICTS' || r
 function gateNeighbours(db, related, embedding, baseline, relMargin) {
     const passed = [];
     const safety = [];
+    const settled = []; // judged and dropped for good: below the margin, or no vector
     let gatedOut = 0;
     let unscored = 0;
     let scoredCount = 0;
@@ -66,15 +69,19 @@ function gateNeighbours(db, related, embedding, baseline, relMargin) {
         }
         scoredCount++;
         const margin = neighbourMargin(db, r.fact.id, embedding, baseline);
-        if (margin === null)
+        if (margin === null) {
             unscored++;
-        else if (margin < relMargin)
+            settled.push(r.fact.id);
+        }
+        else if (margin < relMargin) {
             gatedOut++;
+            settled.push(r.fact.id);
+        }
         else
             passed.push({ fact: r.fact, relation: r.relation, margin });
     }
     passed.sort((a, b) => b.margin - a.margin);
-    return { keep: [...passed, ...safety], gatedOut, unscored };
+    return { keep: [...passed, ...safety], gatedOut, unscored, settled };
 }
 /**
  * Top-K similar facts gated by the probe baseline, expanded with 1-hop ontology
@@ -95,6 +102,7 @@ export function selectInjectFacts(db, embedding, baseline, project, opts = PRODU
     }
     tStage = Date.now();
     const seenIds = new Set(gated.map((r) => r.fact.id));
+    const settledIds = new Set(); // neighbours a previous seed already gated out — not scored or counted again
     const lines = gated.map((r) => ({ fact: r.fact, note: '', origin: 'vec', margin: r.margin }));
     let relGatedOut = 0;
     let relUnscored = 0;
@@ -103,7 +111,7 @@ export function selectInjectFacts(db, embedding, baseline, project, opts = PRODU
             break;
         const related = getRelatedFacts(db, fact.id, 1, 0.6, 0.2, project, {
             scopeFamily: opts.scopeFamily, visibleFact: opts.visibleFactId, visibleRelation: opts.visibleRelation,
-        }).filter((r) => !seenIds.has(r.fact.id));
+        }).filter((r) => !seenIds.has(r.fact.id) && !settledIds.has(r.fact.id));
         let keep;
         if (opts.relMargin === null) {
             keep = related.map((r) => ({ fact: r.fact, relation: r.relation, margin: null }));
@@ -113,6 +121,8 @@ export function selectInjectFacts(db, embedding, baseline, project, opts = PRODU
             keep = gated.keep;
             relGatedOut += gated.gatedOut;
             relUnscored += gated.unscored;
+            for (const id of gated.settled)
+                settledIds.add(id);
         }
         for (const { fact: relFact, relation, margin } of keep) {
             if (!seenIds.has(relFact.id) && lines.length < MAX_CONTEXT_FACTS) {

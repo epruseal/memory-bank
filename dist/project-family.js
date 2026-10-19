@@ -10,61 +10,62 @@ import path from 'path';
  * (`<repo>/docs`) never sees the repo's own project facts, and the repo never
  * sees what its worktrees learned. The family is the git top-level of the cwd
  * plus, for a linked worktree, the main repository root; a fact is in the
- * family when its scope_project is one of those roots or lies under one.
+ * family when its scope_project is one of those roots or lies under one —
+ * but not inside another repository nested there (a separate clone or a
+ * submodule); a linked worktree of a family root is not "another repository".
  *
  * Resolved from the filesystem only (no `git` process — the injection hook has
- * a hard time budget). A root is never $HOME, an ancestor of it, or '/': a home
- * directory that is itself a git work tree would otherwise make every
- * non-repo folder under it one family with every project.
+ * a hard time budget). A root is a real repository: a `.git` directory holding
+ * HEAD, or a `.git` file naming an existing git dir; anything else named
+ * `.git` (garbage, an empty folder, a symlink) means no family. A root is never
+ * a home directory ($HOME or the account's own — HOME can be overridden), an
+ * ancestor of one, or '/': a home directory that is itself a git work tree
+ * would otherwise make every non-repo folder under it one family with every
+ * project. Relative paths (slug-form projects) have no family.
  */
 const WORKTREE_CONTAINERS = ['/.auto-issue-worktrees/', '/.claude/worktrees/'];
 const CACHE_LIMIT = 256;
 const cache = new Map();
+function lstat(p) {
+    try {
+        return fs.lstatSync(p);
+    }
+    catch {
+        return null;
+    }
+}
 function isDir(p) {
-    try {
-        return fs.lstatSync(p).isDirectory();
-    }
-    catch {
-        return false;
-    }
+    return lstat(p)?.isDirectory() === true;
 }
-function isFile(p) {
+function homes() {
+    const out = [path.resolve(os.homedir())];
     try {
-        return fs.lstatSync(p).isFile();
+        out.push(path.resolve(os.userInfo().homedir));
     }
-    catch {
-        return false;
-    }
+    catch { /* no account entry */ }
+    return out;
 }
-/** A root that would swallow unrelated projects: '/', $HOME, or any ancestor of $HOME. */
+/** A root that would swallow unrelated projects: '/', a home directory, or any ancestor of one. */
 function tooBroad(root) {
-    const home = path.resolve(os.homedir());
-    return root === path.parse(root).root || home === root || home.startsWith(root + path.sep);
+    return root === path.parse(root).root || homes().some((home) => home === root || home.startsWith(root + path.sep));
+}
+/** A main repository root: `<root>/.git` is a directory (not a symlink) holding a HEAD file. */
+function isRepoRoot(root) {
+    return isDir(path.join(root, '.git')) && lstat(path.join(root, '.git', 'HEAD'))?.isFile() === true;
 }
 /**
- * Main repository root behind a linked worktree's `.git` file, or null. The
- * file must read `gitdir: <R>/.git/worktrees/<name>`, `<R>/.git` must be a
- * directory, and that admin dir's own `gitdir` back-reference must name this
- * worktree's `.git` file — so a forged `.git` file cannot pull another
+ * Main repository root behind a linked worktree whose `.git` file names
+ * `adminDir`, or null. adminDir must be `<R>/.git/worktrees/<name>`, R a
+ * repository root, and the admin dir's own `gitdir` back-reference must name
+ * this worktree's `.git` file — so a forged `.git` file cannot pull another
  * project's facts into this one.
  */
-function mainRootOf(worktreeTop) {
-    let content;
-    try {
-        content = fs.readFileSync(path.join(worktreeTop, '.git'), 'utf8');
-    }
-    catch {
-        return null;
-    }
-    const m = /^gitdir:\s*(.+?)\s*$/m.exec(content);
-    if (!m)
-        return null;
-    const adminDir = path.resolve(worktreeTop, m[1]);
+function mainRootOf(worktreeTop, adminDir) {
     const parts = /^(.*)\/\.git\/worktrees\/[^/]+$/.exec(adminDir);
     if (!parts)
         return null;
     const root = parts[1];
-    if (!isDir(path.join(root, '.git')))
+    if (!isRepoRoot(root))
         return null;
     let back;
     try {
@@ -77,28 +78,55 @@ function mainRootOf(worktreeTop) {
         return null;
     return root;
 }
+/** What `<dir>/.git` makes of dir. */
+function dotGitOf(dir) {
+    const st = lstat(path.join(dir, '.git'));
+    if (!st)
+        return { kind: 'none' };
+    if (st.isDirectory())
+        return isRepoRoot(dir) ? { kind: 'root' } : { kind: 'invalid' };
+    if (!st.isFile())
+        return { kind: 'invalid' };
+    let content;
+    try {
+        content = fs.readFileSync(path.join(dir, '.git'), 'utf8');
+    }
+    catch {
+        return { kind: 'invalid' };
+    }
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(content);
+    if (!m)
+        return { kind: 'invalid' };
+    const adminDir = path.resolve(dir, m[1]);
+    if (!isDir(adminDir))
+        return { kind: 'invalid' };
+    return { kind: 'linked', main: mainRootOf(dir, adminDir) };
+}
 function resolveUncached(cwd) {
+    if (!path.isAbsolute(cwd))
+        return [];
     const start = path.resolve(cwd);
     if (!isDir(start)) {
-        // A deleted worktree (replayed history): its container names the repo.
+        // A deleted worktree (replayed history): its container names the repo — when the
+        // folder in front of the container is itself a repository root (an umbrella folder
+        // holding worktrees of several repositories is not).
         for (const marker of WORKTREE_CONTAINERS) {
             const i = start.indexOf(marker);
             if (i > 0) {
                 const root = start.slice(0, i);
-                return tooBroad(root) ? [] : [root];
+                return !tooBroad(root) && isRepoRoot(root) ? [root] : [];
             }
         }
         return [];
     }
     for (let dir = start;; dir = path.dirname(dir)) {
-        const dotGit = path.join(dir, '.git');
-        if (isDir(dotGit))
-            return tooBroad(dir) ? [] : [dir];
-        if (isFile(dotGit)) {
-            if (tooBroad(dir))
+        const g = dotGitOf(dir);
+        if (g.kind !== 'none') {
+            if (g.kind === 'invalid' || tooBroad(dir))
                 return [];
-            const main = mainRootOf(dir);
-            return main && !tooBroad(main) && main !== dir ? [dir, main] : [dir];
+            if (g.kind === 'root')
+                return [dir];
+            return g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
         }
         if (dir === path.dirname(dir))
             return [];
@@ -120,12 +148,35 @@ export function clearRepoRootCache() {
     cache.clear();
 }
 /**
+ * Whether `scopeProject`, strictly under `root`, lies inside another repository:
+ * a folder on the way (or the path itself) has its own `.git` that is not a
+ * linked worktree of a family root. Folders that no longer exist are no boundary
+ * (a deleted worktree's facts stay in the family).
+ */
+function insideNestedRepo(root, scopeProject, roots) {
+    let dir = root;
+    for (const seg of scopeProject.slice(root.length + 1).split('/')) {
+        if (!seg)
+            continue;
+        dir = path.join(dir, seg);
+        const g = dotGitOf(dir);
+        if (g.kind === 'none')
+            continue;
+        if (g.kind === 'linked' && g.main !== null && roots.includes(g.main))
+            continue;
+        return true;
+    }
+    return false;
+}
+/**
  * Whether a project-scoped fact's scope_project is visible from `project`.
  * The single predicate behind the KNN scope filter, the relation scope filter
  * and the replay bench. family=false (and family=true with no roots) is the
  * exact match the injection has always used; family=true matches a root or a
  * path under it — on a '/' boundary, so `memory-bank` never matches
- * `memory-bank-cloud`. A null project sees every scope.
+ * `memory-bank-cloud`, and never inside a repository nested under a root. A
+ * path with '.' or '..' segments matches only exactly. A null project sees
+ * every scope.
  */
 export function scopeMatcher(project, family) {
     if (!project)
@@ -135,6 +186,22 @@ export function scopeMatcher(project, family) {
     const roots = resolveRepoRoots(project);
     if (roots.length === 0)
         return (scopeProject) => scopeProject === project;
-    return (scopeProject) => scopeProject === project
-        || (scopeProject != null && roots.some((r) => scopeProject === r || scopeProject.startsWith(r + '/')));
+    const memo = new Map();
+    const inFamily = (s) => {
+        if (s.split('/').some((seg) => seg === '.' || seg === '..'))
+            return false;
+        return roots.some((r) => s === r || (s.startsWith(r + '/') && !insideNestedRepo(r, s, roots)));
+    };
+    return (scopeProject) => {
+        if (scopeProject === project)
+            return true;
+        if (scopeProject == null)
+            return false;
+        let hit = memo.get(scopeProject);
+        if (hit === undefined) {
+            hit = inFamily(scopeProject);
+            memo.set(scopeProject, hit);
+        }
+        return hit;
+    };
 }

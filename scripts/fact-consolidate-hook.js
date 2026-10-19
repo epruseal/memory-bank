@@ -88,11 +88,12 @@ async function main() {
   try {
     // 1. Key facts — read-only, before any worker is started (header). A read
     //    failure is reported on stderr and must not stop the workers below.
+    //    (delivery state lives outside the try so an error after delivery still logs it)
+    const shown = [];
+    let delivered = false;
+    let block = '';
     try {
       const db = openReadOnlyDatabase();
-      const shown = [];
-      let delivered = false;
-      let block = '';
       if (db) try {
         const lines = [];
         let chars = 0;
@@ -123,7 +124,11 @@ async function main() {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.error('fact-consolidate: key facts unavailable:', message);
-      appendInjectLog({ ...logBase, status: 'error', error: message.slice(0, 300), duration_ms: Date.now() - t0 });
+      appendInjectLog({
+        ...logBase, status: 'error', error: message.slice(0, 300), injected: delivered ? shown.length : 0,
+        ...(delivered ? { chars: block.length, injected_ids: shown.map((f) => shortId(f.id)) } : {}),
+        duration_ms: Date.now() - t0,
+      });
     }
 
     // 2. Offload slow work to detached children this hook never waits for:

@@ -9905,8 +9905,8 @@ var init_uploads = __esm({
       } else if (isAsyncIterable(value)) {
         form.append(key, makeFile([await new Response(ReadableStreamFrom(value)).blob()], getName(value, stripFilenames)));
       } else if (value instanceof Blob) {
-        const isFile2 = typeof File !== "undefined" && value instanceof File;
-        const name = isFile2 ? value.name : getName(value, stripFilenames);
+        const isFile = typeof File !== "undefined" && value instanceof File;
+        const name = isFile ? value.name : getName(value, stripFilenames);
         form.append(key, makeFile([value], name, { type: value.type }));
       } else if (Array.isArray(value)) {
         await Promise.all(value.map((entry) => addFormValue(form, key + "[]", entry, stripFilenames)));
@@ -52022,38 +52022,35 @@ import path3 from "path";
 var WORKTREE_CONTAINERS = ["/.auto-issue-worktrees/", "/.claude/worktrees/"];
 var CACHE_LIMIT = 256;
 var cache = /* @__PURE__ */ new Map();
-function isDir(p) {
+function lstat(p) {
   try {
-    return fs3.lstatSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
-function isFile(p) {
-  try {
-    return fs3.lstatSync(p).isFile();
-  } catch {
-    return false;
-  }
-}
-function tooBroad(root) {
-  const home = path3.resolve(os2.homedir());
-  return root === path3.parse(root).root || home === root || home.startsWith(root + path3.sep);
-}
-function mainRootOf(worktreeTop) {
-  let content;
-  try {
-    content = fs3.readFileSync(path3.join(worktreeTop, ".git"), "utf8");
+    return fs3.lstatSync(p);
   } catch {
     return null;
   }
-  const m2 = /^gitdir:\s*(.+?)\s*$/m.exec(content);
-  if (!m2) return null;
-  const adminDir = path3.resolve(worktreeTop, m2[1]);
+}
+function isDir(p) {
+  return lstat(p)?.isDirectory() === true;
+}
+function homes() {
+  const out = [path3.resolve(os2.homedir())];
+  try {
+    out.push(path3.resolve(os2.userInfo().homedir));
+  } catch {
+  }
+  return out;
+}
+function tooBroad(root) {
+  return root === path3.parse(root).root || homes().some((home) => home === root || home.startsWith(root + path3.sep));
+}
+function isRepoRoot(root) {
+  return isDir(path3.join(root, ".git")) && lstat(path3.join(root, ".git", "HEAD"))?.isFile() === true;
+}
+function mainRootOf(worktreeTop, adminDir) {
   const parts = /^(.*)\/\.git\/worktrees\/[^/]+$/.exec(adminDir);
   if (!parts) return null;
   const root = parts[1];
-  if (!isDir(path3.join(root, ".git"))) return null;
+  if (!isRepoRoot(root)) return null;
   let back;
   try {
     back = fs3.readFileSync(path3.join(adminDir, "gitdir"), "utf8").trim();
@@ -52063,25 +52060,42 @@ function mainRootOf(worktreeTop) {
   if (path3.resolve(adminDir, back) !== path3.join(worktreeTop, ".git")) return null;
   return root;
 }
+function dotGitOf(dir) {
+  const st = lstat(path3.join(dir, ".git"));
+  if (!st) return { kind: "none" };
+  if (st.isDirectory()) return isRepoRoot(dir) ? { kind: "root" } : { kind: "invalid" };
+  if (!st.isFile()) return { kind: "invalid" };
+  let content;
+  try {
+    content = fs3.readFileSync(path3.join(dir, ".git"), "utf8");
+  } catch {
+    return { kind: "invalid" };
+  }
+  const m2 = /^gitdir:\s*(.+?)\s*$/m.exec(content);
+  if (!m2) return { kind: "invalid" };
+  const adminDir = path3.resolve(dir, m2[1]);
+  if (!isDir(adminDir)) return { kind: "invalid" };
+  return { kind: "linked", main: mainRootOf(dir, adminDir) };
+}
 function resolveUncached(cwd) {
+  if (!path3.isAbsolute(cwd)) return [];
   const start = path3.resolve(cwd);
   if (!isDir(start)) {
     for (const marker of WORKTREE_CONTAINERS) {
       const i = start.indexOf(marker);
       if (i > 0) {
         const root = start.slice(0, i);
-        return tooBroad(root) ? [] : [root];
+        return !tooBroad(root) && isRepoRoot(root) ? [root] : [];
       }
     }
     return [];
   }
   for (let dir = start; ; dir = path3.dirname(dir)) {
-    const dotGit = path3.join(dir, ".git");
-    if (isDir(dotGit)) return tooBroad(dir) ? [] : [dir];
-    if (isFile(dotGit)) {
-      if (tooBroad(dir)) return [];
-      const main2 = mainRootOf(dir);
-      return main2 && !tooBroad(main2) && main2 !== dir ? [dir, main2] : [dir];
+    const g = dotGitOf(dir);
+    if (g.kind !== "none") {
+      if (g.kind === "invalid" || tooBroad(dir)) return [];
+      if (g.kind === "root") return [dir];
+      return g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
     }
     if (dir === path3.dirname(dir)) return [];
   }
@@ -52094,12 +52108,38 @@ function resolveRepoRoots(cwd) {
   cache.set(cwd, roots);
   return roots;
 }
+function insideNestedRepo(root, scopeProject, roots) {
+  let dir = root;
+  for (const seg of scopeProject.slice(root.length + 1).split("/")) {
+    if (!seg) continue;
+    dir = path3.join(dir, seg);
+    const g = dotGitOf(dir);
+    if (g.kind === "none") continue;
+    if (g.kind === "linked" && g.main !== null && roots.includes(g.main)) continue;
+    return true;
+  }
+  return false;
+}
 function scopeMatcher(project, family) {
   if (!project) return () => true;
   if (!family) return (scopeProject) => scopeProject === project;
   const roots = resolveRepoRoots(project);
   if (roots.length === 0) return (scopeProject) => scopeProject === project;
-  return (scopeProject) => scopeProject === project || scopeProject != null && roots.some((r) => scopeProject === r || scopeProject.startsWith(r + "/"));
+  const memo2 = /* @__PURE__ */ new Map();
+  const inFamily = (s) => {
+    if (s.split("/").some((seg) => seg === "." || seg === "..")) return false;
+    return roots.some((r) => s === r || s.startsWith(r + "/") && !insideNestedRepo(r, s, roots));
+  };
+  return (scopeProject) => {
+    if (scopeProject === project) return true;
+    if (scopeProject == null) return false;
+    let hit = memo2.get(scopeProject);
+    if (hit === void 0) {
+      hit = inFamily(scopeProject);
+      memo2.set(scopeProject, hit);
+    }
+    return hit;
+  };
 }
 
 // src/fact-db.ts
@@ -53215,7 +53255,7 @@ function shortId(id) {
   return id.slice(0, 12);
 }
 function sessionKey(sessionId) {
-  return sessionId ? createHash("sha256").update(sessionId).digest("hex").slice(0, 12) : void 0;
+  return typeof sessionId === "string" && sessionId ? createHash("sha256").update(sessionId).digest("hex").slice(0, 12) : void 0;
 }
 var cachedVersion;
 function pluginVersion() {
@@ -53351,6 +53391,7 @@ var isSafetyEdge = (relation) => relation.relation_type === "CONTRADICTS" || rel
 function gateNeighbours(db, related, embedding, baseline, relMargin) {
   const passed = [];
   const safety = [];
+  const settled = [];
   let gatedOut = 0;
   let unscored = 0;
   let scoredCount = 0;
@@ -53365,12 +53406,16 @@ function gateNeighbours(db, related, embedding, baseline, relMargin) {
     }
     scoredCount++;
     const margin = neighbourMargin(db, r.fact.id, embedding, baseline);
-    if (margin === null) unscored++;
-    else if (margin < relMargin) gatedOut++;
-    else passed.push({ fact: r.fact, relation: r.relation, margin });
+    if (margin === null) {
+      unscored++;
+      settled.push(r.fact.id);
+    } else if (margin < relMargin) {
+      gatedOut++;
+      settled.push(r.fact.id);
+    } else passed.push({ fact: r.fact, relation: r.relation, margin });
   }
   passed.sort((a, b2) => b2.margin - a.margin);
-  return { keep: [...passed, ...safety], gatedOut, unscored };
+  return { keep: [...passed, ...safety], gatedOut, unscored, settled };
 }
 function selectInjectFacts(db, embedding, baseline, project, opts = PRODUCTION_SELECT_OPTIONS) {
   let tStage = Date.now();
@@ -53387,6 +53432,7 @@ function selectInjectFacts(db, embedding, baseline, project, opts = PRODUCTION_S
   }
   tStage = Date.now();
   const seenIds = new Set(gated.map((r) => r.fact.id));
+  const settledIds = /* @__PURE__ */ new Set();
   const lines = gated.map((r) => ({ fact: r.fact, note: "", origin: "vec", margin: r.margin }));
   let relGatedOut = 0;
   let relUnscored = 0;
@@ -53396,7 +53442,7 @@ function selectInjectFacts(db, embedding, baseline, project, opts = PRODUCTION_S
       scopeFamily: opts.scopeFamily,
       visibleFact: opts.visibleFactId,
       visibleRelation: opts.visibleRelation
-    }).filter((r) => !seenIds.has(r.fact.id));
+    }).filter((r) => !seenIds.has(r.fact.id) && !settledIds.has(r.fact.id));
     let keep;
     if (opts.relMargin === null) {
       keep = related.map((r) => ({ fact: r.fact, relation: r.relation, margin: null }));
@@ -53405,6 +53451,7 @@ function selectInjectFacts(db, embedding, baseline, project, opts = PRODUCTION_S
       keep = gated2.keep;
       relGatedOut += gated2.gatedOut;
       relUnscored += gated2.unscored;
+      for (const id of gated2.settled) settledIds.add(id);
     }
     for (const { fact: relFact, relation, margin } of keep) {
       if (!seenIds.has(relFact.id) && lines.length < MAX_CONTEXT_FACTS) {

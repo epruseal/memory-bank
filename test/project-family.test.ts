@@ -15,6 +15,12 @@ let S: string;   // sibling whose name extends R's (memory-bank-cloud)
 let W: string;   // linked worktree inside R
 let E: string;   // linked worktree outside R
 
+/** A repository root as git leaves it: `.git/` holding HEAD. */
+function makeRepo(dir: string) {
+  fs.mkdirSync(path.join(dir, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+}
+
 function linkWorktree(worktreeTop: string, repo: string, name: string, backRef = path.join(worktreeTop, '.git')) {
   const admin = path.join(repo, '.git', 'worktrees', name);
   fs.mkdirSync(admin, { recursive: true });
@@ -27,9 +33,9 @@ beforeAll(() => {
   tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mb-family-')));
   R = path.join(tmp, 'proj', 'memory-bank');
   S = path.join(tmp, 'proj', 'memory-bank-cloud');
-  fs.mkdirSync(path.join(R, '.git'), { recursive: true });
+  makeRepo(R);
   fs.mkdirSync(path.join(R, 'docs', 'deep'), { recursive: true });
-  fs.mkdirSync(path.join(S, '.git'), { recursive: true });
+  makeRepo(S);
   W = path.join(R, '.auto-issue-worktrees', 'issue-1');
   linkWorktree(W, R, 'issue-1');
   E = path.join(tmp, 'elsewhere', 'wt');
@@ -61,27 +67,68 @@ describe('resolveRepoRoots', () => {
     expect(resolveRepoRoots(path.join(tmp, 'never-existed'))).toEqual([]);
   });
 
-  it('forged .git file: a gitdir without the back-reference, or into a repo without a .git directory, links nothing', () => {
+  it('forged .git file: a gitdir without the back-reference links nothing; one naming no git dir is no repository', () => {
     const F = path.join(tmp, 'proj', 'forged');
     linkWorktree(F, S, 'x', '/somewhere/else/.git'); // back-reference names another worktree
     expect(resolveRepoRoots(F)).toEqual([F]);
     const G = path.join(tmp, 'proj', 'forged2');
     fs.mkdirSync(G, { recursive: true });
     fs.writeFileSync(path.join(G, '.git'), `gitdir: ${path.join(tmp, 'nogit', '.git', 'worktrees', 'y')}\n`);
-    expect(resolveRepoRoots(G)).toEqual([G]);
+    expect(resolveRepoRoots(G)).toEqual([]);
     const H = path.join(tmp, 'proj', 'submodule-like');
+    fs.mkdirSync(path.join(R, '.git', 'modules', 'h'), { recursive: true });
     fs.mkdirSync(H, { recursive: true });
     fs.writeFileSync(path.join(H, '.git'), `gitdir: ${path.join(R, '.git', 'modules', 'h')}\n`);
-    expect(resolveRepoRoots(H)).toEqual([H]);
+    expect(resolveRepoRoots(H), 'a submodule is its own root, not linked to R').toEqual([H]);
+  });
+
+  it('a .git that is not a repository — garbage file, empty folder, symlink — means no family', () => {
+    const cases: Array<[string, (d: string) => void]> = [
+      ['garbage', (d) => fs.writeFileSync(path.join(d, '.git'), 'not a gitdir line\n')],
+      ['empty-dir', (d) => fs.mkdirSync(path.join(d, '.git'))],
+      ['symlink', (d) => fs.symlinkSync(path.join(R, '.git'), path.join(d, '.git'))],
+    ];
+    for (const [name, make] of cases) {
+      const d = path.join(tmp, 'umbrella-' + name);
+      fs.mkdirSync(path.join(d, 'project'), { recursive: true });
+      make(d);
+      expect(resolveRepoRoots(path.join(d, 'project')), name).toEqual([]);
+    }
+  });
+
+  it('a deleted worktree under an umbrella folder (not a repository) has no family', () => {
+    const U = path.join(tmp, 'umbrella');
+    makeRepo(path.join(U, 'RepoA'));
+    makeRepo(path.join(U, 'RepoB'));
+    expect(resolveRepoRoots(path.join(U, '.auto-issue-worktrees', 'ORG-RepoA', 'issue-7'))).toEqual([]);
+    expect(resolveRepoRoots(path.join(U, '.claude', 'worktrees', 'x'))).toEqual([]);
+  });
+
+  it('only absolute paths resolve (a slug-form project has no family), whatever the process cwd', () => {
+    vi.spyOn(process, 'cwd').mockReturnValue(R); // a relative path would otherwise resolve inside R
+    expect(resolveRepoRoots('docs')).toEqual([]);
+    expect(resolveRepoRoots('-Users-x-proj')).toEqual([]);
   });
 
   it('a home directory that is a git work tree never becomes a root', () => {
     const home = path.join(tmp, 'home');
-    fs.mkdirSync(path.join(home, '.git'), { recursive: true });
+    makeRepo(home);
     fs.mkdirSync(path.join(home, 'notes'), { recursive: true });
     vi.spyOn(os, 'homedir').mockReturnValue(home);
     expect(resolveRepoRoots(path.join(home, 'notes'))).toEqual([]);
     expect(resolveRepoRoots(home)).toEqual([]);
+    // A deleted worktree of the global ~/.claude container names $HOME as its repo — still no root.
+    expect(resolveRepoRoots(path.join(home, '.claude', 'worktrees', 'gone-1'))).toEqual([]);
+    expect(resolveRepoRoots(path.join(tmp, '.claude', 'worktrees', 'gone-2'))).toEqual([]);
+  });
+
+  it('the account home counts even when HOME points elsewhere', () => {
+    const home = path.join(tmp, 'home2');
+    makeRepo(home);
+    fs.mkdirSync(path.join(home, 'notes'), { recursive: true });
+    vi.spyOn(os, 'homedir').mockReturnValue(path.join(tmp, 'other-home'));
+    vi.spyOn(os, 'userInfo').mockReturnValue({ ...os.userInfo(), homedir: home });
+    expect(resolveRepoRoots(path.join(home, 'notes'))).toEqual([]);
   });
 });
 
@@ -100,6 +147,32 @@ describe('scopeMatcher', () => {
     expect(fromWorktree(R)).toBe(true);
     expect(fromWorktree(path.join(R, '.auto-issue-worktrees', 'issue-2'))).toBe(true);
     expect(scopeMatcher(E, true)(R)).toBe(true);
+  });
+
+  it('a repository nested under a root — a separate clone or a submodule — is not in the family; a linked worktree is', () => {
+    const N = path.join(R, 'vendor', 'lib');
+    makeRepo(N);
+    fs.mkdirSync(path.join(R, '.git', 'modules', 'sub'), { recursive: true });
+    fs.mkdirSync(path.join(R, 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(R, 'sub', '.git'), `gitdir: ${path.join(R, '.git', 'modules', 'sub')}\n`);
+    const m = scopeMatcher(path.join(R, 'docs'), true);
+    expect(m(path.join(R, 'vendor')), 'a plain folder above the clone').toBe(true);
+    expect(m(N)).toBe(false);
+    expect(m(path.join(N, 'src'))).toBe(false);
+    expect(m(path.join(R, 'sub'))).toBe(false);
+    expect(m(W), 'linked worktree of R').toBe(true);
+    expect(m(path.join(W, 'src'))).toBe(true);
+    const foreign = path.join(R, 'other-wt');
+    linkWorktree(foreign, S, 'foreign');
+    expect(m(foreign), 'a worktree of another repository placed under R').toBe(false);
+  });
+
+  it('a path with . or .. segments matches only exactly', () => {
+    fs.mkdirSync(path.join(tmp, 'proj', 'plain-outside'), { recursive: true });
+    const m = scopeMatcher(R, true);
+    expect(m(`${R}/../plain-outside`), 'climbs out of R into a folder that is no repository').toBe(false);
+    expect(m(`${R}/../memory-bank-cloud`)).toBe(false);
+    expect(m(`${R}/./docs`)).toBe(false);
   });
 
   it('a sibling whose name extends the root is never in the family', () => {

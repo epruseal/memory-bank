@@ -21,6 +21,7 @@ export const THRESHOLDS = Object.freeze({
   V2_control_other_j2: 0.05,
   V3_agreement: 0.85,
   V3_min_pairs: 100,
+  V3_rejudge_prompts: 30,
   V5_min_heldout: 100,
   V5_min_hard: 30,
   V6_max_failure_rate: 0.02,
@@ -106,15 +107,24 @@ export function buildFactIndex(db) {
     const s = factSessions.get(r.fact_id);
     if (s) s.add(r.session_id); else factSessions.set(r.fact_id, new Set([r.session_id]));
   }
-  return { factCreated, factSessions };
+  // Latest rewrite of each fact (consolidation EVOLUTION keeps created_at and sources, replaces the text).
+  const factRevised = new Map();
+  for (const r of db.prepare('SELECT fact_id, created_at FROM fact_revisions').iterate()) {
+    const t = toEpoch(r.created_at);
+    if (Number.isFinite(t) && !(factRevised.get(r.fact_id) >= t)) factRevised.set(r.fact_id, t);
+  }
+  return { factCreated, factSessions, factRevised };
 }
 
 /**
  * Visibility at a replayed prompt's moment. A fact is visible when it was
- * created no later than the prompt and was not extracted from the prompt's own
- * session (those facts were learned from this very conversation). A relation is
- * visible when created no later than the prompt. What cannot be restored: facts
- * deactivated or rewritten since (they are read as they are now).
+ * created no later than the prompt, was not extracted from the prompt's own
+ * session (those facts were learned from this very conversation), and was not
+ * rewritten after the prompt (its text and vector are the later ones — the
+ * earlier vector is not kept, so the fact is hidden rather than replayed with
+ * text it did not have yet). A relation is visible when created no later than
+ * the prompt. What cannot be restored: facts deactivated since (read as they
+ * are now).
  */
 export function makeAsOf(index, prompt) {
   const t = toEpoch(prompt.ts);
@@ -122,6 +132,8 @@ export function makeAsOf(index, prompt) {
     visibleFactId(id) {
       const created = index.factCreated.get(id);
       if (created === undefined || !(created <= t)) return false;
+      const revised = index.factRevised?.get(id);
+      if (revised !== undefined && revised > t) return false;
       const sessions = index.factSessions.get(id);
       return !(prompt.sessionId && sessions && sessions.has(prompt.sessionId));
     },
@@ -352,7 +364,11 @@ export function validity(m) {
   const gates = {
     V1: { value: m.controlSameJ2Rate, threshold: `<= ${T.V1_control_same_j2}`, pass: m.controlSameJ2Rate !== null && m.controlSameJ2Rate <= T.V1_control_same_j2 },
     V2: { value: m.controlOtherJ2Rate, threshold: `<= ${T.V2_control_other_j2}`, pass: m.controlOtherJ2Rate !== null && m.controlOtherJ2Rate <= T.V2_control_other_j2 },
-    V3: { value: m.agreement, pairs: m.agreementPairs, threshold: `>= ${T.V3_agreement} over >= ${T.V3_min_pairs} pairs`, pass: m.agreement !== null && m.agreement >= T.V3_agreement && m.agreementPairs >= T.V3_min_pairs },
+    V3: {
+      value: m.agreement, pairs: m.agreementPairs, prompts: m.rejudgePrompts,
+      threshold: `>= ${T.V3_agreement} over >= ${T.V3_min_pairs} pairs of >= ${T.V3_rejudge_prompts} re-judged prompts`,
+      pass: m.agreement !== null && m.agreement >= T.V3_agreement && m.agreementPairs >= T.V3_min_pairs && m.rejudgePrompts >= T.V3_rejudge_prompts,
+    },
     V4: { value: m.deterministic, threshold: 'all variants byte-identical', pass: m.deterministic === true },
     V5: { value: { heldout: m.heldoutPrompts, hard: m.hardPrompts }, threshold: `heldout >= ${T.V5_min_heldout}, hard >= ${T.V5_min_hard}`, pass: m.heldoutPrompts >= T.V5_min_heldout && m.hardPrompts >= T.V5_min_hard },
     V6: { value: m.judgeCalls ? m.judgeFailures / m.judgeCalls : null, threshold: `<= ${T.V6_max_failure_rate}`, pass: m.judgeCalls > 0 && m.judgeFailures / m.judgeCalls <= T.V6_max_failure_rate },
@@ -431,6 +447,28 @@ export function parseDecisionsBlock(markdown) {
 }
 
 /** Strings of the private sample that must never appear in a committed file (≥ 12 chars). */
+/** Text as the leak check compares it: NFC, lowercase, markdown escapes dropped, whitespace folded. */
+export const leakFold = (t) => String(t).normalize('NFC').toLowerCase().replace(/\\([\\`*_{}\[\]()#+\-.!|>~])/g, '$1').replace(/\s+/g, ' ').trim();
+
+/**
+ * 40-char windows of each private text (folded), from its start and every 40 chars on (up to
+ * 400 chars in): a copied prompt or fact shows up wherever the quote starts. Windows shorter
+ * than 12 chars are skipped (too common to mean a leak).
+ */
 export function leakProbes(texts) {
-  return [...new Set(texts.map((t) => String(t).replace(/\s+/g, ' ').trim().slice(0, 40)).filter((p) => p.length >= 12))];
+  const out = new Set();
+  for (const t of texts) {
+    const f = leakFold(t);
+    for (let i = 0; i < Math.min(f.length, 400); i += 40) {
+      const w = f.slice(i, i + 40).trim();
+      if (w.length >= 12) out.add(w);
+    }
+  }
+  return [...out];
+}
+
+/** Prompts whose shown id list differs between two variants' lines (`Map qid → [{id}]`). */
+export function blockDiffers(qids, linesA, linesB) {
+  const ids = (m, q) => (m.get(q) ?? []).map((l) => l.id).join(',');
+  return qids.filter((q) => ids(linesA, q) !== ids(linesB, q));
 }

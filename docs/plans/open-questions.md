@@ -8,3 +8,4 @@
 - [ ] 가족 scope 쓰기 쪽 정규화(새 사실 scope_project 를 주 루트로). 졸업 트리거: 지워진 worktree 고아 사실 수 실측 후 이행 계획.
 - [ ] 긴 프롬프트의 붙여 넣은 블록 제거 질의(C7 대체안). 졸업 트리거: 사람이 친 긴 프롬프트의 하드 부분집합 손실 확인.
 - [ ] 관계 확장 재설계. 졸업 트리거: 관계 줄 판정≥1 51.7% 를 올릴 다른 방식(예: 이웃의 관계 유형별 가중, 확장 seed 수)을 재생 판정으로 비교할 계획.
+- [ ] 저장소 밖에 놓인 worktree 의 가족. 여러 저장소의 worktree 를 한 상위 폴더(`<umbrella>/.auto-issue-worktrees/<ORG>-<REPO>/issue-N`)에 두는 배치에서는 worktree 세션이 본 저장소 사실만 보고 같은 저장소의 형제 worktree 사실은 보지 못하며, 지워진 그런 worktree 는 재생에서 가족이 없다. 졸업 트리거: 본 저장소의 `.git/worktrees/*/gitdir` 로 형제 worktree 를 열거하는 방식의 재생 판정 계획(지워진 worktree 의 소속을 남길 기록이 먼저 필요).

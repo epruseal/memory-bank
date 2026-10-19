@@ -21,6 +21,12 @@ describe('inject-log', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  it('sessionKey hashes only a non-empty string session id', async () => {
+    const { sessionKey } = await import('../src/inject-log.js');
+    expect(sessionKey('abc')).toMatch(/^[0-9a-f]{12}$/);
+    for (const v of [12345, {}, ['x'], '', null, undefined]) expect(sessionKey(v), JSON.stringify(v)).toBeUndefined();
+  });
+
   it('appends a parseable JSONL entry with timestamp', async () => {
     const { appendInjectLog, getInjectLogPath } = await import('../src/inject-log.js');
 
