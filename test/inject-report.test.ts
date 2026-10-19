@@ -88,6 +88,9 @@ function makeFixture() {
     { factId: `cs${i}`, kind: 'control_same' }, { factId: `co${i}`, kind: 'control_other' },
   ];
   qids.forEach((qid, i) => rows.push(JSON.stringify({ qid, pass: 'main', model: 'test-model', scores: scoresOf(i), items: itemsOf(i), bound: bound(i, itemsOf(i), `${qid}:main:0`) })));
+  // a fill-in row: the main pass re-asked one line of q7 alone (no controls); its score repeats the first one
+  const fill = [{ factId: 'f7', kind: 'line' }];
+  rows.push(JSON.stringify({ qid: 'q7', pass: 'main', model: 'test-model', scores: { f7: 1 }, items: fill, bound: bound(7, fill, `q7:main:${itemsOf(7).length}`) }));
   // 30 re-judged prompts, same scores (agreement 1.0, ≥ 100 pairs).
   for (let i = 0; i < 30; i++) rows.push(JSON.stringify({ qid: `q${i}`, pass: 'rejudge', model: 'test-model', scores: scoresOf(i), items: itemsOf(i), bound: bound(i, itemsOf(i), `q${i}:rejudge`) }));
   fs.writeFileSync(path.join(out, 'judgments.jsonl'), rows.join('\n') + '\n');
@@ -118,8 +121,8 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.report.c2.byRepo.largest).toEqual({ prompts: 14, differs: 7, gain: 7, cwdRoots: 1 });
     expect(r.report.c2.byRepo.withoutLargest).toEqual({ measurable: false, n: 26, gain: 13 });
     expect(r.report.c2.blockDiffers).toEqual({ prompts: 20, cwds: 3, repos: 3 });
-    expect(r.report.judge.binding).toEqual({ inline: 250, transcript: 0, unbound: 0, drifted: 0 });
-    expect(r.report.judge.fillRows).toBe(0);
+    expect(r.report.judge.binding).toEqual({ inline: 251, transcript: 0, unbound: 0, drifted: 0 });
+    expect(r.report.judge.fillRows, 'the q7 row without controls').toBe(1);
     const docText = fs.readFileSync(doc, 'utf8');
     expect(docText, 'the doc names the report it came from').toContain(`sha256: \`${sha(path.join(out, 'report.json'))}\``);
     expect(docText, 'every placement bucket the report holds is listed').toContain('가족 없음 40·20·+20');
@@ -141,7 +144,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     fs.writeFileSync(path.join(out, 'judgment-bindings.json'), JSON.stringify({ version: 1, rows: { [key]: { ...row.bound, via: 'transcript' } } }));
     const r = report();
     expect(r.status, r.stderr).toBe(0);
-    expect(r.report.judge.binding).toEqual({ inline: 249, transcript: 1, unbound: 0, drifted: 0 });
+    expect(r.report.judge.binding).toEqual({ inline: 250, transcript: 1, unbound: 0, drifted: 0 });
     expect(r.report.inputs.bindings).toBe(sha(path.join(out, 'judgment-bindings.json')));
   });
 
