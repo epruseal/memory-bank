@@ -307,6 +307,7 @@ describe('decision', () => {
     expect(judge, 'the judge records what it sends with the function the report checks with').toContain('const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };');
     expect(judge, 'a judged row keeps the reply it got').toContain('if (v.ok) return { ...v, retried: attempt > 0, reply: text };');
     expect(judge).toContain('retried: reply.retried, reply: reply.reply,');
+    expect(judge, '--judge binds what it wrote before any report reads it').toContain('// every scored row — these new ones too — is bound to its recorded call before a report reads it\n  await bindLegacy();');
     expect(judge, 'and labels the call with the same seed').toContain('const labeled = labelItems(task.want.map((w) => ({ ...w, text: text(w.factId) })), task.seed);');
     expect(judge, 'a failed first call is asked again in full (its controls too)').toContain("for (const j of prior) if (j.pass === 'main' && j.items && j.scores) items.set(");
     expect(replay).toContain('const reading = affectedReadings(widened(p.project), asOf.visibleFactId);');
