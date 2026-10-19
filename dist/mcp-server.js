@@ -52100,6 +52100,7 @@ function dotGitOf(dir) {
   return { kind: "linked", main: mainRootOf(dir, adminDir) };
 }
 function resolveUncached(cwd) {
+  if (path3.sep !== "/") return [];
   if (!path3.isAbsolute(cwd)) return [];
   const start = path3.resolve(cwd);
   const own2 = lstat(start);
@@ -52141,8 +52142,7 @@ function excludedUnderRoot(root, scopeProject, roots) {
       top = dir;
       continue;
     }
-    if (g.kind === "none") continue;
-    return true;
+    if (g.kind !== "none") return true;
   }
   return false;
 }

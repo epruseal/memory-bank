@@ -302,10 +302,12 @@ describe('decision', () => {
     expect(replay).toContain('const { inputs, code } = bound;');
     expect(judge, 'the report compares the whole code digest but the Node version').toContain('const codeChanged = driftedCode(withoutNode(meta.code?.files), withoutNode(codeDigest(REPO, EMBEDDING_MODEL)));');
     expect(judge, 'every scored judgment row is bound').toContain("if ((j.bound && (b.seed !== j.bound.seed || b.message !== j.bound.message)) || rebuilt(j, b.seed) !== b.message) { binding.drifted++; continue; }");
-    expect(judge, 'and every binding count in the stop list stops the report').toContain("const BINDING_STOPS = ['unbound', 'drifted', 'noReply', 'noCall', 'badItems', 'callReused', 'transcriptMismatch', 'unaccountedCalls', 'malformedRows', 'failedUnbound', 'evidenceDrift'];");
-    expect(judge).toContain('if (BINDING_STOPS.some((k) => binding[k])) {');
+    expect(judge, 'and every binding count in the stop list stops the report').toContain("const BINDING_STOPS = ['unbound', 'drifted', 'noReply', 'noCall', 'badItems', 'callReused', 'transcriptMismatch', 'keptWithoutRow', 'malformedRows', 'failedUnbound', 'evidenceDrift'];");
+    expect(judge).toContain('if (BINDING_STOPS.some((k) => binding[k])) fail(`judgment rows not bound');
     expect(judge, 'the judge records what it sends with the function the report checks with').toContain('const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };');
-    expect(judge, 'a judged row keeps the reply it got').toContain('if (v.ok) return { ...v, retried: attempt > 0, reply: text };');
+    expect(judge, 'a judged row keeps the reply it got').toContain('if (v.ok) return { ...v, retried: attempt > 0, reply: text, message, attempts: attempt + 1 };');
+    expect(judge, 'and --judge keeps each call under its row\'s key, success or failure').toContain('      append(rec);\n      keep(rec, reply);\n    } else {');
+    expect(judge).toContain("      const rec = { qid: task.prompt.qid, pass: task.pass, model: MODEL, at: new Date().toISOString(), items: task.want, bound, failed: reply.reason };\n      append(rec);\n      keep(rec, reply);");
     expect(judge).toContain('retried: reply.retried, reply: reply.reply,');
     expect(judge, '--judge binds what it wrote before any report reads it').toContain('// every scored row — these new ones too — is bound to its recorded call before a report reads it\n  await bindLegacy();');
     expect(judge, 'and labels the call with the same seed').toContain('const labeled = labelItems(task.want.map((w) => ({ ...w, text: text(w.factId) })), task.seed);');

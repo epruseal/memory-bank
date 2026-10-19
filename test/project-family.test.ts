@@ -3,6 +3,7 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { resolveRepoRoots, scopeMatcher, clearRepoRootCache } from '../src/project-family.js';
 
 /**
@@ -111,6 +112,11 @@ describe('resolveRepoRoots', () => {
     expect(m(path.join(wt, 'docs')), 'positive control: a plain folder of the worktree').toBe(true);
     expect(resolveRepoRoots(path.join(plain, 'src')), 'a cwd in that plain folder').toEqual([]);
     expect(resolveRepoRoots(path.join(wt, 'docs')), 'positive control: a cwd in the worktree').toEqual([wt, Q]);
+  });
+
+  it('a Windows path gets no family (the boundaries are \'/\' segments) — pinned, this platform cannot run it', () => {
+    const src = fs.readFileSync(fileURLToPath(new URL('../src/project-family.ts', import.meta.url)), 'utf8');
+    expect(src).toContain("  if (path.sep !== '/') return [];");
   });
 
   it('outside any repository there is no family', () => {

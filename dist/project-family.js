@@ -38,7 +38,9 @@ import path from 'path';
  * Inside a worktree container only the family's linked worktrees count, for a cwd
  * and a fact path alike (a plain folder there may hold another repository's
  * worktrees); the container is the one of the repository or worktree the path
- * is in, its name compared case-folded on macOS and Windows. The worktrees of a
+ * is in, its name compared case-folded on macOS (on a case-sensitive volume too —
+ * folding only ever leaves more out). A Windows path has no family (the boundaries
+ * here are '/' segments): the exact-path scope. The worktrees of a
  * bare repository (`<dir>/.bare/worktrees/…`) are not grouped: each one is its
  * own family.
  */
@@ -153,6 +155,9 @@ function dotGitOf(dir) {
     return { kind: 'linked', main: mainRootOf(dir, adminDir) };
 }
 function resolveUncached(cwd) {
+    // The family's boundaries are '/' segments; a Windows path ('\\' separator) gets none — the exact-path scope.
+    if (path.sep !== '/')
+        return [];
     if (!path.isAbsolute(cwd))
         return [];
     const start = path.resolve(cwd);
@@ -229,9 +234,8 @@ function excludedUnderRoot(root, scopeProject, roots) {
             top = dir;
             continue;
         }
-        if (g.kind === 'none')
-            continue;
-        return true;
+        if (g.kind !== 'none')
+            return true; // another repository nested under the root: a clone or a submodule
     }
     return false;
 }

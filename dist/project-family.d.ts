@@ -35,7 +35,9 @@
  * Inside a worktree container only the family's linked worktrees count, for a cwd
  * and a fact path alike (a plain folder there may hold another repository's
  * worktrees); the container is the one of the repository or worktree the path
- * is in, its name compared case-folded on macOS and Windows. The worktrees of a
+ * is in, its name compared case-folded on macOS (on a case-sensitive volume too —
+ * folding only ever leaves more out). A Windows path has no family (the boundaries
+ * here are '/' segments): the exact-path scope. The worktrees of a
  * bare repository (`<dir>/.bare/worktrees/…`) are not grouped: each one is its
  * own family.
  */
