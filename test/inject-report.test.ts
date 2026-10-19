@@ -588,6 +588,22 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     const reasked = await bind();
     expect(reasked.status).toBe(1);
     expect(lastJson(reasked), 'not bound to the retired re-judge call of the same bytes').toMatchObject({ answeredByOther: 1, matched: 0 });
+    // the refused main row asked again a day later, the other model answering the same scores in other bytes: the
+    // retired call kept for the old row (its own record — same message, the requested model's label) is no candidate,
+    // so the new row binds by its own record only, and that one is refused
+    const old = JSON.parse(line);
+    const otherBytes = JSON.stringify(JSON.parse(old.reply), null, 1);
+    const later2 = JSON.stringify({ ...old, at: '2026-10-21T10:00:00.000Z', reply: otherBytes });
+    fs.appendFileSync(file, later2 + '\n');
+    keepSelf(later2, 9, items, 'q9:main:50', otherBytes);
+    const labeled9 = labelItems(items.map((it) => ({ ...it, text: judged(it.factId) })), 'q9:main:50');
+    fs.writeFileSync(path.join(llmDir(), 'later.jsonl'), [
+      JSON.stringify({ type: 'user', timestamp: '2026-10-21T09:59:58.000Z', message: { role: 'user', content: judgeMessage(promptOf(9), labeled9) } }),
+      JSON.stringify({ type: 'assistant', timestamp: '2026-10-21T09:59:58.000Z', message: { model: 'fallback-model', content: [{ type: 'text', text: otherBytes }] } }),
+    ].join('\n') + '\n');
+    const dayLater = await bind();
+    expect(dayLater.status).toBe(1);
+    expect(lastJson(dayLater), 'neither re-asked row binds to a retired call').toMatchObject({ answeredByOther: 2, matched: 0 });
   });
 
   it('V6 counts every refusal the bindings recorded for a sampled prompt as a failed call, its row retired or not', async () => {
