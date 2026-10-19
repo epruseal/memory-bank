@@ -18,3 +18,12 @@ galaxy-*.png
 /tmp/mbgalaxy-server.log
 .codex-review-output
 .codex-review-passed
+
+# QA 증거 — 게이트 상태 지문에서 제외(없으면 자기무효화로 push 영구차단)
+.qa-evidence.json
+
+# QA 증거 — 게이트 상태 지문에서 제외(없으면 자기무효화로 push 영구차단)
+.claude/worktrees/
+
+# 주입 재생 벤치 — 프롬프트·사실 원문(사적 데이터)과 스냅샷 DB. 커밋 금지
+.bench-out/
