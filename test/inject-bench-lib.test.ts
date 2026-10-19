@@ -304,7 +304,7 @@ describe('decision', () => {
     expect(judge, 'every scored judgment row is bound').toContain("if ((j.bound && (b.seed !== j.bound.seed || b.message !== j.bound.message)) || rebuilt(j, b.seed) !== b.message) { binding.drifted++; continue; }");
     expect(judge, 'and every binding count in the stop list stops the report').toContain(`const BINDING_STOPS = [
   'unbound', 'drifted', 'noReply', 'noCall', 'badItems', 'callReused', 'transcriptMismatch', 'keptWithoutRow', 'malformedRows', 'failedUnbound',
-  'duplicateRows', 'overlapItems', 'noSelfRecord', 'notLegacy', 'retiredLost', 'evidenceDrift',
+  'duplicateRows', 'overlapItems', 'noSelfRecord', 'notLegacy', 'retiredLost', 'answeredByOther', 'evidenceDrift',
 ];`);
     expect(judge).toContain('if (BINDING_STOPS.some((k) => binding[k])) fail(`judgment rows not bound');
     expect(judge, 'the judge records what it sends with the function the report checks with').toContain('const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };');
@@ -316,8 +316,8 @@ describe('decision', () => {
     expect(judge, 'and labels the call with the same seed').toContain('const labeled = labelItems(task.want.map((w) => ({ ...w, text: text(w.factId) })), task.seed);');
     expect(judge, 'a failed first call is asked again in full (its controls too)').toContain('const items = scoredMainItems(prior, MODEL);');
     expect(judge, 'and a re-judge asks the scored main items only').toContain('const itemsNow = scoredMainItems(loadJudgments(), MODEL);');
-    expect(judge, '--judge checks its arguments, then retires, before it asks anything').toMatch(/const limit = intArg\('--limit'[^\n]*\n  const \{ sample, lines \} = await loadBench\(\);\n  const retired = await retireStale\(sample, lines\);\n/);
-    expect(judge, 'retiring marks the calls before the rows go').toMatch(/write\(JUDGE_CALLS, calls\.map[^\n]*\n  const rest = [^\n]*\n  write\(JUDGMENTS, rest/);
+    expect(judge, '--judge checks its arguments, then retires, before it asks anything').toMatch(/const limit = intArg\('--limit'[^\n]*\n  closeTornTail\(JUDGMENTS\);\n  closeTornTail\(JUDGE_CALLS\);\n  const \{ sample, lines \} = await loadBench\(\);\n  const retired = await retireStale\(sample, lines\);\n/);
+    expect(judge, 'retiring records the marked calls in the bindings, then marks them, then the rows go').toMatch(/write\(BINDINGS, JSON\.stringify\(\{ \.\.\.\(doc \?\? \{ version: 5 \}\), retired \}[^\n]*\n  write\(JUDGE_CALLS, calls\.map[^\n]*\n  const rest = [^\n]*\n  write\(JUDGMENTS, rest/);
     expect(replay).toContain('const reading = affectedReadings(widened(p.project), asOf.visibleFactId);');
     expect(replay).toContain('if (reading.registered) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
     expect(replay).toContain('const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();');

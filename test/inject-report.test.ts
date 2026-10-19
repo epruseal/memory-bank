@@ -90,7 +90,7 @@ const judgedRow = (i: number, pass: string, items: Array<{ factId: string; kind:
   ({ qid: `q${i}`, pass, model: 'test-model', scores, items, bound: bound(i, items, seed), reply: replyFor(items, scores, seed) });
 const NO_DRIFT = {
   unbound: 0, drifted: 0, noReply: 0, noCall: 0, badItems: 0, callReused: 0, transcriptMismatch: 0, keptWithoutRow: 0, malformedRows: 0, failedUnbound: 0,
-  duplicateRows: 0, overlapItems: 0, noSelfRecord: 0, notLegacy: 0, retiredLost: 0, evidenceDrift: false,
+  duplicateRows: 0, overlapItems: 0, noSelfRecord: 0, notLegacy: 0, retiredLost: 0, answeredByOther: 0, evidenceDrift: false,
 };
 type Item = { factId: string; kind: string };
 /** The isolated LLM sessions' transcript folder of the fixture (one SDK query per file: the message, then the answer). */
@@ -552,6 +552,81 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     const secondsBefore = await bindWith('2026-10-19T09:59:57.000Z');
     expect(secondsBefore.status).toBe(1);
     expect(lastJson(secondsBefore)).toMatchObject({ answeredByOther: 1, unmatchedScored: 1 });
+    // the refusal is recorded: once the transcript that showed it is gone (24 hours), the row stays refused
+    fs.rmSync(path.join(llmDir(), 'other-run.jsonl'));
+    const later = await bind();
+    expect(later.status, 'a refused row is not bound by its own record a day later').toBe(1);
+    expect(lastJson(later)).toMatchObject({ answeredByOther: 1 });
+    expect((await report()).stderr).toMatch(/1 rows another model answered/);
+    // and --judge (here --retire-stale) retires it with its prompt's other scored rows, to be asked again
+    const r = await run(['--retire-stale', '--out', out]);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout.trim().split('\n')[0]), 'the refused row, q9\'s main row and its re-judge').toEqual({ retired: 3 });
+    expect(lastJson(r)).toMatchObject({ answeredByOther: 0, unmatchedScored: 0 });
+  });
+
+  it('rows written before bindings: --bind-legacy keeps a binding judged on other text, so the row is still retired whichever runs first', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    const bindingsFile = path.join(out, 'judgment-bindings.json');
+    // q5's two rows as rows written before rows carried a binding: no `bound`, no reply, no self-record — bound by their transcripts
+    const oldKeys = new Set<string>();
+    const stripped = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => {
+      const row = JSON.parse(l);
+      if (row.qid !== 'q5') return l;
+      oldKeys.add(crypto.createHash('sha256').update(l).digest('hex'));
+      return JSON.stringify({ ...row, bound: undefined, reply: undefined });
+    });
+    fs.writeFileSync(file, stripped.join('\n') + '\n');
+    fs.writeFileSync(callsFile, fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).filter((l) => !oldKeys.has(JSON.parse(l).key)).join('\n') + '\n');
+    fs.rmSync(bindingsFile);
+    const first = await bind();
+    expect(first.status, first.stdout + first.stderr).toBe(0);
+    expect(JSON.parse(fs.readFileSync(bindingsFile, 'utf8')).legacyRows).toHaveLength(2);
+    // the snapshot is rebuilt with cs5 rewritten, and --bind-legacy runs first (the report's stop message offers it)
+    const db = new Database(path.join(out, 'snapshot.sqlite'));
+    db.prepare("UPDATE facts SET fact = 'rewritten by a later consolidation' WHERE id = 'cs5'").run();
+    db.close();
+    writeMeta();
+    const before = await bind();
+    expect(before.status, 'judged on other text: not a binding a report can read').toBe(1);
+    expect(lastJson(before)).toMatchObject({ drifted: 2, unmatchedScored: 0 });
+    expect((await report()).stderr).toMatch(/2 whose message no longer matches/);
+    const r = await run(['--retire-stale', '--out', out]);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout.trim().split('\n')[0])).toEqual({ retired: 2 });
+    expect(lastJson(r)).toMatchObject({ drifted: 0, keptWithoutRow: 0, unmatchedScored: 0 });
+  });
+
+  it('a retired main row takes its prompt\'s other scored rows with it — the fill-in row too, so the prompt is asked again with its controls', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    const db = new Database(path.join(out, 'snapshot.sqlite'));
+    db.prepare("UPDATE facts SET fact = 'rewritten by a later consolidation' WHERE id = 'cs7'").run();
+    db.close();
+    writeMeta();
+    const r = await run(['--retire-stale', '--out', out]);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout.trim().split('\n')[0]), 'q7\'s first main row, its fill-in row (f7 alone) and its re-judge').toEqual({ retired: 3 });
+    expect(fs.readFileSync(file, 'utf8').split('\n').filter((l) => l && JSON.parse(l).qid === 'q7')).toEqual([]);
+  });
+
+  it('retiring cut off after recording the marked calls in the bindings: the next run writes the same lines', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    const bindingsFile = path.join(out, 'judgment-bindings.json');
+    const db = new Database(path.join(out, 'snapshot.sqlite'));
+    db.prepare("UPDATE facts SET fact = 'rewritten by a later consolidation' WHERE id = 'cs5'").run();
+    db.close();
+    writeMeta();
+    const keys5 = new Set(fs.readFileSync(file, 'utf8').split('\n').filter((l) => l && JSON.parse(l).qid === 'q5').map((l) => crypto.createHash('sha256').update(l).digest('hex')));
+    const marked = fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((c) => keys5.has(c.key)).map((c) => JSON.stringify({ ...c, retired: true }));
+    expect(marked).toHaveLength(4);
+    const doc = JSON.parse(fs.readFileSync(bindingsFile, 'utf8'));
+    fs.writeFileSync(bindingsFile, JSON.stringify({ ...doc, retired: marked.map((l) => crypto.createHash('sha256').update(l).digest('hex')) }));
+    expect((await report()).stderr, 'recorded, not yet written').toMatch(/4 retired calls the bindings recorded that are gone from judge-calls\.jsonl/);
+    const r = await run(['--retire-stale', '--out', out]);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(lastJson(r)).toMatchObject({ retiredLost: 0, keptWithoutRow: 0, unmatchedScored: 0 });
   });
 
   it('a row the judge wrote is bound with its own seed and message: another seed\'s call, or a call on other text, binds nothing', async () => {
