@@ -53341,7 +53341,7 @@ var BLOCK_HEADER = "\u{1F4CC} \uAD00\uB828 \uACFC\uAC70 \uACB0\uC815:";
 var REL_SCORE_CAP = 30;
 var PRODUCTION_SELECT_OPTIONS = Object.freeze({
   relMargin: null,
-  scopeFamily: false
+  scopeFamily: true
 });
 function neighbourMargin(db, factId, embedding, baseline) {
   const distance = factVectorDistance(db, factId, embedding);

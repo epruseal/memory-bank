@@ -94,7 +94,8 @@ describe('selectInjectFacts', () => {
     expect(got.lines[0].fact.id).toBe(ids.seed);
     expect(got.lines.some((l) => l.fact.id === ids.far), 'no gate: an unrelated SUPPORTS neighbour is carried').toBe(true);
     expect(got.relGatedOut + got.relUnscored).toBe(0);
-    expect(sel.selectInjectFacts(db, e, baseline, PROJECT).lines).toEqual(got.lines);
+    // The default (production) options differ only in scopeFamily; this project has no family facts besides rootfact.
+    expect(sel.selectInjectFacts(db, e, baseline, PROJECT, { ...sel.PRODUCTION_SELECT_OPTIONS, scopeFamily: false }).lines).toEqual(got.lines);
   }, 30_000);
 
   it('relation gate keeps exactly the affirmative neighbours at margin >= relMargin, safety edges exempt', async () => {
@@ -182,6 +183,16 @@ describe('selectInjectFacts', () => {
     expect(seedFirst.lines[0].fact.id).toBe(ids.seed);
     expect(seedFirst.lines.some((l) => l.fact.id === ids.near || l.fact.id === ids.contra)).toBe(false);
   }, 30_000);
+
+  it('production options equal the committed replay decision', async () => {
+    const { parseDecisionsBlock } = await import('../bench/inject-bench-lib.mjs');
+    const doc = fs.readFileSync(path.resolve(__dirname, '..', 'docs', 'bench', '2026-10-19-inject-replay.md'), 'utf8');
+    const decided = parseDecisionsBlock(doc);
+    expect(decided, 'the report carries a decisions block').not.toBeNull();
+    expect(decided.verdict).toBe('valid');
+    expect({ ...sel.PRODUCTION_SELECT_OPTIONS }).toEqual(decided.production);
+    expect(Object.isFrozen(sel.PRODUCTION_SELECT_OPTIONS)).toBe(true);
+  });
 
   it('formatInjectBlock keeps the first line, cuts the tail at the budget, reports how many made it', () => {
     const fact = (n: number) => ({ id: `f${n}`, fact: 'x'.repeat(300), category: 'decision', created_at: '2026-10-19T00:00:00Z' }) as never;

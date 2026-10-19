@@ -25,12 +25,17 @@ export const BLOCK_HEADER = '📌 관련 과거 결정:';
 /** Neighbours per seed whose margin is computed when the relation gate is on (relation degree reaches 122 live). */
 export const REL_SCORE_CAP = 30;
 /**
- * What the live injection runs. Changed only by the replay bench's
- * pre-registered decision (docs/bench/2026-10-19-inject-replay.md).
+ * What the live injection runs — the replay bench's pre-registered decision
+ * (docs/bench/2026-10-19-inject-replay.md; test/inject-select.test.ts reads its
+ * decisions block and fails when this drifts from it):
+ *  - relMargin null: every candidate margin lost more than 10% of the relation
+ *    lines judged directly useful, so the relation gate was rejected;
+ *  - scopeFamily true: on the 132 prompts the family widens, judged-useful lines
+ *    per prompt rose +0.13 (95% CI 0.05–0.22) with precision not lower.
  */
 export const PRODUCTION_SELECT_OPTIONS = Object.freeze({
     relMargin: null,
-    scopeFamily: false,
+    scopeFamily: true,
 });
 /** sim − baseline of one stored fact, or null when it has no current-version vector. */
 export function neighbourMargin(db, factId, embedding, baseline) {
