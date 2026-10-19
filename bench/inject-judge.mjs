@@ -20,8 +20,10 @@ import {
   CONTROL_PER_KIND, JUDGE_SYSTEM, REJUDGE_PROMPTS, THRESHOLDS, VARIANTS, aggregate, bootstrapDelta, decide, decideC2,
   decideC3, decisionsBlock, judgeUserMessage, labelItems, leakProbes, lostJ2Rel, meanDelta, perPromptCounts, ratioDelta,
   seededRandom, validateJudgeReply, validity, makeAsOf, isBypassFact, buildFactIndex, blockDiffers, leakFold, repoOf, unboundMeta,
+  driftedInputs, missingRows, determinismBound,
 } from './inject-bench-lib.mjs';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(here, '..');
@@ -334,12 +336,29 @@ async function report() {
   // V4 is bound to the bytes this report reads: both determinism re-runs equal these lines files.
   const det = fs.existsSync(path.join(OUT, 'determinism.json')) ? readJson('determinism.json') : null;
   const lineSha = Object.fromEntries(VARIANTS.map((v) => [v, crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, `lines-${v}.jsonl`))).digest('hex')]));
-  const deterministic = det !== null && det.identical === true
-    && VARIANTS.every((v) => det.variants?.[v]?.a === lineSha[v] && det.variants?.[v]?.b === lineSha[v]);
-  // The affected / hard lists come from replay-meta.json — they must belong to these lines files.
+  const deterministic = determinismBound(det, lineSha);
+  // The affected / hard lists come from replay-meta.json — they must belong to these lines files,
+  // made from this sample and snapshot; every sampled prompt must have a row in every variant.
   const unbound = unboundMeta(meta.hashes, lineSha);
   if (unbound.length) fail(`replay-meta.json hashes do not match the lines files for ${unbound.join(', ')} — re-run --replay (all variants, no suffix)`);
   if (!Array.isArray(meta.affectedRegistered) || !Array.isArray(meta.affectedAsOf)) fail('replay-meta.json has no affectedRegistered / affectedAsOf — re-run --replay');
+  const fileSha = (f) => crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, f))).digest('hex');
+  const replayInputs = { sample: fileSha('sample.json'), snapshot: fileSha('snapshot.sqlite') };
+  const drifted = driftedInputs(meta.inputs, replayInputs);
+  if (drifted.length) fail(`replay-meta.json was made from another ${drifted.join(' and ')} — re-run --replay`);
+  const gaps = missingRows(sample.map((p) => p.qid), lines);
+  if (gaps.length) fail(`lines files miss sampled prompts (${gaps.map((g) => `${g.variant} ${g.missing}`).join(', ')}) — re-run --replay`);
+  const git = (...a) => { try { return execFileSync('git', ['-C', REPO, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };
+  const distSha = (m) => crypto.createHash('sha256').update(fs.readFileSync(dist(m))).digest('hex');
+  const codeStatus = git('status', '--porcelain', '--', 'src', 'bench', 'dist');
+  const inputs = {
+    ...replayInputs, judgments: fileSha('judgments.jsonl'),
+    code: {
+      git: git('rev-parse', 'HEAD'),
+      dirty: codeStatus === null ? null : codeStatus !== '',
+      dist: Object.fromEntries(['inject-select.js', 'project-family.js', 'fact-db.js', 'ontology-db.js'].map((m) => [m, distSha(m)])),
+    },
+  };
   const bySplit = { train: sample.filter((p) => p.split === 'train').map((p) => p.qid), heldout: sample.filter((p) => p.split === 'heldout').map((p) => p.qid) };
   bySplit.all = [...bySplit.train, ...bySplit.heldout];
 
@@ -452,7 +471,7 @@ async function report() {
       controls: { same: ctrl.control_same, other: ctrl.control_other },
       agreement: { agree, pairs, prompts: rejudgePrompts.size, lines: lineAgree, j2 },
     },
-    lineSha, validity: v, stats, c2: c2stats, c4, hardGain, hardLines, decisions,
+    lineSha, inputs, validity: v, stats, c2: c2stats, c4, hardGain, hardLines, decisions,
   };
   fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(result, null, 1) + '\n');
   console.log(JSON.stringify({ verdict: decisions.verdict, validity: Object.fromEntries(Object.entries(v.gates).map(([k, g]) => [k, g.pass])), C3: c3.decision, C2: c2.decision, production: decisions.production }));
@@ -481,7 +500,7 @@ function writeDoc(file, r) {
     '',
     '## 표본',
     '',
-    `서로 다른 프롬프트 ${r.sample.distinct}개(train ${r.sample.train} · held-out ${r.sample.heldout}). 판정 실패로 빠진 프롬프트 ${r.sample.unjudged}개. 하드 부분집합(v0 가 0줄) ${r.sample.hard}개. 가족 scope 영향 프롬프트 ${r.sample.affected}개.`,
+    `서로 다른 프롬프트 ${r.sample.distinct}개(train ${r.sample.train} · held-out ${r.sample.heldout}). 판정이 없어 빠진 프롬프트(판정 실패·미판정) ${r.sample.unjudged}개. 하드 부분집합(v0 가 0줄) ${r.sample.hard}개. 가족 scope 영향 프롬프트 ${r.sample.affected}개.`,
     '표본은 운영 로그와 대화 색인이 맞는 프롬프트만 쓴다(같은 cwd·같은 길이·±180초, 현행 게이트 통과, 합성 턴 제외, 같은 질의 하나로 접음). 색인되지 않는 자동화 세션은 빠진다.',
     '',
     '## 유효성 (V1~V6, 사전 등록)',
@@ -498,6 +517,7 @@ function writeDoc(file, r) {
     `판정 호출 ${r.judge.calls}회, 실패 ${r.judge.failures}회, 끊긴 마지막 줄 ${r.judge.tornTail}개, 표본 밖 판정 행 ${r.judge.outsideSample}개(집계 제외). 대조군 판정 2: 같은 scope ${r.judge.controls.same[0]}/${r.judge.controls.same[1]}, 다른 프로젝트 ${r.judge.controls.other[0]}/${r.judge.controls.other[1]}. 재채점 일치 ${r.judge.agreement.agree}/${r.judge.agreement.pairs}(재채점 프롬프트 ${r.judge.agreement.prompts}개).`,
     `참고(판정 규칙 밖): 대조군을 뺀 줄만의 재채점 일치 ${r.judge.agreement.lines[0]}/${r.judge.agreement.lines[1]}. 판정 2 의 재현성은 처음 판정 ${r.judge.agreement.j2.main}개·재채점 ${r.judge.agreement.j2.rejudge}개·양쪽 ${r.judge.agreement.j2.both}개(양성 일치 ${fmt(r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge ? (2 * r.judge.agreement.j2.both) / (r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge) : null)}). 부트스트랩 구간은 판정 잡음을 담지 않는다.`,
     `V4 는 두 번의 재생이 이 보고가 읽은 줄 파일과 바이트 단위로 같아야 통과한다(줄 파일 sha256 앞 12자: ${VARIANTS.map((vn) => `${vn} ${r.lineSha[vn].slice(0, 12)}`).join(' · ')}).`,
+    `결속: 이 보고는 재생이 기록한 표본·스냅샷 해시를 다시 계산해 같을 때만 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)} · 판정 ${r.inputs.judgments.slice(0, 12)}). 코드 \`${r.inputs.code.git ? r.inputs.code.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.dirty === false ? '(src·bench·dist 깨끗함)' : ''} · dist ${Object.entries(r.inputs.code.dist).map(([m, h]) => `${m} ${h.slice(0, 12)}`).join(' · ')}.`,
     '',
     ...['train', 'heldout', 'all'].flatMap((split) => [
       `## 변형별 지표 — ${split}`,
@@ -520,7 +540,7 @@ function writeDoc(file, r) {
     '',
     '## C2 저장소 가족 scope',
     '',
-    `영향 프롬프트 ${r.c2.affected}개(두 분할 합침 — 사전 등록 문장 그대로: 가족 술어가 넓어지고 넓어진 경로에 지금 활성인 사실이 있는 cwd 의 프롬프트). 판정2/프롬프트 Δ ${ci(r.c2.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.precisionJ2Delta)}.`,
+    `영향 프롬프트 ${r.c2.affected}개(두 분할 합침 — 사전 등록 문장 "넓어진 경로에 사실이 있는 cwd 의 프롬프트"의 cwd 단위 해석. 원문에 시점이 없어 사실은 지금 활성인 것으로 센다). 판정2/프롬프트 Δ ${ci(r.c2.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.precisionJ2Delta)}.`,
     `사후 해석(판정 규칙 밖 — 계획 Deviations 2, 결정에 쓰지 않음): 그 프롬프트 시점에 보이는 사실로 세면 영향 ${r.c2.asOf.affected}개, 판정2/프롬프트 Δ ${ci(r.c2.asOf.j2Delta)} · 정밀도(=2) Δ ${ci(r.c2.asOf.precisionJ2Delta)} → 같은 규칙이면 \`${r.c2.asOf.decision}\`.`,
     `참고(판정 규칙 밖): family 블록이 v0 와 실제로 다른 프롬프트 ${r.c2.blockDiffers.prompts}개 — cwd ${r.c2.blockDiffers.cwds}곳, 저장소 ${r.c2.blockDiffers.repos}곳(연결 worktree 는 본 저장소로 셈).`,
     `일반화 한계: 영향 프롬프트는 저장소 ${r.c2.byRepo.repos}곳에 걸치지만, 판정 2 이득 ${r.c2.byRepo.totalGain}줄의 저장소별 몫은 [${r.c2.byRepo.gainByRepo.join(', ')}]이다. 이득이 가장 큰 저장소 하나(cwd 루트 ${r.c2.byRepo.largest?.cwdRoots ?? 0}곳 — 본체와 연결 worktree)에 영향 프롬프트 ${r.c2.byRepo.largest?.prompts ?? 0}개, 블록이 달라진 프롬프트 ${r.c2.byRepo.largest?.differs ?? 0}개, 이득 ${r.c2.byRepo.largest?.gain ?? 0}줄이 있다. ${r.c2.byRepo.withoutLargest.measurable ? `그 저장소를 뺀 프롬프트 ${r.c2.byRepo.withoutLargest.n}개의 판정2/프롬프트 Δ ${ci(r.c2.byRepo.withoutLargest)}.` : `그 저장소를 빼면 영향 프롬프트 ${r.c2.byRepo.withoutLargest.n}개(이득 ${r.c2.byRepo.withoutLargest.gain}줄)로 사전 등록 최소 ${THRESHOLDS.C2_min_affected}개에 못 미쳐 판정할 수 없다 — 다른 저장소에서의 효과는 이번 표본으로 말할 수 없다.`} 프롬프트 단위 부트스트랩이라 같은 cwd·저장소끼리의 상관은 반영하지 않는다(구간이 실제보다 좁을 수 있다).`,
@@ -539,7 +559,7 @@ function writeDoc(file, r) {
     '## 한계',
     '',
     '- 판정기는 LLM 이다. 사람 라벨이 아니고, 길이·언어 편향이 있을 수 있다. 대조군(V1·V2)과 재채점(V3)으로만 보정했다.',
-    '- 재생은 세션 원장(이미 보여 준 사실)을 재현하지 않는다. 비활성 전환은 복원하지 못한다(지금 상태로 읽음). 프롬프트 뒤에 문장이 바뀐 사실은 그때의 벡터가 없어 숨긴다 — 통합의 EVOLUTION(개정 행의 사실), CONTRADICTION 병합(개정 행의 새 문장을 지금 가진 다른 사실 — 병합 없이 새 사실 문장을 그대로 쓴 경우까지 숨겨 보수적).',
+    '- 재생은 세션 원장(이미 보여 준 사실)을 재현하지 않는다. 비활성 전환은 복원하지 못한다(지금 상태로 읽음). 프롬프트 뒤에 문장이 바뀐 사실은 숨긴다 — 통합의 재작성은 벡터를 바꾸지 않아 행에는 그때의 벡터와 나중 문장이 짝지어 있고, 판정할 문장이 그때 보인 문장이 아니기 때문이다. 대상: 통합의 EVOLUTION(개정 행의 사실), CONTRADICTION 병합(개정 행의 새 문장을 지금 가진 다른 사실 — 병합 없이 새 사실 문장을 그대로 쓴 경우까지 숨겨 보수적).',
     '- 지워진 cwd 는 worktree 보관 폴더 앞쪽 폴더가 저장소 루트일 때만 그 저장소의 가족으로 푼다. 여러 저장소의 worktree 를 담은 상위 폴더 아래에서 지워진 cwd 는 가족이 없다(완전 일치) — 그런 프롬프트의 가족 효과는 재지 못한다. 루트 아래 지워진 사실 경로는 그 루트의 worktree 보관 폴더(`.claude/worktrees/`·`.auto-issue-worktrees/`) 아래일 때만 가족이다(다른 저장소였을 수 있는 경로는 뺀다).',
     '- 정렬은 ±180초 안의 가장 이른 행을 고르고 여러 행이 맞는 경우를 세지 않는다. 프롬프트 길이 비교는 UTF-16 길이(JS)와 코드포인트 수(SQLite)가 달라 이모지가 든 프롬프트는 빠진다.',
     '- 누출 검사는 정규화(NFC·소문자·공백 접기·마크다운 이스케이프 제거)한 원문 전체에서 20자 간격으로 뽑은 40자 창을 이 문서에서 찾는다 — 59자 이상 그대로 옮긴 인용은 반드시 잡는다. 더 짧은 인용·의역은 잡지 못한다.',

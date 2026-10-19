@@ -133,8 +133,9 @@ export function buildFactIndex(db) {
  * Visibility at a replayed prompt's moment. A fact is visible when it was
  * created no later than the prompt, was not extracted from the prompt's own
  * session (those facts were learned from this very conversation), and was not
- * rewritten after the prompt (its text and vector are the later ones — the
- * earlier vector is not kept, so the fact is hidden rather than replayed with
+ * rewritten after the prompt (consolidation rewrites the text but not the vector, so the row
+ * pairs the earlier vector with the later text — the text judged would not be the one shown then;
+ * the earlier text survives only in fact_revisions.previous_fact — so the fact is hidden rather than replayed with
  * text it did not have yet). A relation is visible when created no later than
  * the prompt. What cannot be restored: facts deactivated since (read as they
  * are now).
@@ -459,16 +460,14 @@ export function parseDecisionsBlock(markdown) {
   return m ? JSON.parse(m[1]) : null;
 }
 
-/** Strings of the private sample that must never appear in a committed file (≥ 12 chars). */
 /** Text as the leak check compares it: NFC, lowercase, markdown escapes dropped, whitespace folded. */
 export const leakFold = (t) => String(t).normalize('NFC').toLowerCase().replace(/\\([\\`*_{}\[\]()#+\-.!|>~])/g, '$1').replace(/\s+/g, ' ').trim();
 
 /**
- * 40-char windows of each private text (folded), from its start and every 40 chars on (up to
- * 400 chars in): a copied prompt or fact shows up wherever the quote starts. Windows shorter
- * than 12 chars are skipped (too common to mean a leak).
+ * Leak probes of the private texts (prompts, judged facts — none may appear in a committed file):
+ * folded 40-char windows every 20 chars over the whole text, so any copied run of 59+ chars holds
+ * one whole. Windows shorter than 12 chars are skipped (too common to mean a leak).
  */
-/** Leak probes: folded 40-char windows every 20 chars over the whole text — any copied run of 59+ chars holds one whole. */
 export function leakProbes(texts) {
   const out = new Set();
   for (const t of texts) {
@@ -489,6 +488,37 @@ export function repoOf(roots, project) {
 /** Variants whose replay-meta hash is not the sha256 of the lines file read now (the meta's lists belong to other bytes). */
 export function unboundMeta(metaHashes, lineSha) {
   return Object.keys(lineSha).filter((v) => metaHashes?.[v] !== lineSha[v]);
+}
+
+/** Replay inputs (sample, snapshot) whose sha256 now differs from what replay-meta recorded — the replay used other bytes. */
+export function driftedInputs(metaInputs, inputs) {
+  return Object.keys(inputs).filter((k) => metaInputs?.[k] !== inputs[k]);
+}
+
+/** Variants missing a row for some sampled prompt (such a prompt would count as 0 lines instead of failing). */
+export function missingRows(qids, lines) {
+  return Object.entries(lines)
+    .map(([variant, m]) => ({ variant, missing: qids.filter((q) => !m.has(q)).length }))
+    .filter((x) => x.missing > 0);
+}
+
+/** One variant of the determinism check: two fresh runs and the lines file the judge reads must all be the same bytes. */
+export function determinismEntry(a, b, used) {
+  return { a, b, lines: used, identical: a === b && a === used };
+}
+
+/** V4: determinism.json passed AND both of its runs equal the lines files this report reads. */
+export function determinismBound(det, lineSha) {
+  return det != null && det.identical === true
+    && Object.keys(lineSha).every((v) => det.variants?.[v]?.a === lineSha[v] && det.variants?.[v]?.b === lineSha[v]);
+}
+
+/** Project-scoped facts the C2 'affected' readings look at — active now (the registered reading counts these). */
+export const PROJECT_FACTS_SQL = "SELECT id, scope_project FROM facts WHERE is_active = 1 AND scope_type = 'project'";
+
+/** The two C2 'affected' readings of one prompt: registered (widened paths hold facts) and post-hoc as-of (one visible then). */
+export function affectedReadings(widenedIds, visibleFactId) {
+  return { registered: widenedIds.length > 0, asOf: widenedIds.some((id) => visibleFactId(id)) };
 }
 
 /** Prompts whose shown id list differs between two variants' lines (`Map qid → [{id}]`). */

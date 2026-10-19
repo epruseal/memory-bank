@@ -199,6 +199,40 @@ describe('selectInjectFacts', () => {
     expect(sib.lines.some((l) => l.fact.id === ids.rootfact), 'a sibling name is not the family').toBe(false);
   }, 30_000);
 
+  it('scope family on the relation path: a family neighbour (either direction) is carried only with scopeFamily on, another repository\'s never', async () => {
+    await add('relseed', 'Container images for this service are built with Buildah on the self-hosted runner');
+    await add('relfam', 'Every published tag is signed off by the release manager before the changelog goes out', { scope: REPO });
+    await add('relfamIn', 'Nightly smoke tests must pass before anyone tags a release candidate',
+      { scope: path.join(REPO, '.auto-issue-worktrees', 'issue-7') });   // a deleted worktree in the repository's container
+    await add('relsib', 'The cloud repository publishes its tags from the office build server', { scope: `${REPO}-cloud` });
+    await add('relother', 'Another project keeps its tags in a separate mirror', { scope: path.join(tmp, 'other-project') });
+    onto.createRelation(db, ids.relseed, 'SUPPORTS', ids.relfam);      // outgoing
+    onto.createRelation(db, ids.relfamIn, 'SUPPORTS', ids.relseed);    // incoming
+    onto.createRelation(db, ids.relseed, 'SUPPORTS', ids.relsib);
+    onto.createRelation(db, ids.relseed, 'SUPPORTS', ids.relother);
+    const related = (scopeFamily: boolean) =>
+      new Set(onto.getRelatedFacts(db, ids.relseed, 1, 0.6, 0.2, PROJECT, { scopeFamily }).map((r) => r.fact.id));
+    const on = related(true);
+    const off = related(false);
+    for (const k of ['relfam', 'relfamIn']) {
+      expect(on.has(ids[k]), `${k} with the family`).toBe(true);
+      expect(off.has(ids[k]), `${k} without it (exact match)`).toBe(false);
+    }
+    for (const k of ['relsib', 'relother']) expect(on.has(ids[k]) || off.has(ids[k]), `${k} never`).toBe(false);
+    // Through the production selection: the seed is a vector hit and carries the family neighbours as relation lines.
+    const { e, baseline } = await queryVec('How are the container images of this service built?');
+    const sOn = sel.selectInjectFacts(db, e, baseline, PROJECT, { relMargin: null, scopeFamily: true });
+    const sOff = sel.selectInjectFacts(db, e, baseline, PROJECT, { relMargin: null, scopeFamily: false });
+    expect(sOn.gated.some((g) => g.fact.id === ids.relseed), 'the seed is a vector hit').toBe(true);
+    for (const k of ['relfam', 'relfamIn']) {
+      expect(sOn.lines.find((l) => l.fact.id === ids[k])?.origin, `${k} arrives as a relation line`).toBe('rel');
+      expect(sOff.lines.some((l) => l.fact.id === ids[k]), `${k} not without the family`).toBe(false);
+    }
+    expect(sOn.lines.some((l) => l.fact.id === ids.relsib || l.fact.id === ids.relother)).toBe(false);
+    const prod = sel.selectInjectFacts(db, e, baseline, PROJECT, sel.PRODUCTION_SELECT_OPTIONS);
+    expect(prod.lines.map((l) => l.fact.id), 'production options take the family relation path').toEqual(sOn.lines.map((l) => l.fact.id));
+  }, 60_000);
+
   it('visibleFactId hides a fact from the KNN and from relation expansion (replay as-of)', async () => {
     const { e, baseline } = await queryVec(QUERY);
     const hidden = new Set([ids.seed]);

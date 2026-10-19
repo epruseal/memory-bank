@@ -19,7 +19,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  VARIANTS, REL_VARIANTS, alignWindow, buildFactIndex, extractIdentifiers, foldSample, kwLines, makeAsOf, searchedLogRows,
+  VARIANTS, REL_VARIANTS, PROJECT_FACTS_SQL, affectedReadings, determinismEntry, alignWindow, buildFactIndex, extractIdentifiers, foldSample, kwLines, makeAsOf, searchedLogRows,
 } from './inject-bench-lib.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -267,7 +267,7 @@ async function replay() {
   // C2 'affected', through the same predicate the selection uses: the family predicate is wider than the
   // exact match and the widened paths hold facts. Registered reading (decides): the prompt's cwd has such
   // facts active now. Post-hoc reading (reported, plan Deviations 2): facts this prompt could see (as-of).
-  const projectFacts = db.prepare("SELECT id, scope_project FROM facts WHERE is_active = 1 AND scope_type = 'project'").all();
+  const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();
   const widenedOf = new Map();
   const widened = (project) => {
     if (!widenedOf.has(project)) {
@@ -278,7 +278,6 @@ async function replay() {
     return widenedOf.get(project);
   };
   const affected = new Set();
-  const isAffectedAsOf = (p, asOf) => widened(p.project).some((id) => asOf.visibleFactId(id));
 
   await initEmbeddings();
   const out = Object.fromEntries(variants.map((v) => [v, []]));
@@ -325,8 +324,9 @@ async function replay() {
       });
       if (v === 'v0' && lines.length === 0) meta.hard.push(p.qid);
     }
-    if (widened(p.project).length > 0) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }
-    if (isAffectedAsOf(p, asOf)) meta.affectedAsOf.push(p.qid);
+    const reading = affectedReadings(widened(p.project), asOf.visibleFactId);
+    if (reading.registered) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }
+    if (reading.asOf) meta.affectedAsOf.push(p.qid);
   }
   db.close();
   const hashes = {};
@@ -335,7 +335,10 @@ async function replay() {
     fs.writeFileSync(path.join(OUT, `lines-${v}${suffix}.jsonl`), body);
     hashes[v] = crypto.createHash('sha256').update(body).digest('hex');
   }
-  if (!suffix) writeJson(path.join(OUT, 'replay-meta.json'), { ...meta, generatedAt: new Date().toISOString(), hashes });
+  // The inputs too: the report refuses lists made from another sample or snapshot.
+  const fileSha = (f) => crypto.createHash('sha256').update(fs.readFileSync(path.join(OUT, f))).digest('hex');
+  const inputs = { sample: fileSha('sample.json'), snapshot: fileSha('snapshot.sqlite') };
+  if (!suffix) writeJson(path.join(OUT, 'replay-meta.json'), { ...meta, generatedAt: new Date().toISOString(), hashes, inputs });
   console.log(JSON.stringify({ prompts: sample.length, variants, hard: meta.hard.length, affected: affected.size, affectedAsOf: meta.affectedAsOf.length, kw: meta.kw, hashes }));
 }
 
@@ -356,7 +359,7 @@ function checkDeterminism() {
     const a = h('.det-a');
     const b = h('.det-b');
     const used = h('');
-    variants[v] = { a, b, lines: used, identical: a === b && a === used };
+    variants[v] = determinismEntry(a, b, used);
   }
   const identical = Object.values(variants).every((x) => x.identical);
   writeJson(path.join(OUT, 'determinism.json'), { generatedAt: new Date().toISOString(), identical, variants });

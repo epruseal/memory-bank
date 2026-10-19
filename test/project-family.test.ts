@@ -25,6 +25,7 @@ function makeRepo(dir: string) {
 function linkWorktree(worktreeTop: string, repo: string, name: string, backRef = path.join(worktreeTop, '.git')) {
   const admin = path.join(repo, '.git', 'worktrees', name);
   fs.mkdirSync(admin, { recursive: true });
+  fs.writeFileSync(path.join(admin, 'HEAD'), 'ref: refs/heads/wt\n');
   fs.mkdirSync(worktreeTop, { recursive: true });
   fs.writeFileSync(path.join(worktreeTop, '.git'), `gitdir: ${admin}\n`);
   fs.writeFileSync(path.join(admin, 'gitdir'), `${backRef}\n`);
@@ -79,9 +80,43 @@ describe('resolveRepoRoots', () => {
     expect(resolveRepoRoots(G)).toEqual([]);
     const H = path.join(tmp, 'proj', 'submodule-like');
     fs.mkdirSync(path.join(R, '.git', 'modules', 'h'), { recursive: true });
+    fs.writeFileSync(path.join(R, '.git', 'modules', 'h', 'HEAD'), 'ref: refs/heads/main\n');
     fs.mkdirSync(H, { recursive: true });
     fs.writeFileSync(path.join(H, '.git'), `gitdir: ${path.join(R, '.git', 'modules', 'h')}\n`);
     expect(resolveRepoRoots(H), 'a submodule is its own root, not linked to R').toEqual([H]);
+  });
+
+  it('a .git file naming a folder that is no git dir (no HEAD) — `gitdir: .` included — is no repository', () => {
+    const U = path.join(tmp, 'umbrella-gitdir-dot');
+    for (const p of ['P1', 'P2']) fs.mkdirSync(path.join(U, p), { recursive: true });
+    fs.writeFileSync(path.join(U, '.git'), 'gitdir: .\n');
+    expect(resolveRepoRoots(path.join(U, 'P1'))).toEqual([]);
+    expect(scopeMatcher(path.join(U, 'P1'), true)(path.join(U, 'P2')), 'two unrelated projects stay apart').toBe(false);
+    const V = path.join(tmp, 'gitdir-plain');
+    fs.mkdirSync(path.join(V, 'p'), { recursive: true });
+    fs.mkdirSync(path.join(tmp, 'plain-admin'), { recursive: true });
+    fs.writeFileSync(path.join(V, '.git'), `gitdir: ${path.join(tmp, 'plain-admin')}\n`);
+    expect(resolveRepoRoots(path.join(V, 'p'))).toEqual([]);
+    fs.writeFileSync(path.join(tmp, 'plain-admin', 'HEAD'), 'ref: refs/heads/main\n');
+    clearRepoRootCache();
+    expect(resolveRepoRoots(path.join(V, 'p')), 'positive control: with HEAD it is a git dir').toEqual([V]);
+  });
+
+  it('a cwd whose last component is a symbolic link has no family (left out, never pulled in)', () => {
+    const link = path.join(tmp, 'link-to-docs');
+    fs.symlinkSync(path.join(R, 'docs'), link);
+    expect(resolveRepoRoots(link)).toEqual([]);
+  });
+
+  it('the root cache is bounded: past 256 entries it starts over, so an old answer is recomputed', () => {
+    const first = path.join(tmp, 'bounded-first');
+    fs.mkdirSync(first, { recursive: true });
+    vi.spyOn(Date, 'now').mockReturnValue(5_000_000);
+    expect(resolveRepoRoots(first)).toEqual([]);
+    makeRepo(first);
+    expect(resolveRepoRoots(first), 'cached').toEqual([]);
+    for (let i = 0; i < 256; i++) resolveRepoRoots(path.join(tmp, 'bounded-other', String(i)));
+    expect(resolveRepoRoots(first), 'the cache was cleared at the bound').toEqual([first]);
   });
 
   it('a .git that is not a repository — garbage file, empty folder, symlink — means no family', () => {
@@ -188,6 +223,7 @@ describe('scopeMatcher', () => {
     const N = path.join(R, 'vendor', 'lib');
     makeRepo(N);
     fs.mkdirSync(path.join(R, '.git', 'modules', 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(R, '.git', 'modules', 'sub', 'HEAD'), 'ref: refs/heads/main\n');
     fs.mkdirSync(path.join(R, 'sub'), { recursive: true });
     fs.writeFileSync(path.join(R, 'sub', '.git'), `gitdir: ${path.join(R, '.git', 'modules', 'sub')}\n`);
     const m = scopeMatcher(path.join(R, 'docs'), true);
@@ -214,6 +250,8 @@ describe('scopeMatcher', () => {
     fs.rmSync(clone, { recursive: true, force: true });
     expect(scopeMatcher(path.join(R, 'docs'), true)(clone), 'deleted, it is still left out').toBe(false);
     expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(R, 'tmp')), 'positive control: the folder that remains').toBe(true);
+    // A container below a sub-folder (a deleted nested repository's worktree) is not the root's container.
+    expect(scopeMatcher(path.join(R, 'docs'), true)(path.join(R, 'tmp', 'gone-clone', '.claude', 'worktrees', 'w')), 'not the root\'s own container').toBe(false);
   });
 
   it('a path with . or .. segments matches only exactly', () => {

@@ -19,12 +19,14 @@ import path from 'path';
  *
  * Resolved from the filesystem only (no `git` process — the injection hook has
  * a hard time budget). A root is a real repository: a `.git` directory holding
- * HEAD, or a `.git` file naming an existing git dir; anything else named
+ * HEAD, or a `.git` file naming an existing git dir (a folder holding HEAD); anything else named
  * `.git` (garbage, an empty folder, a symlink) means no family. A root is never
  * a home directory ($HOME or the account's own — HOME can be overridden), an
  * ancestor of one, or '/': a home directory that is itself a git work tree
  * would otherwise make every non-repo folder under it one family with every
- * project. Relative paths (slug-form projects) have no family.
+ * project. Relative paths (slug-form projects) have no family, and neither has
+ * a cwd whose last component is a symbolic link (read as a path that no longer
+ * exists — facts are left out, never pulled in).
  */
 const WORKTREE_CONTAINERS = ['/.auto-issue-worktrees/', '/.claude/worktrees/'];
 const CACHE_LIMIT = 256;
@@ -114,7 +116,8 @@ function dotGitOf(dir) {
     if (!m)
         return { kind: 'invalid' };
     const adminDir = path.resolve(dir, m[1]);
-    if (!isDir(adminDir))
+    // A git dir holds a HEAD file (git's own test) — `gitdir: .` or any other plain folder is not one.
+    if (!isDir(adminDir) || lstat(path.join(adminDir, 'HEAD'))?.isFile() !== true)
         return { kind: 'invalid' };
     return { kind: 'linked', main: mainRootOf(dir, adminDir) };
 }

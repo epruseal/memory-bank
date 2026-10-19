@@ -52084,7 +52084,7 @@ function dotGitOf(dir) {
   const m2 = /^gitdir:\s*(.+?)\s*$/m.exec(content);
   if (!m2) return { kind: "invalid" };
   const adminDir = path3.resolve(dir, m2[1]);
-  if (!isDir(adminDir)) return { kind: "invalid" };
+  if (!isDir(adminDir) || lstat(path3.join(adminDir, "HEAD"))?.isFile() !== true) return { kind: "invalid" };
   return { kind: "linked", main: mainRootOf(dir, adminDir) };
 }
 function resolveUncached(cwd) {

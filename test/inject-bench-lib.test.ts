@@ -9,7 +9,7 @@ import {
   THRESHOLDS, alignWindow, bootstrapDelta, decide, decideC2, decideC3, decisionsBlock, extractIdentifiers, foldSample,
   isBypassFact, kwLines, leakProbes, lostJ2Rel, makeAsOf, meanDelta, parseDecisionsBlock, perPromptCounts, aggregate,
   ratioDelta, searchedLogRows, splitOf, toEpoch, validateJudgeReply, validity, labelItems, leakFold, blockDiffers,
-  buildFactIndex, repoOf, unboundMeta,
+  buildFactIndex, repoOf, unboundMeta, driftedInputs, missingRows, determinismEntry, determinismBound, affectedReadings, PROJECT_FACTS_SQL,
 } from '../bench/inject-bench-lib.mjs';
 
 /**
@@ -70,7 +70,7 @@ describe('as-of', () => {
     factRevised: new Map<string, number>(),
   };
   const asOf = makeAsOf(index, { ts: '2026-10-01T00:00:00Z', sessionId: 's1' });
-  it('hides a fact rewritten after the prompt (its text and vector are the later ones); an earlier rewrite is fine', () => {
+  it('hides a fact rewritten after the prompt (its text is the later one; the vector is not); an earlier rewrite is fine', () => {
     const idx = {
       ...index,
       factCreated: new Map([...index.factCreated, ['evolved', toEpoch('2026-09-01T00:00:00Z')], ['settled', toEpoch('2026-09-01T00:00:00Z')]]),
@@ -99,6 +99,7 @@ describe('as-of', () => {
     fact.run('later', 'deploy target is vercel, merged', '2026-10-10T00:00:00Z');
     fact.run('evolved', 'cache ttl is 60s', '2026-09-01T00:00:00Z');
     fact.run('other', 'unrelated sentence', '2026-09-01T00:00:00Z');
+    fact.run('sameInstant', 'deploy target is vercel, merged', '2026-10-05T00:00:00Z');   // existed at the revision's instant
     const rev = db.prepare('INSERT INTO fact_revisions VALUES (?, ?, ?)');
     rev.run('old', 'deploy target is vercel, merged', '2026-10-05T00:00:00Z');
     rev.run('evolved', 'cache ttl is 60s', '2026-10-06T00:00:00Z');
@@ -109,6 +110,7 @@ describe('as-of', () => {
     expect(idx.factRevised.has('later'), 'created after the revision — its text is its own').toBe(false);
     expect(idx.factRevised.get('evolved')).toBe(toEpoch('2026-10-06T00:00:00Z'));
     expect(idx.factRevised.has('other')).toBe(false);
+    expect(idx.factRevised.get('sameInstant'), 'created at the revision instant counts as existing then').toBe(toEpoch('2026-10-05T00:00:00Z'));
     expect(makeAsOf(idx, { ts: '2026-10-01T00:00:00Z', sessionId: 's9' }).visibleFactId('new')).toBe(false);
     expect(makeAsOf(idx, { ts: '2026-10-07T00:00:00Z', sessionId: 's9' }).visibleFactId('new')).toBe(true);
   });
@@ -287,7 +289,28 @@ describe('decision', () => {
     expect(judge).toContain('const affected = usable(meta.affectedRegistered);\n  const c2stats = c2For(affected);');
     expect(judge).toContain('const c2 = decideC2(c2stats);');
     expect(judge, 'grouped by repository, not by worktree').toContain('const repoOfQ = (q) => repoOf(resolveRepoRoots(projectOf.get(q)), projectOf.get(q));');
-    expect(replay).toContain('if (widened(p.project).length > 0) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
+    expect(replay).toContain('const reading = affectedReadings(widened(p.project), asOf.visibleFactId);');
+    expect(replay).toContain('if (reading.registered) { affected.add(p.qid); meta.affectedRegistered.push(p.qid); }');
+    expect(replay).toContain('const projectFacts = db.prepare(PROJECT_FACTS_SQL).all();');
+    expect(replay).toContain('variants[v] = determinismEntry(a, b, used);');
+    expect(judge).toContain('const deterministic = determinismBound(det, lineSha);');
+  });
+  it('affected readings, determinism entries and input binding (shared by replay and report)', () => {
+    expect(PROJECT_FACTS_SQL, 'the registered reading counts facts active now').toMatch(/WHERE is_active = 1 AND scope_type = 'project'$/);
+    expect(affectedReadings([], () => true)).toEqual({ registered: false, asOf: false });
+    expect(affectedReadings(['a', 'b'], () => false)).toEqual({ registered: true, asOf: false });
+    expect(affectedReadings(['a', 'b'], (id) => id === 'b')).toEqual({ registered: true, asOf: true });
+    expect(determinismEntry('x', 'x', 'x').identical).toBe(true);
+    expect(determinismEntry('x', 'x', 'y').identical, 'two runs agree with each other but not with the judged file').toBe(false);
+    expect(determinismEntry('x', 'y', 'x').identical).toBe(false);
+    const det = { identical: true, variants: { v0: { a: 'h0', b: 'h0' }, kw: { a: 'h1', b: 'h1' } } };
+    expect(determinismBound(det, { v0: 'h0', kw: 'h1' })).toBe(true);
+    expect(determinismBound(det, { v0: 'h0', kw: 'h2' })).toBe(false);
+    expect(determinismBound({ ...det, identical: false }, { v0: 'h0', kw: 'h1' })).toBe(false);
+    expect(determinismBound(null, { v0: 'h0' })).toBe(false);
+    expect(driftedInputs({ sample: 'a', snapshot: 'b' }, { sample: 'a', snapshot: 'c' })).toEqual(['snapshot']);
+    expect(driftedInputs(undefined, { sample: 'a' })).toEqual(['sample']);
+    expect(missingRows(['q1', 'q2'], { v0: new Map([['q1', []], ['q2', []]]), kw: new Map([['q1', []]]) })).toEqual([{ variant: 'kw', missing: 1 }]);
   });
   it('repoOf groups a linked worktree with its repository; unboundMeta names variants whose meta hash differs', () => {
     expect(repoOf(['/r/.wt/a', '/r'], '/r/.wt/a/src')).toBe('/r');
