@@ -27,21 +27,24 @@ import path from 'path';
  * would otherwise make every non-repo folder under it one family with every
  * project. Relative paths have no family here (callers resolve a slug-form
  * project to a path first — canonicalizeProject — and use that path's family),
- * and neither has a cwd that is a symbolic link or a file, or that reaches its
- * repository through a symbolic link — the root itself included (a link can
- * point into another repository, and a link's target can change under the same
- * path). A path that cannot be read (EACCES, EIO) counts as no family / outside
+ * and neither has a cwd that is a symbolic link or a file, or that has a
+ * symbolic link between it and its repository root — the root itself included (a
+ * link can point into another repository, and a link's target can change under
+ * the same path). Links above the root are not looked at: the scope is a path,
+ * as the exact-path project scope always was. A path that cannot be read (EACCES, EIO) counts as no family / outside
  * it, never as absent. A path that no longer exists has no family and is never
  * in one: nothing on disk tells which repository it was (a deleted worktree, a
  * deleted clone, another repository's layer in a container all look the same),
  * so facts learned in a since-deleted worktree are not seen by its repository.
- * Inside a worktree container only the family's linked worktrees count (a plain
- * folder there may hold another repository's worktrees). The worktrees of a
+ * Inside a worktree container only the family's linked worktrees count, for a cwd
+ * and a fact path alike (a plain folder there may hold another repository's
+ * worktrees); the container is the one of the repository or worktree the path
+ * is in, its name compared case-folded on macOS and Windows. The worktrees of a
  * bare repository (`<dir>/.bare/worktrees/…`) are not grouped: each one is its
  * own family.
  */
 
-/** Worktree containers of a repository root (`<root>/.claude/worktrees/<name>`) — the one list; the bench reads it too. */
+/** Worktree containers of a repository root (`<root>/.claude/worktrees/<name>`) — the one list. */
 export const WORKTREE_CONTAINERS = Object.freeze(['/.auto-issue-worktrees/', '/.claude/worktrees/']);
 const CACHE_LIMIT = 256;
 /** A daemon outlives a folder: the same path can become another repository (or none). */
@@ -159,8 +162,10 @@ function resolveUncached(cwd: string): string[] {
     const g = dotGitOf(dir);
     if (g.kind !== 'none') {
       if (g.kind === 'invalid' || tooBroad(dir)) return [];
-      if (g.kind === 'root') return [dir];
-      return g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
+      const roots = g.kind === 'root' ? [dir] : g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
+      // The way down to the cwd passes the same test as a fact path: a plain folder in a worktree container
+      // (another repository's layer, `ORG-REPO/…`) must not borrow the container's repository.
+      return dir !== start && excludedUnderRoot(dir, start, roots) ? [] : roots;
     }
     if (dir === path.dirname(dir)) return [];
   }
@@ -197,6 +202,7 @@ export function clearRepoRootCache(): void {
  */
 function excludedUnderRoot(root: string, scopeProject: string, roots: string[]): boolean {
   let dir = root;
+  let top = root;   // the repository or family worktree the walk is in: its containers are the ones that count
   for (const seg of scopeProject.slice(root.length + 1).split('/')) {
     if (!seg) continue;
     const parent = dir;
@@ -205,11 +211,17 @@ function excludedUnderRoot(root: string, scopeProject: string, roots: string[]):
     if (st === null || st === UNREADABLE || st.isSymbolicLink()) return true;
     const g = dotGitOf(dir);
     const familyWorktree = g.kind === 'linked' && g.main !== null && roots.includes(g.main);
-    if (WORKTREE_CONTAINERS.some((c) => parent + '/' === root + c) && !familyWorktree) return true;
-    if (g.kind === 'none' || familyWorktree) continue;
+    if (inWorktreeContainer(parent, top) && !familyWorktree) return true;
+    if (familyWorktree) { top = dir; continue; }
+    if (g.kind === 'none') continue;
     return true;
   }
   return false;
+}
+
+/** Whether `parent` is one of `top`'s worktree containers (case folded where names are: '.Claude/Worktrees' is the same folder). */
+function inWorktreeContainer(parent: string, top: string): boolean {
+  return WORKTREE_CONTAINERS.some((c) => fold(parent + '/') === fold(top + c));
 }
 
 /**

@@ -11,7 +11,7 @@ import {
   ratioDelta, searchedLogRows, splitOf, toEpoch, validateJudgeReply, validity, labelItems, leakFold, blockDiffers,
   buildFactIndex, repoOf, unboundMeta, driftedInputs, missingRows, determinismEntry, determinismBound, affectedReadings, PROJECT_FACTS_SQL,
   placementOf, widenedFactIds, sqliteDigest, driftedCode, codeDigest, REPLAY_ENTRY, moduleClosure, embeddingModelFiles,
-  gitState, replayBinding, bindingDrift, recordRoots, JUDGE_SYSTEM, JUDGE_RETRY_MARK, judgeMessage, judgeUserMessage,
+  gitState, replayBinding, bindingDrift, recordRoots, JUDGE_SYSTEM, JUDGE_RETRY_MARK, judgeRetryUser, isRetryMessage, judgeMessage, judgeUserMessage,
   judgeMessageSha, firstAttemptSha, indexCalls, replyGivesRowScores, judgeSeedCandidates, legacyBinding, dependencyDigest,
 } from '../bench/inject-bench-lib.mjs';
 import { execFileSync } from 'child_process';
@@ -301,7 +301,9 @@ describe('decision', () => {
     expect(replay, 'and checked again at the end').toContain('const drift = bindingDrift(bound, replayBinding(REPO, OUT, EMBEDDING_MODEL));\n  if (drift.length) fail(');
     expect(replay).toContain('const { inputs, code } = bound;');
     expect(judge, 'the report compares the whole code digest but the Node version').toContain('const codeChanged = driftedCode(withoutNode(meta.code?.files), withoutNode(codeDigest(REPO, EMBEDDING_MODEL)));');
-    expect(judge, 'every scored judgment row is bound').toContain('if (judgeMessageSha(promptOf.get(j.qid), j.items, b.seed, textOf) !== b.message) { binding.drifted++; continue; }');
+    expect(judge, 'every scored judgment row is bound').toContain("if ((j.bound && (b.seed !== j.bound.seed || b.message !== j.bound.message)) || rebuilt(j, b.seed) !== b.message) { binding.drifted++; continue; }");
+    expect(judge, 'and every binding count in the stop list stops the report').toContain("const BINDING_STOPS = ['unbound', 'drifted', 'noReply', 'noCall', 'badItems', 'callReused', 'transcriptMismatch', 'unaccountedCalls', 'malformedRows', 'failedUnbound', 'evidenceDrift'];");
+    expect(judge).toContain('if (BINDING_STOPS.some((k) => binding[k])) {');
     expect(judge, 'the judge records what it sends with the function the report checks with').toContain('const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };');
     expect(judge, 'a judged row keeps the reply it got').toContain('if (v.ok) return { ...v, retried: attempt > 0, reply: text };');
     expect(judge).toContain('retried: reply.retried, reply: reply.reply,');
@@ -334,10 +336,9 @@ describe('decision', () => {
     expect(placementOf('/r/docs', ['/r'])).toBe('repo-folder');
     expect(placementOf('/r', ['/r'])).toBe('repo-folder');
     expect(placementOf('/r/.claude/worktrees/w', ['/r/.claude/worktrees/w', '/r'])).toBe('worktree-inside');
-    expect(placementOf('/r/.auto-issue-worktrees/gone/src', ['/r']), 'a deleted worktree inside the repository').toBe('worktree-inside');
+    expect(placementOf('/r/.claude/worktrees', ['/r']), 'one root: the repository folder (a plain folder in a container has no family)').toBe('repo-folder');
     expect(placementOf('/u/.auto-issue-worktrees/ORG-r/issue-1', ['/u/.auto-issue-worktrees/ORG-r/issue-1', '/r'])).toBe('worktree-outside');
     expect(placementOf('/r-x', ['/r-x', '/r']), 'a sibling whose name extends the repository is outside it').toBe('worktree-outside');
-    expect(placementOf('/r-x/.claude/worktrees/w', ['/r']), 'the container must be the repository\'s own').toBe('repo-folder');
     expect(placementOf('/x', [])).toBe('no-family');
     const facts = [{ id: 'a', scope_project: '/r' }, { id: 'b', scope_project: '/r/docs' }, { id: 'c', scope_project: '/other' }];
     const inFamily = (s: string | null) => s === '/r' || (s ?? '').startsWith('/r/');
@@ -530,9 +531,19 @@ describe('decision', () => {
     // what the judge received: the first attempt, or a retry (first message + a note)
     const sent = judgeMessage(prompt, labeled);
     expect(firstAttemptSha(sent)).toBe(m0);
-    expect(firstAttemptSha(`${sent}${JUDGE_RETRY_MARK}missing id f2). Answer again`)).toBe(m0);
+    expect(firstAttemptSha(judgeRetryUser(sent, 'missing id f2'))).toBe(m0);
+    expect(isRetryMessage(judgeRetryUser(sent, 'missing id f2'))).toBe(true);
+    expect(isRetryMessage(sent)).toBe(false);
+    // a prompt that quotes the retry note is not cut there: only the note a retry appends at the end is
+    const quoting = { ...prompt, query: `why did it say${JUDGE_RETRY_MARK}missing id f2)?` };
+    const quotingMsg = judgeMessage(quoting, labeled);
+    expect(firstAttemptSha(quotingMsg), 'a first attempt quoting the note').toBe(sha(quotingMsg));
+    expect(isRetryMessage(quotingMsg)).toBe(false);
+    expect(firstAttemptSha(judgeRetryUser(quotingMsg, 'bad json')), 'its retry').toBe(sha(quotingMsg));
+    expect(firstAttemptSha(`${sent}${JUDGE_RETRY_MARK}missing id f2). Answer again`), 'a note without the full tail is no retry').not.toBe(m0);
     expect(judgeSeedCandidates({ qid: 'q', pass: 'rejudge' }, 9)).toEqual(['q:rejudge']);
     expect(judgeSeedCandidates({ qid: 'q', pass: 'main' }, 2)).toEqual(['q:main:0', 'q:main:1', 'q:main:2']);
+    expect(judgeSeedCandidates({ qid: 'q', pass: 'main', bound: { seed: 'q:main:7' } }, 2), 'the seed a row recorded when judged').toEqual(['q:main:7']);
     // a legacy row binds to a call whose message is the row's AND whose reply gives the row's scores, from the row's model
     const later = labelItems(items.map((it) => ({ ...it, text: textOf(it.factId) })), 'q:main:2');
     const scores = { a: 2, b: 0, c: 1 };
@@ -549,7 +560,7 @@ describe('decision', () => {
     expect(legacyBinding(row, prompt, (id) => (id === 'a' ? '[decision] Liquibase' : textOf(id)), calls, 5, parse), 'the text judged differs').toBeNull();
     expect(legacyBinding({ ...row, model: 'm2' }, prompt, textOf, calls, 5, parse), 'another model answered').toBeNull();
     expect(legacyBinding({ ...row, scores: { ...scores, c: 2 } }, prompt, textOf, calls, 5, parse), 'the row holds other scores').toBeNull();
-    const retry = { ...call, message: `${call.message}${JUDGE_RETRY_MARK}missing id f1). Answer again` };
+    const retry = { ...call, message: judgeRetryUser(call.message, 'missing id f1') };
     const failedFirst = { ...call, reply: 'not json' };
     expect(legacyBinding(row, prompt, textOf, indexCalls([failedFirst, retry]), 5, parse)?.call, 'the retry that answered, not the first attempt').toBe(retry);
     expect(legacyBinding(row, prompt, textOf, indexCalls([retry, failedFirst]), 5, parse)?.call, 'in either order').toBe(retry);

@@ -52110,8 +52110,8 @@ function resolveUncached(cwd) {
     const g = dotGitOf(dir);
     if (g.kind !== "none") {
       if (g.kind === "invalid" || tooBroad(dir)) return [];
-      if (g.kind === "root") return [dir];
-      return g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
+      const roots = g.kind === "root" ? [dir] : g.main && !tooBroad(g.main) && g.main !== dir ? [dir, g.main] : [dir];
+      return dir !== start && excludedUnderRoot(dir, start, roots) ? [] : roots;
     }
     if (dir === path3.dirname(dir)) return [];
   }
@@ -52127,6 +52127,7 @@ function resolveRepoRoots(cwd) {
 }
 function excludedUnderRoot(root, scopeProject, roots) {
   let dir = root;
+  let top = root;
   for (const seg of scopeProject.slice(root.length + 1).split("/")) {
     if (!seg) continue;
     const parent = dir;
@@ -52135,11 +52136,18 @@ function excludedUnderRoot(root, scopeProject, roots) {
     if (st === null || st === UNREADABLE || st.isSymbolicLink()) return true;
     const g = dotGitOf(dir);
     const familyWorktree = g.kind === "linked" && g.main !== null && roots.includes(g.main);
-    if (WORKTREE_CONTAINERS.some((c) => parent + "/" === root + c) && !familyWorktree) return true;
-    if (g.kind === "none" || familyWorktree) continue;
+    if (inWorktreeContainer(parent, top) && !familyWorktree) return true;
+    if (familyWorktree) {
+      top = dir;
+      continue;
+    }
+    if (g.kind === "none") continue;
     return true;
   }
   return false;
+}
+function inWorktreeContainer(parent, top) {
+  return WORKTREE_CONTAINERS.some((c) => fold(parent + "/") === fold(top + c));
 }
 function scopeMatcher(project, family) {
   if (!project) return () => true;

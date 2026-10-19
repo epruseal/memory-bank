@@ -85,6 +85,32 @@ describe('resolveRepoRoots', () => {
     expect(m(path.join(layer, 'issue-2')), 'the other repository\'s worktree in it').toBe(false);
     expect(m(own), 'positive control: the family\'s worktree').toBe(true);
     expect(m(path.join(T, '.auto-issue-worktrees')), 'the container itself is a plain folder of T').toBe(true);
+    // the container's name in another case is the same folder where names fold (and no folder where they do not)
+    expect(m(path.join(T, '.Auto-Issue-Worktrees', 'ORG-other')), 'the layer folder named in another case').toBe(false);
+    // a cwd passes the same test on its way down from the root: a session opened in the layer borrows nothing
+    fs.mkdirSync(path.join(layer, 'notes'), { recursive: true });
+    expect(resolveRepoRoots(layer), 'a cwd that is the layer folder').toEqual([]);
+    expect(resolveRepoRoots(path.join(layer, 'notes')), 'a cwd below it').toEqual([]);
+    expect(scopeMatcher(layer, true)(T), 'so T\'s facts stay out of a session there').toBe(false);
+    expect(resolveRepoRoots(path.join(T, '.auto-issue-worktrees')), 'positive control: the container folder itself is T\'s').toEqual([T]);
+    expect(resolveRepoRoots(own), 'positive control: the family worktree').toEqual([own, T]);
+  });
+
+  it('a linked worktree\'s own containers count from that worktree: a plain folder in one is out, for a fact and a cwd', () => {
+    const Q = path.join(tmp, 'nested-container');
+    makeRepo(Q);
+    const wt = path.join(Q, '.claude', 'worktrees', 'wt');
+    linkWorktree(wt, Q, 'wt');
+    const plain = path.join(wt, '.claude', 'worktrees', 'plain');
+    fs.mkdirSync(path.join(plain, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(wt, 'docs'), { recursive: true });
+    const m = scopeMatcher(wt, true);
+    expect(m(plain), 'walked from the main root the container is the worktree\'s, not the root\'s').toBe(false);
+    expect(m(path.join(plain, 'src'))).toBe(false);
+    expect(scopeMatcher(Q, true)(plain), 'from the repository too').toBe(false);
+    expect(m(path.join(wt, 'docs')), 'positive control: a plain folder of the worktree').toBe(true);
+    expect(resolveRepoRoots(path.join(plain, 'src')), 'a cwd in that plain folder').toEqual([]);
+    expect(resolveRepoRoots(path.join(wt, 'docs')), 'positive control: a cwd in the worktree').toEqual([wt, Q]);
   });
 
   it('outside any repository there is no family', () => {

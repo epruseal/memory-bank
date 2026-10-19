@@ -10,7 +10,6 @@ import fs from 'node:fs';
 import { builtinModules } from 'node:module';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { WORKTREE_CONTAINERS } from '../dist/project-family.js';
 
 export const VARIANTS = ['v0', 'rel020', 'rel030', 'rel045', 'family', 'kw'];
 export const REL_VARIANTS = { rel020: 0.02, rel030: 0.03, rel045: 0.045 };
@@ -281,13 +280,33 @@ export function judgeMessageSha(prompt, items, seed, textOf) {
   return sha256(judgeMessage(prompt, labelItems(items.map((it) => ({ ...it, text: textOf(it.factId) })), seed)));
 }
 
-/** What a retry appends to the first message (inject-judge.mjs judgeCall). */
+/** What a retry appends to the first message (judgeRetryUser): this, the reason, then JUDGE_RETRY_TAIL. */
 export const JUDGE_RETRY_MARK = '\n\nYour previous answer was invalid (';
+const JUDGE_RETRY_TAIL = '). Answer again with only the JSON array, every id exactly once.';
 
-/** sha256 of the first attempt of a recorded judge message — a retry is the first message plus a note. */
+/** The user message of a retry (inject-judge.mjs judgeCall): the first one plus a note naming what was invalid. */
+export function judgeRetryUser(user, reason) {
+  return `${user}${JUDGE_RETRY_MARK}${reason}${JUDGE_RETRY_TAIL}`;
+}
+
+/**
+ * The first attempt of a recorded judge message: a retry ends with the note judgeRetryUser appends (cut at
+ * its last mark); any other message is its own first attempt — a prompt or fact quoting the note's words is not cut.
+ */
+function firstAttemptOf(message) {
+  if (!message.endsWith(JUDGE_RETRY_TAIL)) return message;
+  const i = message.lastIndexOf(JUDGE_RETRY_MARK);
+  return i > -1 && !message.slice(i + JUDGE_RETRY_MARK.length).includes('\n') ? message.slice(0, i) : message;
+}
+
+/** Whether a recorded judge message is a retry (the first message plus judgeRetryUser's note). */
+export function isRetryMessage(message) {
+  return firstAttemptOf(message) !== message;
+}
+
+/** sha256 of the first attempt of a recorded judge message. */
 export function firstAttemptSha(message) {
-  const i = message.indexOf(JUDGE_RETRY_MARK);
-  return sha256(i > -1 ? message.slice(0, i) : message);
+  return sha256(firstAttemptOf(message));
 }
 
 /** Recorded calls ({message, reply, model, …}) by the sha256 of their first attempt. */
@@ -300,8 +319,12 @@ export function indexCalls(calls) {
   return out;
 }
 
-/** Seeds a judgment row can have been labelled with: the re-judge seed, or the main seed at any item count up to `maxItems`. */
+/**
+ * Seeds a judgment row can have been labelled with: the seed it recorded when judged (`bound`), else the
+ * re-judge seed, or the main seed at any item count up to `maxItems`.
+ */
 export function judgeSeedCandidates(row, maxItems) {
+  if (typeof row.bound?.seed === 'string') return [row.bound.seed];
   return row.pass === 'rejudge' ? [`${row.qid}:rejudge`] : Array.from({ length: maxItems + 1 }, (_, k) => `${row.qid}:main:${k}`);
 }
 
@@ -313,7 +336,7 @@ export function replyGivesRowScores(row, seed, reply, textOf, parse) {
 }
 
 /**
- * The judge call behind a judgment row written before rows carried a binding: a recorded call
+ * The judge call behind a judgment row: a recorded call
  * (`callsByFirst`: indexCalls) whose first attempt equals the row's message rebuilt from the current texts
  * with some candidate seed, answered by the row's model with exactly the row's scores — { seed, message, call }
  * or null; a call whose `file` is in `used` already answers another row. A message alone only shows that it
@@ -746,15 +769,15 @@ export function sqliteDigest(file) {
 }
 
 /**
- * Where a prompt's cwd sits in its repository, from the family roots recorded at replay time:
- * the repository folder itself or a sub-folder, a worktree inside the repository folder (live or
- * deleted, under a worktree container), or a linked worktree placed outside it.
+ * Where a prompt's cwd sits in its repository, from the family roots recorded at replay time: one root
+ * is the repository folder itself or a sub-folder (a plain folder in a worktree container has no family);
+ * two are a linked worktree, inside the repository folder or placed outside it.
  */
-export function placementOf(project, roots) {
+export function placementOf(_project, roots) {
   if (!roots.length) return 'no-family';
   const repo = roots[roots.length - 1];
   if (roots.length > 1) return roots[0].startsWith(repo + '/') ? 'worktree-inside' : 'worktree-outside';
-  return WORKTREE_CONTAINERS.some((c) => project.startsWith(repo + c)) ? 'worktree-inside' : 'repo-folder';
+  return 'repo-folder';
 }
 
 /** Ids of the project facts the family adds for `project`: in the family, not the exact path (none without roots). */

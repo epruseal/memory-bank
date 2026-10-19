@@ -88,14 +88,38 @@ const replyFor = (items: Array<{ factId: string; kind: string }>, scores: Record
 /** A judgment row as the judge writes it: binding and the reply it got. */
 const judgedRow = (i: number, pass: string, items: Array<{ factId: string; kind: string }>, scores: Record<string, number>, seed: string) =>
   ({ qid: `q${i}`, pass, model: 'test-model', scores, items, bound: bound(i, items, seed), reply: replyFor(items, scores, seed) });
-const NO_DRIFT = { unbound: 0, drifted: 0, noReply: 0, noCall: 0, badItems: 0, callReused: 0, transcriptMismatch: 0, evidenceDrift: false };
+const NO_DRIFT = {
+  unbound: 0, drifted: 0, noReply: 0, noCall: 0, badItems: 0, callReused: 0, transcriptMismatch: 0, unaccountedCalls: 0, malformedRows: 0, failedUnbound: 0, evidenceDrift: false,
+};
+type Item = { factId: string; kind: string };
+/** The isolated LLM sessions' transcript folder of the fixture (one SDK query per file: the message, then the answer). */
+const llmDir = () => path.join(out, 'projects', '-private-tmp-memory-bank-llm');
+function recordCall(name: string, i: number, items: Item[], scores: Record<string, number>, seed: string, model = 'test-model') {
+  const labeled = labelItems(items.map((it) => ({ ...it, text: judged(it.factId) })), seed);
+  const reply = JSON.stringify(labeled.map((it) => ({ id: it.label, score: scores[it.factId] })));
+  fs.mkdirSync(llmDir(), { recursive: true });
+  fs.writeFileSync(path.join(llmDir(), name), [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: judgeMessage(promptOf(i), labeled) } }),
+    JSON.stringify({ type: 'assistant', message: { model, content: [{ type: 'text', text: reply }] } }),
+  ].join('\n') + '\n');
+}
+const lastJson = (r: { stdout: string }) => JSON.parse(r.stdout.trim().split('\n').pop() ?? '{}');
+async function bind() {
+  return run(['--bind-legacy', '--out', out]);
+}
+/** Bind every scored row (the fixture's calls are recorded); a run that leaves a row unbound is a fixture error. */
+async function rebind() {
+  const r = await bind();
+  if (r.status !== 0) throw new Error(`--bind-legacy: ${r.stdout}${r.stderr}`);
+  return r;
+}
 const rewrite = (file: string, n: number, change: (row: Record<string, any>) => Record<string, unknown>) => {
   const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
   lines[n] = JSON.stringify(change(JSON.parse(lines[n])));
   fs.writeFileSync(file, lines.join('\n') + '\n');
 };
 
-function makeFixture() {
+async function makeFixture() {
   out = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-report-'));
   fs.writeFileSync(path.join(out, 'sample.json'), JSON.stringify(qids.map((_, i) => promptOf(i))));
   const db = new Database(path.join(out, 'snapshot.sqlite'));
@@ -114,15 +138,20 @@ function makeFixture() {
     ...(i < 20 ? [{ factId: `g${i}`, kind: 'line' }] : []),
     { factId: `cs${i}`, kind: 'control_same' }, { factId: `co${i}`, kind: 'control_other' },
   ];
-  qids.forEach((qid, i) => rows.push(JSON.stringify(judgedRow(i, 'main', itemsOf(i), scoresOf(i), `${qid}:main:0`))));
+  const asked: Array<[number, string, Item[], Record<string, number>, string]> = qids.map((qid, i) => [i, 'main', itemsOf(i), scoresOf(i), `${qid}:main:0`]);
   // a fill-in row: the main pass re-asked one line of q7 alone (no controls); its score repeats the first one
-  const fill = [{ factId: 'f7', kind: 'line' }];
-  rows.push(JSON.stringify(judgedRow(7, 'main', fill, { f7: 1 }, `q7:main:${itemsOf(7).length}`)));
+  asked.push([7, 'main', [{ factId: 'f7', kind: 'line' }], { f7: 1 }, `q7:main:${itemsOf(7).length}`]);
   // 30 re-judged prompts, same scores (agreement 1.0, ≥ 100 pairs).
-  for (let i = 0; i < 30; i++) rows.push(JSON.stringify(judgedRow(i, 'rejudge', itemsOf(i), scoresOf(i), `q${i}:rejudge`)));
+  for (let i = 0; i < 30; i++) asked.push([i, 'rejudge', itemsOf(i), scoresOf(i), `q${i}:rejudge`]);
+  // every call is recorded (fx-<row>.jsonl) and every row bound to it, as --judge leaves them
+  asked.forEach(([i, pass, items, scores, seed], n) => {
+    rows.push(JSON.stringify(judgedRow(i, pass, items, scores, seed)));
+    recordCall(`fx-${n}.jsonl`, i, items, scores, seed);
+  });
   fs.writeFileSync(path.join(out, 'judgments.jsonl'), rows.join('\n') + '\n');
   writeMeta();
   writeDeterminism();
+  await rebind();
 }
 
 beforeEach(makeFixture);
@@ -148,7 +177,10 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.report.c2.byRepo.largest).toEqual({ prompts: 14, differs: 7, gain: 7, cwdRoots: 1 });
     expect(r.report.c2.byRepo.withoutLargest).toEqual({ measurable: false, n: 26, gain: 13 });
     expect(r.report.c2.blockDiffers).toEqual({ prompts: 20, cwds: 3, repos: 3 });
-    expect(r.report.judge.binding).toEqual({ inline: 251, transcript: 0, retried: 0, transcriptChecked: 0, transcriptGone: 0, staleLines: 0, staleRows: 0, ...NO_DRIFT });
+    expect(r.report.judge.binding).toEqual({
+      inline: 251, transcript: 0, retried: 0, transcriptChecked: 251, transcriptGone: 0, staleLines: 0, staleRows: 0,
+      recordedJudgeCalls: 251, smokeCalls: 0, transcriptsFolder: true, ...NO_DRIFT,
+    });
     expect(r.report.judge.fillRows, 'the q7 row without controls').toBe(1);
     expect(r.report.judge.promptsWithoutControls, 'q7 also has its first row with controls').toBe(0);
     const docText = fs.readFileSync(doc, 'utf8');
@@ -160,49 +192,42 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.report.inputs.code.report.dirty, 'the dirty flag is the working tree\'s').toBe(status !== '');
   });
 
-  it('--bind-legacy binds a row written before rows carried a binding only to a recorded judge call with its message AND its scores; the report checks the kept call again', async () => {
+  it('--bind-legacy binds every scored row to a recorded judge call with its message AND its scores, one call per row; the report checks the kept call again', async () => {
     const file = path.join(out, 'judgments.jsonl');
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    const bindingsFile = path.join(out, 'judgment-bindings.json');
+    // start over: nothing bound yet, rows 0 and 1 written before rows carried their own binding, their calls not found yet
+    fs.rmSync(callsFile);
+    fs.rmSync(bindingsFile);
+    for (const n of [0, 1]) fs.rmSync(path.join(llmDir(), `fx-${n}.jsonl`));
     const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
     const legacy = [0, 1].map((n) => { const row = JSON.parse(lines[n]); lines[n] = JSON.stringify({ ...row, bound: undefined, reply: undefined }); return row; });
     fs.writeFileSync(file, lines.join('\n') + '\n');
-    expect((await report()).stderr, 'no binding anywhere').toMatch(/2 without a binding/);
-    // the isolated LLM sessions' transcripts: one SDK query per file (user message, then the assistant's answer)
-    const projects = path.join(out, 'projects');
-    const llm = path.join(projects, '-private-tmp-memory-bank-llm');
-    fs.mkdirSync(llm, { recursive: true });
-    const record = (name: string, i: number, row: { items: Array<{ factId: string; kind: string }>; scores: Record<string, number>; bound: { seed: string } }, scores = row.scores, model = 'test-model') => {
-      const labeled = labelItems(row.items.map((it) => ({ ...it, text: judged(it.factId) })), row.bound.seed);
-      const reply = JSON.stringify(labeled.map((it) => ({ id: it.label, score: scores[it.factId] })));
-      fs.writeFileSync(path.join(llm, name), [
-        JSON.stringify({ type: 'user', message: { role: 'user', content: judgeMessage(promptOf(i), labeled) } }),
-        JSON.stringify({ type: 'assistant', message: { model, content: [{ type: 'text', text: reply }] } }),
-      ].join('\n') + '\n');
-    };
-    const bind = () => run(['--bind-legacy', '--out', out]);
-    record('row0.jsonl', 0, legacy[0]);
-    record('row1-other-model.jsonl', 1, legacy[1], legacy[1].scores, 'another-model');
-    record('row1-other-scores.jsonl', 1, legacy[1], { ...legacy[1].scores, cs1: 2 });
+    expect((await report()).stderr, 'no binding anywhere').toMatch(/251 without a binding/);
+    const record = (name: string, n: number, scores = legacy[n].scores, model = 'test-model') => recordCall(name, n, legacy[n].items, scores, legacy[n].bound.seed, model);
+    record('row0.jsonl', 0);
+    record('row1-other-model.jsonl', 1, legacy[1].scores, 'another-model');
+    record('row1-other-scores.jsonl', 1, { ...legacy[1].scores, cs1: 2 });
     const first = await bind();
     expect(first.status, 'row 1 has no call with its model and its scores').toBe(1);
-    expect(JSON.parse(first.stdout.trim().split('\n').pop() ?? '{}')).toMatchObject({ matched: 1, unmatchedScored: 1 });
+    expect(lastJson(first)).toMatchObject({ withOwnBinding: 249, matched: 250, unmatchedScored: 1 });
     expect((await report()).stderr).toMatch(/1 without a binding/);
-    record('row1.jsonl', 1, legacy[1]);
+    record('row1.jsonl', 1);
     const second = await bind();
     expect(second.status, second.stderr).toBe(0);
+    expect(lastJson(second)).toMatchObject({ kept: 250, matched: 1, unmatchedScored: 0 });
     const r = await report();
     expect(r.status, r.stderr).toBe(0);
-    expect(r.report.judge.binding).toMatchObject({ inline: 249, transcript: 2, transcriptChecked: 2, transcriptGone: 0, ...NO_DRIFT });
-    expect(r.report.inputs.bindings).toBe(sha(path.join(out, 'judgment-bindings.json')));
-    expect(r.report.inputs.judgeCalls).toBe(sha(path.join(out, 'judge-calls.jsonl')));
-    const callsFile = path.join(out, 'judge-calls.jsonl');
-    const bindingsFile = path.join(out, 'judgment-bindings.json');
+    expect(r.report.judge.binding).toMatchObject({ inline: 249, transcript: 2, transcriptChecked: 251, transcriptGone: 0, ...NO_DRIFT });
+    expect(r.report.inputs.bindings).toBe(sha(bindingsFile));
+    expect(r.report.inputs.judgeCalls).toBe(sha(callsFile));
     const kept = fs.readFileSync(callsFile, 'utf8');
     const keptBindings = fs.readFileSync(bindingsFile, 'utf8');
     const keptLines = kept.split('\n').filter(Boolean).map((l) => JSON.parse(l));
     const shaOf = (t: string) => crypto.createHash('sha256').update(t).digest('hex');
     const restore = () => { fs.writeFileSync(callsFile, kept); fs.writeFileSync(bindingsFile, keptBindings); };
     /** Rewrite the kept call of row 0 (and, for a consistent forgery, its binding and the evidence hash to match). */
-    const forge = (call: Record<string, any>, consistent: boolean, binding: (b: Record<string, any>) => void = () => {}) => {
+    const forge = (call: Record<string, any>, consistent: boolean) => {
       const body = [call, ...keptLines.slice(1)].map((l) => JSON.stringify(l)).join('\n') + '\n';
       fs.writeFileSync(callsFile, body);
       if (!consistent) return;
@@ -212,7 +237,6 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
       b.call.replySha = shaOf(call.reply);
       b.call.model = call.model;
       b.call.file = call.file;
-      binding(b);
       doc.evidence.sha256 = shaOf(body);
       fs.writeFileSync(bindingsFile, JSON.stringify(doc));
     };
@@ -236,39 +260,50 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect((await report()).stderr, 'the kept file is not the one the bindings name').toMatch(/judge-calls\.jsonl is not the file the bindings name/);
     restore();
     // the original transcript, while it is there, is checked against the kept call
-    const row0 = path.join(llm, keptLines[0].file.split('/').pop());
+    const row0 = path.join(llmDir(), 'row0.jsonl');
     const original = fs.readFileSync(row0, 'utf8');
     expect(original).toContain('"model":"test-model"');
     fs.writeFileSync(row0, original.replace('"model":"test-model"', '"model":"another-model"'));
     expect((await report()).stderr, 'the transcript now says something else').toMatch(/1 whose transcript differs from the kept call/);
     fs.writeFileSync(row0, original);
     // transcripts expire: once they are gone, --bind-legacy keeps the bindings whose kept calls still hold
-    for (const f of fs.readdirSync(llm)) fs.rmSync(path.join(llm, f));
+    for (const f of fs.readdirSync(llmDir())) fs.rmSync(path.join(llmDir(), f));
     const third = await bind();
     expect(third.status, third.stderr).toBe(0);
-    expect(JSON.parse(third.stdout.trim().split('\n').pop() ?? '{}')).toMatchObject({ transcripts: 0, kept: 2, matched: 0, unmatchedScored: 0 });
+    expect(lastJson(third)).toMatchObject({ transcripts: 0, keptOnly: 251, kept: 251, matched: 0, unmatchedScored: 0, keptUnbound: 0 });
     expect(fs.readFileSync(callsFile, 'utf8'), 'the kept calls are the same bytes').toBe(kept);
     const gone = await report();
     expect(gone.status, gone.stderr).toBe(0);
-    expect(gone.report.judge.binding).toMatchObject({ transcript: 2, transcriptChecked: 0, transcriptGone: 2, ...NO_DRIFT });
-    const rebound = fs.readFileSync(bindingsFile, 'utf8');
+    expect(gone.report.judge.binding).toMatchObject({ inline: 249, transcript: 2, transcriptChecked: 0, transcriptGone: 251, recordedJudgeCalls: 0, ...NO_DRIFT });
+    // with the bindings file gone too, the kept calls alone bind every row again (they are the only copy now)
+    fs.rmSync(bindingsFile);
+    const fourth = await bind();
+    expect(fourth.status, fourth.stderr).toBe(0);
+    expect(lastJson(fourth)).toMatchObject({ kept: 0, matched: 251, unmatchedScored: 0 });
+    expect(fs.readFileSync(callsFile, 'utf8'), 'nothing lost').toBe(kept);
+    expect((await report()).status).toBe(0);
     // the same row twice (an append repeated): its kept call answers one of them, the other stays unbound
     const judgedLines = fs.readFileSync(file, 'utf8');
     fs.appendFileSync(file, judgedLines.split('\n')[0] + '\n');
     const dup = await bind();
     expect(dup.status, 'a duplicated row cannot take its call a second time').toBe(1);
-    expect(JSON.parse(dup.stdout.trim().split('\n').pop() ?? '{}')).toMatchObject({ kept: 2, unmatchedScored: 1, written: false });
+    expect(lastJson(dup)).toMatchObject({ kept: 251, unmatchedScored: 1 });
     expect(fs.readFileSync(callsFile, 'utf8')).toBe(kept);
+    // a row of a prompt no longer sampled is the report's to ignore, not a row left unbound
+    fs.writeFileSync(file, judgedLines + JSON.stringify({ qid: 'q-gone', pass: 'main', model: 'test-model', items: [{ factId: 'f0', kind: 'line' }], scores: { f0: 1 } }) + '\n');
+    const outside = await bind();
+    expect(outside.status, outside.stderr).toBe(0);
+    expect(lastJson(outside)).toMatchObject({ outOfSample: 1, unmatchedScored: 0 });
+    // a row that can no longer be bound: the run fails, and every kept call stays in the file
     fs.writeFileSync(file, judgedLines);
-    // and a row that can no longer be bound leaves the kept evidence as it was (nothing written)
-    rewrite(file, 2, (row) => ({ ...row, bound: undefined, reply: undefined }));
-    const fourth = await bind();
-    expect(fourth.status).toBe(1);
-    expect(JSON.parse(fourth.stdout.trim().split('\n').pop() ?? '{}')).toMatchObject({ kept: 2, unmatchedScored: 1, written: false });
-    expect(fs.readFileSync(callsFile, 'utf8')).toBe(kept);
-    expect(fs.readFileSync(bindingsFile, 'utf8')).toBe(rebound);
+    rewrite(file, 2, (row) => ({ ...row, bound: undefined, reply: undefined, scores: { ...row.scores, cs2: 2 } }));
+    const fifth = await bind();
+    expect(fifth.status).toBe(1);
+    expect(lastJson(fifth)).toMatchObject({ unmatchedScored: 1, keptUnbound: 1 });
+    const after = fs.readFileSync(callsFile, 'utf8');
+    for (const l of kept.split('\n').filter(Boolean)) expect(after).toContain(l);
     fs.rmSync(callsFile);
-    expect((await report()).stderr, 'a bindings file without its calls').toMatch(/2 whose kept judge call is missing/);
+    expect((await report()).stderr, 'a bindings file without its calls').toMatch(/1 without a binding, 0 whose message no longer matches .*250 whose kept judge call is missing/);
   });
 
   it('a row the judge wrote must carry the reply that gives its scores and items that are its score keys; no control is a line shown now', async () => {
@@ -289,7 +324,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     ];
     for (const [name, change, message] of cases) {
       fs.rmSync(out, { recursive: true, force: true });
-      makeFixture();
+      await makeFixture();
       expect((await report()).status, `${name}: positive control on a fresh folder`).toBe(0);
       rewrite(path.join(out, 'judgments.jsonl'), 3, change);
       const r = await report();
@@ -305,12 +340,59 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
       const items = row.items.map((it: { factId: string; kind: string }) => (it.factId === 'cs3' ? { ...it, kind: 'line' } : it));
       return { ...row, items, bound: bound(3, items, row.bound.seed), reply: replyFor(items, row.scores, row.bound.seed) };
     });
+    await rebind();   // the same call: kinds are not in the message
     const doc = path.join(out, 'doc.md');
     const r = await report(doc);
     expect(r.status, r.stderr).toBe(0);
     expect(r.report.judge.binding).toMatchObject({ staleLines: 1, staleRows: 1, ...NO_DRIFT });
     expect(r.report.judge.controls.same[1], 'one control fewer').toBe(N - 1);
     expect(fs.readFileSync(doc, 'utf8')).toContain('지금 어느 변형도 표시하지 않는 줄 항목 1개(1행)');
+  });
+
+  it('V6 counts rows that are bound: a row neither scored nor failed, a failed row not bound to its message, or a judge call no row records stops the report', async () => {
+    const file = path.join(out, 'judgments.jsonl');
+    const failedItems = [{ factId: 'f0', kind: 'line' }];
+    const failedRow = { qid: 'q0', pass: 'main', model: 'test-model', at: '2026-10-19T00:00:00Z', items: failedItems, bound: bound(0, failedItems, 'q0:main:99'), failed: 'invalid reply' };
+    fs.appendFileSync(file, JSON.stringify(failedRow) + '\n');
+    const ok = await report();
+    expect(ok.status, `positive control — a failed row bound to its message counts toward V6: ${ok.stderr}`).toBe(0);
+    expect(ok.report.judge.failures).toBe(1);
+    const judgments = () => path.join(out, 'judgments.jsonl');   // the folder is made again for each case
+    const cases: Array<[string, () => void, RegExp]> = [
+      ['an empty row (it would only grow the denominator)', () => fs.appendFileSync(judgments(), JSON.stringify({ qid: 'q0', pass: 'main', model: 'test-model' }) + '\n'), /1 rows neither scored nor failed/],
+      ['a failed row without its message', () => fs.appendFileSync(judgments(), JSON.stringify({ ...failedRow, bound: undefined }) + '\n'), /1 failed rows not bound to the message they sent/],
+      ['a failed row whose message is another', () => fs.appendFileSync(judgments(), JSON.stringify({ ...failedRow, bound: { ...failedRow.bound, message: 'e'.repeat(64) } }) + '\n'), /1 failed rows not bound/],
+      ['a row removed while its call is on disk (the last re-judge row)', () => {
+        const lines = fs.readFileSync(judgments(), 'utf8').split('\n').filter(Boolean);
+        fs.writeFileSync(judgments(), lines.slice(0, -1).join('\n') + '\n');
+      }, /1 recorded judge calls no row records/],
+    ];
+    for (const [name, mutate, message] of cases) {
+      fs.rmSync(out, { recursive: true, force: true });
+      await makeFixture();
+      expect((await report()).status, `${name}: positive control on a fresh folder`).toBe(0);
+      mutate();
+      const r = await report();
+      expect(r.status, name).toBe(1);
+      expect(r.stderr, name).toMatch(message);
+    }
+  });
+
+  it('the smoke call is told apart from judgment calls; a call the judge cut off before its row is not', async () => {
+    // the smoke prompt and notes of inject-judge --smoke (one recorded call, no row)
+    const smoke = labelItems([
+      { factId: 'a', text: '[decision] Database migrations run through Flyway with versioned SQL files only' },
+      { factId: 'b', text: '[note] The team lunch order on Fridays is kimchi stew' },
+    ], 'smoke');
+    fs.writeFileSync(path.join(llmDir(), 'smoke.jsonl'), [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: judgeMessage({ project: '/tmp/inject-judge-smoke', query: 'Which tool do we use to run database migrations?' }, smoke) } }),
+      JSON.stringify({ type: 'assistant', message: { model: 'test-model', content: [{ type: 'text', text: '[]' }] } }),
+    ].join('\n') + '\n');
+    const r = await report();
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.report.judge.binding).toMatchObject({ recordedJudgeCalls: 252, smokeCalls: 1, unaccountedCalls: 0 });
+    recordCall('cut-off.jsonl', 3, [{ factId: 'f3', kind: 'line' }], { f3: 1 }, 'q3:main:77');
+    expect((await report()).stderr).toMatch(/1 recorded judge calls no row records/);
   });
 
   it('a judged prompt with no control in any scored main row is counted (V1/V2 then rest on fewer pairs)', async () => {
@@ -321,6 +403,10 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     const scores = Object.fromEntries(items.map((it: { factId: string }) => [it.factId, row.scores[it.factId]]));
     lines[9] = JSON.stringify(judgedRow(9, 'main', items, scores, row.bound.seed));
     fs.writeFileSync(file, lines.join('\n') + '\n');
+    // the call that made this row (its message has no controls) — the call for the old row is gone with it
+    fs.rmSync(path.join(llmDir(), 'fx-9.jsonl'));
+    recordCall('fx-9b.jsonl', 9, items, scores, row.bound.seed);
+    await rebind();
     const r = await report();
     expect(r.status, r.stderr).toBe(0);
     expect(r.report.judge.promptsWithoutControls).toBe(1);
@@ -386,7 +472,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     ];
     for (const [name, mutate, message] of cases) {
       fs.rmSync(out, { recursive: true, force: true });
-      makeFixture();
+      await makeFixture();
       expect((await report()).status, `${name}: positive control on a fresh folder`).toBe(0);
       mutate();
       const r = await report();

@@ -23,20 +23,23 @@
  * would otherwise make every non-repo folder under it one family with every
  * project. Relative paths have no family here (callers resolve a slug-form
  * project to a path first — canonicalizeProject — and use that path's family),
- * and neither has a cwd that is a symbolic link or a file, or that reaches its
- * repository through a symbolic link — the root itself included (a link can
- * point into another repository, and a link's target can change under the same
- * path). A path that cannot be read (EACCES, EIO) counts as no family / outside
+ * and neither has a cwd that is a symbolic link or a file, or that has a
+ * symbolic link between it and its repository root — the root itself included (a
+ * link can point into another repository, and a link's target can change under
+ * the same path). Links above the root are not looked at: the scope is a path,
+ * as the exact-path project scope always was. A path that cannot be read (EACCES, EIO) counts as no family / outside
  * it, never as absent. A path that no longer exists has no family and is never
  * in one: nothing on disk tells which repository it was (a deleted worktree, a
  * deleted clone, another repository's layer in a container all look the same),
  * so facts learned in a since-deleted worktree are not seen by its repository.
- * Inside a worktree container only the family's linked worktrees count (a plain
- * folder there may hold another repository's worktrees). The worktrees of a
+ * Inside a worktree container only the family's linked worktrees count, for a cwd
+ * and a fact path alike (a plain folder there may hold another repository's
+ * worktrees); the container is the one of the repository or worktree the path
+ * is in, its name compared case-folded on macOS and Windows. The worktrees of a
  * bare repository (`<dir>/.bare/worktrees/…`) are not grouped: each one is its
  * own family.
  */
-/** Worktree containers of a repository root (`<root>/.claude/worktrees/<name>`) — the one list; the bench reads it too. */
+/** Worktree containers of a repository root (`<root>/.claude/worktrees/<name>`) — the one list. */
 export declare const WORKTREE_CONTAINERS: readonly string[];
 /**
  * Family roots of `cwd` ([] = no family: not in a repository, or only a too-broad one) — the
