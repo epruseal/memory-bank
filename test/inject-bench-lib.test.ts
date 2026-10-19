@@ -372,6 +372,8 @@ describe('decision', () => {
       expect(() => moduleClosure(dir), 'a CommonJS require').toThrow(/cannot follow/);
       put('dist/dep.js', "const n = 'mod.js';\nawait import(dist(n));\n");
       expect(() => moduleClosure(dir), 'a computed dist name').toThrow(/cannot follow/);
+      put('dist/dep.js', "const n = 'mod.js';\nexecFileSync(process.execPath, [dist(n)]);\n");
+      expect(() => moduleClosure(dir), 'a computed dist path run as a child process').toThrow(/cannot follow/);
       put('dist/dep.js', "import './gone.js';\n");
       expect(() => moduleClosure(dir), 'a relative import naming no file').toThrow(/dist\/gone\.js is imported but is not a file/);
       put('dist/dep.js', 'export const y = 2;\n');

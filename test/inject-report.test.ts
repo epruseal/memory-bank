@@ -167,12 +167,22 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.report.judge.binding).toMatchObject({ inline: 249, transcript: 2, unbound: 0, drifted: 0, noCall: 0 });
     expect(r.report.inputs.bindings).toBe(sha(path.join(out, 'judgment-bindings.json')));
     expect(r.report.inputs.judgeCalls).toBe(sha(path.join(out, 'judge-calls.jsonl')));
-    // the kept call is the evidence: another score in it, or no kept call at all, and the binding no longer counts
+    // the kept call is the evidence: another score in its reply, or no kept call at all, and the binding no longer counts
     const callsFile = path.join(out, 'judge-calls.jsonl');
     const kept = fs.readFileSync(callsFile, 'utf8');
-    fs.writeFileSync(callsFile, kept.replace(/"score\\":0/, '"score\\":2'));
-    expect(kept.includes('"score\\":0'), 'the fixture has a score to change').toBe(true);
-    expect(report().stderr).toMatch(/1 whose kept judge call is missing or does not give the row's scores/);
+    const keptLines = kept.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const otherScore = (reply: string) => JSON.stringify(JSON.parse(reply).map((x: { id: string; score: number }, n: number) => (n === 0 ? { ...x, score: (x.score + 1) % 3 } : x)));
+    const forgedReply = otherScore(keptLines[0].reply);
+    const withReply = (reply: string) => [{ ...keptLines[0], reply }, ...keptLines.slice(1)].map((l) => JSON.stringify(l)).join('\n') + '\n';
+    fs.writeFileSync(callsFile, withReply(forgedReply));
+    expect(report().stderr, 'the reply bytes differ from the ones bound').toMatch(/1 whose kept judge call is missing or does not give the row's scores/);
+    // a consistent forgery: the kept reply AND its sha in the bindings file changed — the reply's scores still differ from the row's
+    const bindingsFile = path.join(out, 'judgment-bindings.json');
+    const bindings = JSON.parse(fs.readFileSync(bindingsFile, 'utf8'));
+    bindings.rows[keptLines[0].key].call.replySha = crypto.createHash('sha256').update(forgedReply).digest('hex');
+    fs.writeFileSync(bindingsFile, JSON.stringify(bindings));
+    expect(report().stderr, 'the reply gives other scores than the row').toMatch(/1 whose kept judge call is missing or does not give the row's scores/);
+    fs.writeFileSync(callsFile, kept);
     fs.rmSync(callsFile);
     expect(report().stderr, 'a bindings file without its calls').toMatch(/2 whose kept judge call is missing/);
   });

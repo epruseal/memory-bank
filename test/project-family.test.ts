@@ -128,6 +128,26 @@ describe('resolveRepoRoots', () => {
     expect(resolveRepoRoots(link)).toEqual([]);
   });
 
+  it('a container holding another repository\'s linked worktree, or one that cannot be listed, is not the root\'s alone', (ctx) => {
+    const Q = path.join(tmp, 'foreign-wt');
+    const other = path.join(tmp, 'foreign-main');
+    makeRepo(Q);
+    makeRepo(other);
+    linkWorktree(path.join(Q, '.claude', 'worktrees', 'foreign'), other, 'foreign');
+    expect(resolveRepoRoots(path.join(Q, '.claude', 'worktrees', 'gone'))).toEqual([]);
+    linkWorktree(path.join(Q, '.auto-issue-worktrees', 'own'), Q, 'own');
+    expect(resolveRepoRoots(path.join(Q, '.auto-issue-worktrees', 'gone')), 'positive control: a container of its own worktree').toEqual([Q]);
+    if (process.getuid?.() === 0) ctx.skip();   // root lists through permissions
+    const container = path.join(Q, '.auto-issue-worktrees');
+    fs.chmodSync(container, 0o311);   // a missing child is still known missing; the container cannot be listed
+    clearRepoRootCache();
+    try {
+      expect(resolveRepoRoots(path.join(container, 'gone'))).toEqual([]);
+    } finally {
+      fs.chmodSync(container, 0o755);
+    }
+  });
+
   it('a symbolic link inside a worktree container borrows nothing from the container\'s repository', () => {
     const Q = path.join(tmp, 'link-in-container');
     makeRepo(Q);
