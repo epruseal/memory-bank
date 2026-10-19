@@ -130,7 +130,7 @@ Every user prompt (≥20 chars) triggers the `UserPromptSubmit` hook, which vect
 ```bash
 npm run build
 node bench/inject-replay.mjs --build && node bench/inject-replay.mjs --replay && node bench/inject-replay.mjs --check-determinism
-node bench/inject-judge.mjs --smoke && node bench/inject-judge.mjs --judge   # binds every row to its call at the end (--bind-legacy)
+node bench/inject-judge.mjs --smoke && node bench/inject-judge.mjs --judge   # retires rows judged on other text first (--retire-stale), binds every row to its call at the end (--bind-legacy)
 node bench/inject-judge.mjs --report --doc docs/bench/<date>-inject-replay.md && node bench/inject-judge.mjs --leak-check docs/bench/<date>-inject-replay.md
 ```
 

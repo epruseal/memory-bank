@@ -89,7 +89,8 @@ const replyFor = (items: Array<{ factId: string; kind: string }>, scores: Record
 const judgedRow = (i: number, pass: string, items: Array<{ factId: string; kind: string }>, scores: Record<string, number>, seed: string) =>
   ({ qid: `q${i}`, pass, model: 'test-model', scores, items, bound: bound(i, items, seed), reply: replyFor(items, scores, seed) });
 const NO_DRIFT = {
-  unbound: 0, drifted: 0, noReply: 0, noCall: 0, badItems: 0, callReused: 0, transcriptMismatch: 0, keptWithoutRow: 0, malformedRows: 0, failedUnbound: 0, evidenceDrift: false,
+  unbound: 0, drifted: 0, noReply: 0, noCall: 0, badItems: 0, callReused: 0, transcriptMismatch: 0, keptWithoutRow: 0, malformedRows: 0, failedUnbound: 0,
+  duplicateRows: 0, overlapItems: 0, noSelfRecord: 0, notLegacy: 0, evidenceDrift: false,
 };
 type Item = { factId: string; kind: string };
 /** The isolated LLM sessions' transcript folder of the fixture (one SDK query per file: the message, then the answer). */
@@ -145,16 +146,20 @@ async function makeFixture(opts: { withoutControls?: number } = {}) {
     // a prompt judged without controls (no fact to pick one from) — opts.withoutControls
     ...(i === opts.withoutControls ? [] : [{ factId: `cs${i}`, kind: 'control_same' }, { factId: `co${i}`, kind: 'control_other' }]),
   ];
-  const scoresAsked = (i: number) => Object.fromEntries(itemsOf(i).map((it) => [it.factId, scoresOf(i)[it.factId]]));
-  const asked: Array<[number, string, Item[], Record<string, number>, string]> = qids.map((qid, i) => [i, 'main', itemsOf(i), scoresAsked(i), `${qid}:main:0`]);
-  // a fill-in row: the main pass re-asked one line of q7 alone (no controls); its score repeats the first one
-  asked.push([7, 'main', [{ factId: 'f7', kind: 'line' }], { f7: 1 }, `q7:main:${itemsOf(7).length}`]);
+  // q7's first main row was judged before f7 was shown; a fill-in row asked f7 alone later (no controls)
+  const firstItems = (i: number) => itemsOf(i).filter((it) => !(i === 7 && it.factId === 'f7'));
+  const scoresAsked = (i: number, items = itemsOf(i)) => Object.fromEntries(items.map((it) => [it.factId, scoresOf(i)[it.factId]]));
+  const asked: Array<[number, string, Item[], Record<string, number>, string]> = qids.map((qid, i) => [i, 'main', firstItems(i), scoresAsked(i, firstItems(i)), `${qid}:main:0`]);
+  asked.push([7, 'main', [{ factId: 'f7', kind: 'line' }], { f7: 1 }, `q7:main:${firstItems(7).length}`]);
   // 30 re-judged prompts, same scores (agreement 1.0, ≥ 100 pairs).
   for (let i = 0; i < 30; i++) asked.push([i, 'rejudge', itemsOf(i), scoresAsked(i), `q${i}:rejudge`]);
-  // every call is recorded (fx-<row>.jsonl) and every row bound to it, as --judge leaves them
+  // every call is recorded (fx-<row>.jsonl) and kept by --judge under its row's key, and every row bound to it, as --judge leaves them
+  fs.writeFileSync(path.join(out, 'judge-calls.jsonl'), '');
   asked.forEach(([i, pass, items, scores, seed], n) => {
-    rows.push(JSON.stringify(judgedRow(i, pass, items, scores, seed)));
+    const row = judgedRow(i, pass, items, scores, seed);
+    rows.push(JSON.stringify(row));
     recordCall(`fx-${n}.jsonl`, i, items, scores, seed);
+    keepSelf(JSON.stringify(row), i, items, seed, row.reply);
   });
   fs.writeFileSync(path.join(out, 'judgments.jsonl'), rows.join('\n') + '\n');
   writeMeta();
@@ -187,7 +192,8 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(r.report.c2.blockDiffers).toEqual({ prompts: 20, cwds: 3, repos: 3 });
     expect(r.report.judge.binding).toEqual({
       inline: 251, transcript: 0, retried: 0, transcriptChecked: 251, transcriptGone: 0, staleLines: 0, staleRows: 0,
-      selfRecorded: 0, recordedJudgeCalls: 251, smokeCalls: 0, callsWithoutRow: 0, transcriptsFolder: true, ...NO_DRIFT,
+      selfRecorded: 0, retiredCalls: 0, legacyListed: 0, recordedJudgeCalls: 251, smokeCalls: 0, callsWithoutRow: 0, transcriptsFolder: true,
+      ...NO_DRIFT,
     });
     expect(r.report.judge.fillRows, 'the q7 row without controls').toBe(1);
     expect(r.report.judge.promptsWithoutControls, 'q7 also has its first row with controls').toBe(0);
@@ -204,14 +210,19 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     const file = path.join(out, 'judgments.jsonl');
     const callsFile = path.join(out, 'judge-calls.jsonl');
     const bindingsFile = path.join(out, 'judgment-bindings.json');
-    // start over: nothing bound yet, rows 0 and 1 written before rows carried their own binding, their calls not found yet
-    fs.rmSync(callsFile);
+    // start over: nothing bound yet, rows 0 and 1 written before rows carried their own binding, their calls not found yet;
+    // the other rows as --judge left them (each with the call it kept right after the row)
     fs.rmSync(bindingsFile);
     for (const n of [0, 1]) fs.rmSync(path.join(llmDir(), `fx-${n}.jsonl`));
     const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
     const legacy = [0, 1].map((n) => { const row = JSON.parse(lines[n]); lines[n] = JSON.stringify({ ...row, bound: undefined, reply: undefined }); return row; });
     fs.writeFileSync(file, lines.join('\n') + '\n');
-    expect((await report()).stderr, 'no binding anywhere').toMatch(/251 without a binding/);
+    const selfLines = fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).filter((l) => JSON.parse(l).file.startsWith('self/'));
+    const legacyKeys = new Set(legacy.map((row) => crypto.createHash('sha256').update(JSON.stringify(row)).digest('hex')));
+    fs.writeFileSync(callsFile, selfLines.filter((l) => !legacyKeys.has(JSON.parse(l).key)).join('\n') + '\n');
+    const none = await report();
+    expect(none.stderr, 'no binding anywhere (and no list of rows written before bindings yet)').toMatch(/249 without a binding/);
+    expect(none.stderr).toMatch(/2 rows without their own binding that the first --bind-legacy did not list/);
     const record = (name: string, n: number, scores = legacy[n].scores, model = 'test-model') => recordCall(name, n, legacy[n].items, scores, legacy[n].bound.seed, model);
     record('row0.jsonl', 0);
     record('row1-other-model.jsonl', 1, legacy[1].scores, 'another-model');
@@ -278,11 +289,11 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     for (const f of fs.readdirSync(llmDir())) fs.rmSync(path.join(llmDir(), f));
     const third = await bind();
     expect(third.status, third.stderr).toBe(0);
-    expect(lastJson(third)).toMatchObject({ transcripts: 0, keptOnly: 251, kept: 251, matched: 0, unmatchedScored: 0, keptUnbound: 0 });
+    expect(lastJson(third)).toMatchObject({ transcripts: 0, keptOnly: 500, kept: 251, matched: 0, unmatchedScored: 0, keptUnbound: 249, keptWithoutRow: 0 });
     expect(fs.readFileSync(callsFile, 'utf8'), 'the kept calls are the same bytes').toBe(kept);
     const gone = await report();
     expect(gone.status, gone.stderr).toBe(0);
-    expect(gone.report.judge.binding).toMatchObject({ inline: 249, transcript: 2, transcriptChecked: 0, transcriptGone: 251, recordedJudgeCalls: 0, ...NO_DRIFT });
+    expect(gone.report.judge.binding).toMatchObject({ inline: 249, transcript: 2, transcriptChecked: 0, transcriptGone: 251, recordedJudgeCalls: 0, legacyListed: 2, ...NO_DRIFT });
     // with the bindings file gone too, the kept calls alone bind every row again (they are the only copy now)
     fs.rmSync(bindingsFile);
     const fourth = await bind();
@@ -295,8 +306,15 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     fs.appendFileSync(file, judgedLines.split('\n')[0] + '\n');
     const dup = await bind();
     expect(dup.status, 'a duplicated row cannot take its call a second time').toBe(1);
-    expect(lastJson(dup)).toMatchObject({ kept: 251, unmatchedScored: 1 });
+    expect(lastJson(dup)).toMatchObject({ kept: 251, duplicateRows: 1 });
     expect(fs.readFileSync(callsFile, 'utf8')).toBe(kept);
+    expect((await report()).stderr).toMatch(/1 duplicated rows/);
+    // a copy of a row written before bindings (another kind for a control): not in the list the first --bind-legacy made
+    fs.writeFileSync(file, judgedLines + JSON.stringify({ ...JSON.parse(judgedLines.split('\n')[0]), items: JSON.parse(judgedLines.split('\n')[0]).items.map((it: Item) => (it.kind === 'control_other' ? { ...it, kind: 'control_same' } : it)) }) + '\n');
+    const copy = await bind();
+    expect(copy.status).toBe(1);
+    expect(lastJson(copy)).toMatchObject({ notLegacy: 1 });
+    expect((await report()).stderr).toMatch(/1 rows without their own binding that the first --bind-legacy did not list/);
     // a row of a prompt no longer sampled is the report's to ignore, not a row left unbound
     fs.writeFileSync(file, judgedLines + JSON.stringify({ qid: 'q-gone', pass: 'main', model: 'test-model', items: [{ factId: 'f0', kind: 'line' }], scores: { f0: 1 } }) + '\n');
     const outside = await bind();
@@ -307,11 +325,11 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     rewrite(file, 2, (row) => ({ ...row, bound: undefined, reply: undefined, scores: { ...row.scores, cs2: 2 } }));
     const fifth = await bind();
     expect(fifth.status).toBe(1);
-    expect(lastJson(fifth)).toMatchObject({ unmatchedScored: 1, keptUnbound: 1 });
+    expect(lastJson(fifth)).toMatchObject({ unmatchedScored: 1, notLegacy: 1, keptWithoutRow: 2 });
     const after = fs.readFileSync(callsFile, 'utf8');
     for (const l of kept.split('\n').filter(Boolean)) expect(after).toContain(l);
     fs.rmSync(callsFile);
-    expect((await report()).stderr, 'a bindings file without its calls').toMatch(/1 without a binding, 0 whose message no longer matches .*250 whose kept judge call is missing/);
+    expect((await report()).stderr, 'a bindings file without its calls').toMatch(/0 without a binding, 0 whose message no longer matches .*250 whose kept judge call is missing.*1 rows without their own binding that the first --bind-legacy did not list/);
   });
 
   it('a row the judge wrote must carry the reply that gives its scores and items that are its score keys; no control is a line shown now', async () => {
@@ -363,9 +381,9 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
       return { ...row, items, bound: bound(3, items, row.bound.seed), reply: replyFor(items, row.scores, row.bound.seed) };
     });
     const r = await bind();
-    expect(r.status, 'the kept call of the old row names no row').toBe(1);
-    expect(lastJson(r)).toMatchObject({ unmatchedScored: 0, keptWithoutRow: 1 });
-    expect((await report()).stderr).toMatch(/1 kept calls of rows no longer in judgments\.jsonl/);
+    expect(r.status, 'the edited row has no call kept for it; the calls of the old row name no row').toBe(1);
+    expect(lastJson(r)).toMatchObject({ unmatchedScored: 1, noSelfRecord: 1, keptWithoutRow: 2 });
+    expect((await report()).stderr).toMatch(/2 kept calls of rows no longer in judgments\.jsonl/);
   });
 
   it('an interrupted append: a torn last line is cut before anything is appended after it, in both files', async () => {
@@ -377,7 +395,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(torn.status, torn.stderr).toBe(0);
     expect(torn.report.judge.tornTail).toBe(1);
     fs.appendFileSync(callsFile, '{"key":"abc","fi');
-    expect((await report()).stderr, 'a torn kept call is read as such').toMatch(/judge-calls\.jsonl: line 252 is not JSON — run --bind-legacy/);
+    expect((await report()).stderr, 'a torn kept call is read as such').toMatch(/judge-calls\.jsonl: line 503 is not JSON — run --bind-legacy/);
     const b = await bind();
     expect(b.status, b.stdout + b.stderr).toBe(0);
     expect(lastJson(b)).toMatchObject({ tornCut: 2 });
@@ -393,19 +411,62 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(fs.readFileSync(file, 'utf8')).toBe(before);
   });
 
+  it('a copy of a judged row appended next to a spare real call of the same message binds nothing: no call was kept for it', async () => {
+    // a spare call: the same message asked twice (an interrupted --judge asked again, or another --out folder the same day)
+    const file = path.join(out, 'judgments.jsonl');
+    const row = JSON.parse(fs.readFileSync(file, 'utf8').split('\n')[3]);
+    recordCall('spare.jsonl', 3, row.items, row.scores, row.bound.seed);
+    const copy = { ...row, items: row.items.map((it: Item) => (it.kind === 'control_other' ? { ...it, kind: 'control_same' } : it)) };
+    fs.appendFileSync(file, JSON.stringify(copy) + '\n');
+    const b = await bind();
+    expect(b.status).toBe(1);
+    expect(lastJson(b)).toMatchObject({ noSelfRecord: 1, unmatchedScored: 1 });
+    const r = await report();
+    expect(r.stderr, 'it would also judge q3\'s facts twice').toMatch(/5 facts judged twice in one prompt's main rows/);
+  });
+
+  it('a rebuilt snapshot: --retire-stale retires the rows judged on other text (their kept calls marked, never dropped), then binds', async () => {
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    const before = fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).length;
+    const db = new Database(path.join(out, 'snapshot.sqlite'));
+    db.prepare("UPDATE facts SET fact = 'rewritten by a later consolidation' WHERE id = 'cs5'").run();
+    db.close();
+    writeMeta();
+    expect((await report()).stderr, 'q5\'s main and re-judge rows were judged on other text').toMatch(/2 whose message no longer matches/);
+    const r = await run(['--retire-stale', '--out', out]);
+    expect(r.status, r.stdout + r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout.trim().split('\n')[0])).toEqual({ retired: 2 });
+    expect(lastJson(r)).toMatchObject({ rows: 249, keptWithoutRow: 0, unmatchedScored: 0 });
+    const calls = fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(calls.length, 'every kept call stays').toBe(before);
+    expect(calls.filter((c) => c.retired).length, 'the 2 rows\' transcript calls and the 2 --judge kept').toBe(4);
+    // what is left to do is asking q5 again (--judge) — the report says so, and no longer stops on the retired rows
+    const after = await report();
+    expect(after.stderr).toMatch(/1 prompt\(s\) have shown lines without a judgment/);
+  });
+
   it('a call with no transcript (the API-key path) binds by the call --judge kept for it', async () => {
     const file = path.join(out, 'judgments.jsonl');
     const line5 = fs.readFileSync(file, 'utf8').split('\n')[5];
     const row = JSON.parse(line5);
+    const key5 = crypto.createHash('sha256').update(line5).digest('hex');
+    // no transcript: only the call --judge kept for itself
     fs.rmSync(path.join(llmDir(), 'fx-5.jsonl'));
-    fs.rmSync(path.join(out, 'judge-calls.jsonl'));
+    const callsFile = path.join(out, 'judge-calls.jsonl');
+    fs.writeFileSync(callsFile, fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).filter((l) => { const c = JSON.parse(l); return c.key !== key5 || c.file === `self/${key5}`; }).join('\n') + '\n');
     fs.rmSync(path.join(out, 'judgment-bindings.json'));
-    keepSelf(line5, 5, row.items, row.bound.seed, row.reply);
     const b = await bind();
     expect(b.status, b.stdout + b.stderr).toBe(0);
     const r = await report();
     expect(r.status, r.stderr).toBe(0);
     expect(r.report.judge.binding).toMatchObject({ inline: 251, selfRecorded: 1, transcriptChecked: 250, ...NO_DRIFT });
+    // a transcript of that same call naming another model: another model answered (the refusal fallback) — not this row's judge
+    fs.rmSync(path.join(out, 'judgment-bindings.json'));
+    fs.writeFileSync(callsFile, fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).filter((l) => !JSON.parse(l).file.startsWith('-private')).join('\n') + '\n');
+    recordCall('fallback.jsonl', 5, row.items, row.scores, row.bound.seed, 'fallback-model');
+    const other = await bind();
+    expect(other.status).toBe(1);
+    expect(lastJson(other)).toMatchObject({ answeredByOther: 1 });
   });
 
   it('a row the judge wrote is bound with its own seed and message: another seed\'s call, or a call on other text, binds nothing', async () => {
@@ -431,7 +492,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     fs.writeFileSync(bindingsFile, JSON.stringify(doc));
     expect((await report()).stderr, 'the binding names another seed than the row recorded').toMatch(/0 without a binding, 1 whose message no longer matches/);
     // --bind-legacy: the row's text changed since it was judged, and a call on the new text gives its scores
-    fs.rmSync(callsFile);
+    fs.writeFileSync(callsFile, keptLines.map((c) => JSON.stringify(c)).join('\n') + '\n');
     fs.rmSync(bindingsFile);
     fs.rmSync(path.join(llmDir(), 'other-seed.jsonl'));
     const db = new Database(path.join(out, 'snapshot.sqlite'));
@@ -468,7 +529,12 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
     expect(ok.report.judge.failures).toBe(1);
     const cases: Array<[string, () => Promise<void> | void, RegExp]> = [
       ['an empty row (it would only grow the denominator)', () => fs.appendFileSync(judgments(), JSON.stringify({ qid: 'q0', pass: 'main', model: 'test-model' }) + '\n'), /1 rows neither scored nor failed/],
-      ['a failed row invented in the judgment file alone (its message is right, no call was kept)', () => fs.appendFileSync(judgments(), JSON.stringify(failedRow) + '\n'), /1 failed rows without the failed call kept for them/],
+      ['a failed row invented in the judgment file alone (its message is right, no call was kept)', async () => {
+        fs.appendFileSync(judgments(), JSON.stringify(failedRow) + '\n');
+        const b = await bind();
+        expect(b.status, '--bind-legacy refuses it too').toBe(1);
+        expect(lastJson(b)).toMatchObject({ failedWithoutCall: 1 });
+      }, /1 failed rows without the failed call kept for them/],
       ['a failed row whose kept reply is a valid answer', async () => {
         addFailed(failedRow, replyFor(failedItems, { f0: 1 }, 'q0:main:99'));
         await rebind().catch(() => undefined);
@@ -491,7 +557,26 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
       ['a scored row removed (the last re-judge row)', () => {
         const lines = fs.readFileSync(judgments(), 'utf8').split('\n').filter(Boolean);
         fs.writeFileSync(judgments(), lines.slice(0, -1).join('\n') + '\n');
-      }, /1 kept calls of rows no longer in judgments\.jsonl/],
+      }, /2 kept calls of rows no longer in judgments\.jsonl/],   // its transcript's kept call and the one --judge kept
+      ['a failed row duplicated (the same line again)', async () => {
+        const line = addFailed();
+        await rebind();
+        fs.appendFileSync(judgments(), line + '\n');
+      }, /1 duplicated rows/],
+      ['a failed row whose kept call is another prompt\'s message', async () => {
+        const line = JSON.stringify(failedRow);
+        fs.appendFileSync(judgments(), line + '\n');
+        keepSelf(line, 1, failedItems, failedRow.bound.seed, 'not json');
+        await bind();
+      }, /1 failed rows without the failed call kept for them/],
+      ['a failed row whose kept call is another model\'s', async () => {
+        const line = JSON.stringify(failedRow);
+        fs.appendFileSync(judgments(), line + '\n');
+        keepSelf(line, 0, failedItems, failedRow.bound.seed, 'not json');
+        const calls = path.join(out, 'judge-calls.jsonl');
+        fs.writeFileSync(calls, fs.readFileSync(calls, 'utf8').replace(/"model":"test-model","attempts":1\}\n$/, '"model":"another-model","attempts":1}\n'));
+        await bind();
+      }, /1 failed rows without the failed call kept for them/],
     ];
     for (const [name, mutate, message] of cases) {
       fs.rmSync(out, { recursive: true, force: true });
@@ -575,7 +660,7 @@ describe('inject-judge --report (synthetic bench folder, valid harness)', () => 
         const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
         lines[3] = JSON.stringify({ ...JSON.parse(lines[3]), bound: undefined, reply: undefined });
         fs.writeFileSync(file, lines.join('\n') + '\n');
-      }, /1 without a binding, 0 whose message/],
+      }, /0 without a binding, .*1 rows without their own binding that the first --bind-legacy did not list/],
       ['seed', () => {
         const file = path.join(out, 'judgments.jsonl');
         const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);

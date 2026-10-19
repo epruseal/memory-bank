@@ -302,7 +302,10 @@ describe('decision', () => {
     expect(replay).toContain('const { inputs, code } = bound;');
     expect(judge, 'the report compares the whole code digest but the Node version').toContain('const codeChanged = driftedCode(withoutNode(meta.code?.files), withoutNode(codeDigest(REPO, EMBEDDING_MODEL)));');
     expect(judge, 'every scored judgment row is bound').toContain("if ((j.bound && (b.seed !== j.bound.seed || b.message !== j.bound.message)) || rebuilt(j, b.seed) !== b.message) { binding.drifted++; continue; }");
-    expect(judge, 'and every binding count in the stop list stops the report').toContain("const BINDING_STOPS = ['unbound', 'drifted', 'noReply', 'noCall', 'badItems', 'callReused', 'transcriptMismatch', 'keptWithoutRow', 'malformedRows', 'failedUnbound', 'evidenceDrift'];");
+    expect(judge, 'and every binding count in the stop list stops the report').toContain(`const BINDING_STOPS = [
+  'unbound', 'drifted', 'noReply', 'noCall', 'badItems', 'callReused', 'transcriptMismatch', 'keptWithoutRow', 'malformedRows', 'failedUnbound',
+  'duplicateRows', 'overlapItems', 'noSelfRecord', 'notLegacy', 'evidenceDrift',
+];`);
     expect(judge).toContain('if (BINDING_STOPS.some((k) => binding[k])) fail(`judgment rows not bound');
     expect(judge, 'the judge records what it sends with the function the report checks with').toContain('const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };');
     expect(judge, 'a judged row keeps the reply it got').toContain('if (v.ok) return { ...v, retried: attempt > 0, reply: text, message, attempts: attempt + 1 };');
