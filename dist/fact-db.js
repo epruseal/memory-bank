@@ -3,6 +3,7 @@ import { canonicalizeProject } from './project-canon.js';
 import { EMBEDDING_VERSION } from './embedding-version.js';
 import { getVecQuant, embeddingToVecBlob, vecParamSql, normalizeVecDistance, l2DistanceToSimilarity } from './db.js';
 import { factRejectReason, factTextRejectReason } from './fact-validity.js';
+import { scopeMatcher } from './project-family.js';
 /** dtype/scale-aware MATCH/INSERT param for a fact-side vec table: the SQL
  * placeholder (vec_int8(?) wrap for int8), the correctly-encoded blob and the
  * table's VecQuant (to normalize distances). float32 tables (pre-migration
@@ -139,8 +140,10 @@ export function insertRevision(db, params) {
 export function getRevisions(db, factId) {
     return db.prepare('SELECT * FROM fact_revisions WHERE fact_id = ? ORDER BY created_at DESC').all(factId);
 }
-export function searchSimilarFacts(db, embedding, project, limit = 5, threshold = 0.85) {
+const VISIBLE_FETCH_CAP = 6400;
+export function searchSimilarFacts(db, embedding, project, limit = 5, threshold = 0.85, opts = {}) {
     const canonProject = project ? canonicalizeProject(db, project) : project;
+    const inScope = scopeMatcher(canonProject, opts.scopeFamily === true);
     // Search both language indexes: the query language is unknown, and
     // multilingual models score same-language pairs far higher than
     // cross-language pairs. Keep the best (smallest) distance per fact id.
@@ -153,18 +156,30 @@ export function searchSimilarFacts(db, embedding, project, limit = 5, threshold 
     // Per-table dtype: the two language indexes can be at DIFFERENT dtypes
     // mid-migration, and int8 distances come back ×scale — normalize
     // BEFORE the cross-table merge or the scales are incomparable.
-    const fetch = (table) => factKnn(table, () => {
+    const knn = (table, n) => factKnn(table, () => {
         const p = vecParamFor(db, table, embedding);
         const rows = db.prepare(`
       SELECT id, distance FROM ${table}
       WHERE embedding MATCH ${p.sql}
       ORDER BY distance
       LIMIT ?
-    `).all(p.blob, candidateFetch);
+    `).all(p.blob, n);
         for (const r of rows)
             r.distance = normalizeVecDistance(r.distance, p.q);
         return rows;
     }, []);
+    const visibleId = opts.visibleId;
+    const fetch = (table) => {
+        if (!visibleId)
+            return knn(table, candidateFetch);
+        // Grow the fetch until candidateFetch visible rows are in hand (or the index runs out).
+        for (let n = candidateFetch * 4;; n = Math.min(n * 4, VISIBLE_FETCH_CAP)) {
+            const rows = knn(table, n);
+            const visible = rows.filter((r) => visibleId(r.id));
+            if (visible.length >= candidateFetch || rows.length < n || n >= VISIBLE_FETCH_CAP)
+                return visible.slice(0, candidateFetch);
+        }
+    };
     const best = new Map();
     for (const vr of [...fetch('vec_facts'), ...fetch('vec_facts_kr')]) {
         const cur = best.get(vr.id);
@@ -187,14 +202,37 @@ export function searchSimilarFacts(db, embedding, project, limit = 5, threshold 
         if (!row)
             continue;
         const fact = rowToFact(row);
-        // Scope filter: same project or global only
-        if (canonProject && fact.scope_type === 'project' && fact.scope_project !== canonProject)
+        // Scope filter: same project (or its repository family, when asked) or global only
+        if (fact.scope_type === 'project' && !inScope(fact.scope_project))
             continue;
         results.push({ fact, distance: vr.distance });
         if (results.length >= limit)
             break;
     }
     return results;
+}
+/**
+ * Distance from `embedding` to one fact's stored vectors: the smaller of its
+ * English and Korean vectors — the same rule the KNN above ranks by (it keeps
+ * the best distance per id across both tables), normalized for int8 tables.
+ * null when the fact has no vector of the current embedding version.
+ */
+export function factVectorDistance(db, factId, embedding) {
+    const row = db.prepare('SELECT embedding_version FROM facts WHERE id = ?').get(factId);
+    if (!row || row.embedding_version !== EMBEDDING_VERSION)
+        return null;
+    let best = null;
+    for (const table of ['vec_facts', 'vec_facts_kr']) {
+        const d = factKnn(table, () => {
+            const p = vecParamFor(db, table, embedding);
+            const hit = db.prepare(`SELECT vec_distance_l2(embedding, ${p.sql}) AS d FROM ${table} WHERE id = ?`)
+                .get(p.blob, factId);
+            return hit ? normalizeVecDistance(hit.d, p.q) : null;
+        }, null);
+        if (d !== null && (best === null || d < best))
+            best = d;
+    }
+    return best;
 }
 /**
  * Nearest active facts restricted to EXACTLY one scope — used by consolidation

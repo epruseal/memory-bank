@@ -29,6 +29,15 @@ export declare function classifyFact(db: Database.Database, factId: string, cate
 export declare function getFactsByCategory(db: Database.Database, categoryId: string): Fact[];
 export declare function getFactsByDomain(db: Database.Database, domainId: string): Fact[];
 export declare function createRelation(db: Database.Database, sourceFactId: string, relationType: RelationType, targetFactId: string, reasoning?: string): OntologyRelation;
+/** Options of getRelatedFacts that only the injection selection (and its replay bench) passes. */
+export interface RelatedFactsOptions {
+    /** Widen scopeProject to its repository family (project-family.ts). */
+    scopeFamily?: boolean;
+    /** Replay bench only: facts that existed at the replayed moment. */
+    visibleFact?: (id: string) => boolean;
+    /** Replay bench only: relations that existed at the replayed moment. */
+    visibleRelation?: (relation: OntologyRelation) => boolean;
+}
 /**
  * Get related facts with relevance decay.
  *
@@ -45,7 +54,7 @@ export declare function createRelation(db: Database.Database, sourceFactId: stri
  *                       Prevents cross-project noise in graph traversal.
  *                       Pass null/undefined to allow cross-project traversal (e.g., explore_graph).
  */
-export declare function getRelatedFacts(db: Database.Database, factId: string, hops?: number, decay?: number, minRelevance?: number, scopeProject?: string | null): Array<{
+export declare function getRelatedFacts(db: Database.Database, factId: string, hops?: number, decay?: number, minRelevance?: number, scopeProject?: string | null, opts?: RelatedFactsOptions): Array<{
     fact: Fact;
     relation: OntologyRelation;
     relevance: number;

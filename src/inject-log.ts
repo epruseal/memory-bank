@@ -76,6 +76,9 @@ export interface InjectLogEntry {
   plugin_version?: string;
   /** via='session-start' only — the SessionStart source Claude Code reports (startup, resume, clear, compact). */
   source?: string;
+  /** Relation gate on only: neighbours dropped below the margin / never scored (inject-select.ts). */
+  rel_gated_out?: number;
+  rel_unscored?: number;
 }
 
 /** Log form of a fact id — 12 chars keep lines short and are unique enough for joins. */

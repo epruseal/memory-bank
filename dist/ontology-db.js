@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { getVecQuant, embeddingToVecBlob, vecParamSql, normalizeVecDistance } from './db.js';
 import { ontologyNameRejectReason } from './fact-validity.js';
+import { scopeMatcher } from './project-family.js';
 // === Domain CRUD ===
 export function createDomain(db, name, description) {
     const rejectReason = ontologyNameRejectReason(name);
@@ -196,7 +197,8 @@ export function createRelation(db, sourceFactId, relationType, targetFactId, rea
  *                       Prevents cross-project noise in graph traversal.
  *                       Pass null/undefined to allow cross-project traversal (e.g., explore_graph).
  */
-export function getRelatedFacts(db, factId, hops = 1, decay = 0.6, minRelevance = 0.2, scopeProject) {
+export function getRelatedFacts(db, factId, hops = 1, decay = 0.6, minRelevance = 0.2, scopeProject, opts = {}) {
+    const inScope = scopeMatcher(scopeProject ?? null, opts.scopeFamily === true);
     const visited = new Set([factId]);
     const results = [];
     let frontier = [factId];
@@ -240,7 +242,9 @@ export function getRelatedFacts(db, factId, hops = 1, decay = 0.6, minRelevance 
             for (const [targetId, rows] of outByNeighbour) {
                 const fact = rowToFact(rows[0]);
                 // Scope filter: skip facts from other projects (unless scopeProject is null)
-                if (scopeProject && fact.scope_type === 'project' && fact.scope_project !== scopeProject)
+                if (fact.scope_type === 'project' && !inScope(fact.scope_project))
+                    continue;
+                if (opts.visibleFact && !opts.visibleFact(fact.id))
                     continue;
                 // Select the surfaced edge FIRST: a neighbour with no qualifying
                 // edge is PRUNED — it must not enter the frontier, or traversal
@@ -250,6 +254,8 @@ export function getRelatedFacts(db, factId, hops = 1, decay = 0.6, minRelevance 
                 let chosen = null;
                 for (const row of rows) {
                     const relation = rowToRelation(row);
+                    if (opts.visibleRelation && !opts.visibleRelation(relation))
+                        continue;
                     // Relation type weight: SUPPORTS/INFLUENCES stronger than CONTRADICTS/SUPERSEDES
                     const typeWeight = (relation.relation_type === 'SUPPORTS' || relation.relation_type === 'INFLUENCES') ? 1.0 : 0.7;
                     const relevance = hopRelevance * typeWeight;
@@ -290,13 +296,17 @@ export function getRelatedFacts(db, factId, hops = 1, decay = 0.6, minRelevance 
             for (const [sourceId, rows] of inByNeighbour) {
                 const fact = rowToFact(rows[0]);
                 // Scope filter: skip facts from other projects
-                if (scopeProject && fact.scope_type === 'project' && fact.scope_project !== scopeProject)
+                if (fact.scope_type === 'project' && !inScope(fact.scope_project))
+                    continue;
+                if (opts.visibleFact && !opts.visibleFact(fact.id))
                     continue;
                 // Same pruning contract as the outgoing side: no qualifying edge →
                 // no frontier entry, no path leak.
                 let chosen = null;
                 for (const row of rows) {
                     const relation = rowToRelation(row);
+                    if (opts.visibleRelation && !opts.visibleRelation(relation))
+                        continue;
                     const typeWeight = (relation.relation_type === 'SUPPORTS' || relation.relation_type === 'INFLUENCES') ? 1.0 : 0.7;
                     const relevance = hopRelevance * typeWeight;
                     if (relevance >= minRelevance) {

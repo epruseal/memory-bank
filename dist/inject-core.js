@@ -5,7 +5,7 @@ import { appendInjectLog, pluginVersion, sessionKey, shortId } from './inject-lo
 import { loadLedger } from './inject-ledger.js';
 import { injectionQuery } from './prompt-gate.js';
 import { factTextKey } from './fact-text.js';
-import { formatInjectBlock, selectInjectFacts } from './inject-select.js';
+import { formatInjectBlock, PRODUCTION_SELECT_OPTIONS, selectInjectFacts } from './inject-select.js';
 // detectRepeat 는 exchanges 전체(335k) 벡터검색이다. OS 페이지 캐시가 식은 상태에서
 // 583~844ms 가 걸려 주입 지연의 대부분을 차지했다(2026-10-03 실측: 데몬 웜 24ms).
 // 게다가 cwd 와 슬러그를 비교하던 버그로 2,686회 주입 동안 결과를 한 번도 내지
@@ -68,12 +68,15 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
         // warm daemon. NOT closed here: getSearchDb owns its lifecycle.
         const db = getSearchDb();
         {
-            const selection = selectInjectFacts(db, embedding, baseline, project);
+            const selection = selectInjectFacts(db, embedding, baseline, project, PRODUCTION_SELECT_OPTIONS);
             timings.search_ms = selection.timings.search_ms;
             const candidates = selection.candidates;
             const decision = {
                 top_margins: selection.topMargins.map((m) => Math.round(m * 1000) / 1000),
                 gated_ids: selection.gated.map((g) => shortId(g.fact.id)),
+                ...(PRODUCTION_SELECT_OPTIONS.relMargin !== null
+                    ? { rel_gated_out: selection.relGatedOut, rel_unscored: selection.relUnscored }
+                    : {}),
             };
             if (selection.gated.length === 0) {
                 appendInjectLog({

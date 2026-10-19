@@ -31,10 +31,28 @@ export declare function deactivateFact(db: Database.Database, id: string): void;
 export declare function deleteFact(db: Database.Database, id: string): void;
 export declare function insertRevision(db: Database.Database, params: InsertRevisionParams): string;
 export declare function getRevisions(db: Database.Database, factId: string): FactRevision[];
-export declare function searchSimilarFacts(db: Database.Database, embedding: number[], project: string | null, limit?: number, threshold?: number): Array<{
+/** Options of searchSimilarFacts that only the injection selection (and its replay bench) passes. */
+export interface FactSearchOptions {
+    /** Widen the project scope to the repository family (project-family.ts). */
+    scopeFamily?: boolean;
+    /**
+     * Replay bench only: which vector rows existed at the replayed moment. Applied
+     * BEFORE the overfetch cut, so the cut sees the same top rows the index held
+     * then (rows added later cannot crowd them out).
+     */
+    visibleId?: (id: string) => boolean;
+}
+export declare function searchSimilarFacts(db: Database.Database, embedding: number[], project: string | null, limit?: number, threshold?: number, opts?: FactSearchOptions): Array<{
     fact: Fact;
     distance: number;
 }>;
+/**
+ * Distance from `embedding` to one fact's stored vectors: the smaller of its
+ * English and Korean vectors — the same rule the KNN above ranks by (it keeps
+ * the best distance per id across both tables), normalized for int8 tables.
+ * null when the fact has no vector of the current embedding version.
+ */
+export declare function factVectorDistance(db: Database.Database, factId: string, embedding: number[]): number | null;
 /**
  * Nearest active facts restricted to EXACTLY one scope — used by consolidation
  * so a project-private fact and a global fact can never be compared/merged

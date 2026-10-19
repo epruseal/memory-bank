@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
 import { getVecQuant, embeddingToVecBlob, vecParamSql, normalizeVecDistance } from './db.js';
 import { ontologyNameRejectReason } from './fact-validity.js';
+import { scopeMatcher } from './project-family.js';
 import type {
   OntologyDomain,
   OntologyCategory,
@@ -260,6 +261,16 @@ export function createRelation(
   };
 }
 
+/** Options of getRelatedFacts that only the injection selection (and its replay bench) passes. */
+export interface RelatedFactsOptions {
+  /** Widen scopeProject to its repository family (project-family.ts). */
+  scopeFamily?: boolean;
+  /** Replay bench only: facts that existed at the replayed moment. */
+  visibleFact?: (id: string) => boolean;
+  /** Replay bench only: relations that existed at the replayed moment. */
+  visibleRelation?: (relation: OntologyRelation) => boolean;
+}
+
 /**
  * Get related facts with relevance decay.
  *
@@ -283,7 +294,9 @@ export function getRelatedFacts(
   decay: number = 0.6,
   minRelevance: number = 0.2,
   scopeProject?: string | null,
+  opts: RelatedFactsOptions = {},
 ): Array<{ fact: Fact; relation: OntologyRelation; relevance: number; hop: number }> {
+  const inScope = scopeMatcher(scopeProject ?? null, opts.scopeFamily === true);
   const visited = new Set<string>([factId]);
   const results: Array<{ fact: Fact; relation: OntologyRelation; relevance: number; hop: number }> = [];
 
@@ -331,7 +344,8 @@ export function getRelatedFacts(
         const fact = rowToFact(rows[0]);
 
         // Scope filter: skip facts from other projects (unless scopeProject is null)
-        if (scopeProject && fact.scope_type === 'project' && fact.scope_project !== scopeProject) continue;
+        if (fact.scope_type === 'project' && !inScope(fact.scope_project)) continue;
+        if (opts.visibleFact && !opts.visibleFact(fact.id)) continue;
 
         // Select the surfaced edge FIRST: a neighbour with no qualifying
         // edge is PRUNED — it must not enter the frontier, or traversal
@@ -341,6 +355,7 @@ export function getRelatedFacts(
         let chosen: { relation: OntologyRelation; relevance: number } | null = null;
         for (const row of rows) {
           const relation = rowToRelation(row);
+          if (opts.visibleRelation && !opts.visibleRelation(relation)) continue;
           // Relation type weight: SUPPORTS/INFLUENCES stronger than CONTRADICTS/SUPERSEDES
           const typeWeight = (relation.relation_type === 'SUPPORTS' || relation.relation_type === 'INFLUENCES') ? 1.0 : 0.7;
           const relevance = hopRelevance * typeWeight;
@@ -383,13 +398,15 @@ export function getRelatedFacts(
         const fact = rowToFact(rows[0]);
 
         // Scope filter: skip facts from other projects
-        if (scopeProject && fact.scope_type === 'project' && fact.scope_project !== scopeProject) continue;
+        if (fact.scope_type === 'project' && !inScope(fact.scope_project)) continue;
+        if (opts.visibleFact && !opts.visibleFact(fact.id)) continue;
 
         // Same pruning contract as the outgoing side: no qualifying edge →
         // no frontier entry, no path leak.
         let chosen: { relation: OntologyRelation; relevance: number } | null = null;
         for (const row of rows) {
           const relation = rowToRelation(row);
+          if (opts.visibleRelation && !opts.visibleRelation(relation)) continue;
           const typeWeight = (relation.relation_type === 'SUPPORTS' || relation.relation_type === 'INFLUENCES') ? 1.0 : 0.7;
           const relevance = hopRelevance * typeWeight;
           if (relevance >= minRelevance) {
