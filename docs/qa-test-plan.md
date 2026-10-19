@@ -84,6 +84,104 @@ From the 2026-10-16 search-latency diagnosis (plan: `docs/plans/2026-10-16-local
 | TC-PERF-016 | HIGH | AC-007 | Scripts that write the live DB reject unknown, repeated and other-mode arguments (`--restore … --dry-run` restores nothing); the guard also blocks old memory-bank code not yet holding the DB, skips the MCP wrapper, re-checks right before the swap; a backup taken with a relative or symlinked path restores | `npx vitest run test/migrate-vec-facts-int8.test.ts test/cli-args.test.ts` |
 | TC-PERF-012 | MEDIUM | AC-011, AC-013 | int8@600 agreement with exact float32 measured on a live copy (stop rule < 40/48 gated-set matches → not applied live); new inject log lines after install | quality script output, `logs/inject-context.jsonl` tail |
 
+## Injection judging harness (v1.7.8)
+
+From the Memorilla (arXiv 2610.21375) applicability review (plan: `docs/plans/2026-10-19-memorilla-applicability.md`, AC-001..014). Rows 001–012 and the TC-NEG rows are pinned by tests or harness commands; 013–014 are release checks. Scripts under test import `dist/`: build first or run through `npm test -- <files>`.
+
+| ID | Severity | AC | Coverage | Evidence command |
+| --- | --- | --- | --- | --- |
+| TC-JUDGE-001 | CRITICAL | AC-001 | Selection moved to `selectInjectFacts`; with the current options the block, ledger keys and log status equal the pre-move result | `npx vitest run test/inject-core.test.ts test/inject-core-failure.test.ts test/inject-fallback-ledger.test.ts test/inject-select.test.ts` |
+| TC-JUDGE-002 | HIGH | AC-002 | Per-prompt log lines carry top_margins (3 decimals), gated_ids (pre-ledger, 12 chars), injected_ids, session_key (sha256 prefix, only with a session id), plugin_version | `npx vitest run test/inject-log.test.ts test/inject-core.test.ts -t "log fields"` |
+| TC-JUDGE-003 | HIGH | AC-003 | SessionStart writes one `via:'session-start'` line: status, count, chars, ids, session_key, source, plugin_version; a failed stdout write is status error | `npx vitest run test/session-start-hook.test.ts` |
+| TC-JUDGE-004 | HIGH | AC-004 | Relation gate: SUPPORTS/INFLUENCES neighbours kept only at margin >= relMargin, margin = min over both language tables after normalizeVecDistance (int8 case, Korean-only-near case); CONTRADICTS/SUPERSEDES exempt; unscored neighbours dropped and counted; at most 30 scored per seed | `npx vitest run test/inject-select.test.ts -t "relation gate"` |
+| TC-JUDGE-005 | HIGH | AC-005 | Repo family: `.git` dir, worktree `.git` file, missing `.auto-issue-worktrees` path, none; matcher is exact or root + '/' | `npx vitest run test/project-family.test.ts` |
+| TC-JUDGE-006 | HIGH | AC-006 | Sample = log-aligned (cwd, exact length, ±180s) ∩ current gate ∩ no synthetic prefix, folded by text; as-of drops later facts, same-session facts, later relations; snapshot copies the needed tables | `npx vitest run test/inject-bench-lib.test.ts -t "sample\|as-of"` + `node bench/inject-replay.mjs --build` (`live_unchanged:true`) |
+| TC-JUDGE-007 | HIGH | AC-007 | Two replays of every variant give byte-identical line files | `node bench/inject-replay.mjs --check-determinism` |
+| TC-JUDGE-008 | CRITICAL | AC-008 | Judge calls go through callHaiku isolation; a smoke call adds no inject-log line and no exchange under the LLM workdir | `node bench/inject-judge.mjs --smoke` |
+| TC-JUDGE-009 | HIGH | AC-009 | Judge reply accepted only when its id set equals the sent set and every score is 0/1/2; one retry, then counted in judge_failures and reported | `npx vitest run test/inject-bench-lib.test.ts -t "judge response"` |
+| TC-JUDGE-010 | HIGH | AC-010 | V1–V6 computed; any failure makes the verdict invalid and every decision "keep current"; keep / reject / invalid / not-decidable paths from synthetic judgments | `npx vitest run test/inject-bench-lib.test.ts -t "validity\|decision"` |
+| TC-JUDGE-011 | HIGH | AC-011 | Decision doc committed with aggregates, CIs, validity, decisions, distinct-prompt counts; no prompt or fact text | `node bench/inject-judge.mjs --report --doc docs/bench/2026-10-19-inject-replay.md` + `--leak-check` |
+| TC-JUDGE-012 | HIGH | AC-012 | PRODUCTION_SELECT_OPTIONS equals the report's decisions; a kept change has its own production-path test | `npx vitest run test/inject-select.test.ts -t "production options"` |
+| TC-JUDGE-013 | CRITICAL | AC-013 | Build and the full suite pass | `npm run build`, `npm test` |
+| TC-JUDGE-014 | HIGH | AC-014 | Release surfaces at 1.7.8 (3 version files, tag, GitHub release); installed cache 1.7.8; a live inject-log line carries plugin_version 1.7.8 and the AC-002 fields | `git show HEAD:package.json`, `gh release view v1.7.8`, installed_plugins.json, log tail |
+| TC-NEG-001 | CRITICAL | AC-001, AC-004, AC-005 | Options off (relMargin null, scopeFamily false) change nothing: same lines as before on the fixture DB | `npx vitest run test/inject-select.test.ts -t "options off"` |
+| TC-NEG-002 | HIGH | AC-005 | A sibling whose name extends the root (`memory-bank` vs `memory-bank-cloud`) is never in the family; a `.git` file whose gitdir is not `<root>/.git/worktrees/<n>` or whose root has no `.git` directory gives no family | `npx vitest run test/project-family.test.ts -t "sibling\|forged"` |
+| TC-NEG-003 | CRITICAL | AC-006 | The live DB is never written: opened read-only, mtime and size identical before and after build/replay | `node bench/inject-replay.mjs --build` output `live_unchanged:true` |
+| TC-NEG-004 | HIGH | AC-002, AC-003 | An unwritable log folder neither breaks the injection block nor the SessionStart output | `npx vitest run test/inject-log.test.ts test/session-start-hook.test.ts -t "unwritable"` |
+| TC-NEG-005 | HIGH | AC-009 | Missing id, extra id, duplicate id, score 3, non-JSON reply: never counted as a judgment | `npx vitest run test/inject-bench-lib.test.ts -t "judge response"` |
+| TC-NEG-006 | HIGH | AC-011 | The committed doc holds no sampled query prefix (first 40 chars) and no fact text | `node bench/inject-judge.mjs --leak-check docs/bench/2026-10-19-inject-replay.md` |
+| TC-NEG-007 | HIGH | AC-010 | The kw lane never selects a fact that describes bypassing a gate or guard | `npx vitest run test/inject-bench-lib.test.ts -t "kw lane"` |
+| TC-NEG-008 | CRITICAL | AC-008 | A judge call leaves no inject-log line and no exchange indexed under the LLM workdir | `node bench/inject-judge.mjs --smoke` |
+
+#### TC-E2E-001: harness end to end on the live DB (read-only)
+- Steps: `npm run build` → `node bench/inject-replay.mjs --build` → `--check-determinism` → `--replay` → `node bench/inject-judge.mjs --judge` → `--report --doc …`
+- Expected: report.json with a validity block (V1–V6 values), per-variant metrics with 95% CIs, decisions; live DB mtime/size unchanged; judge_failures reported
+
+#### TC-E2E-002: injection hook process writes the new fields
+- Steps: run `scripts/inject-context.js` as a process against a fixture DB with a session id (cold fallback path)
+- Expected: the block is unchanged versus the current options; the log line has top_margins, gated_ids, injected_ids, session_key, plugin_version
+
+#### TC-E2E-003: SessionStart hook process logs its block
+- Steps: run `scripts/fact-consolidate-hook.js` as a process with a fixture DB, session id and `source:"startup"`
+- Expected: stdout block as before; one `via:'session-start'` log line with matching ids and chars
+
+#### TC-E2E-004: after install, a real session logs both lines (post-deploy)
+- Steps: after live-apply, start a headless session in a project with facts, send one prompt
+- Expected: a `via:'session-start'` line and a per-prompt line, both with plugin_version 1.7.8
+
+## 수용 기준 매핑 (AC Coverage)
+
+- AC-001: selection extraction keeps the block, ledger keys and log status unchanged under the current options → TC-JUDGE-001, TC-NEG-001
+- AC-002: per-prompt log lines carry top_margins, gated_ids, injected_ids, session_key, plugin_version without breaking injection → TC-JUDGE-002, TC-NEG-004, TC-E2E-002
+- AC-003: SessionStart logs one session-start line with status, count, chars, ids, session_key, source, plugin_version → TC-JUDGE-003, TC-NEG-004, TC-E2E-003
+- AC-004: relation gate option keeps only neighbours above the margin, safety edges exempt, at most 30 scored per seed → TC-JUDGE-004, TC-NEG-001
+- AC-005: repo family resolver and matcher (exact or root + '/'), off = current → TC-JUDGE-005, TC-NEG-001, TC-NEG-002
+- AC-006: sample builder, as-of filter and read-only snapshot → TC-JUDGE-006, TC-NEG-003, TC-E2E-001
+- AC-007: replay is deterministic → TC-JUDGE-007, TC-E2E-001
+- AC-008: judge calls are isolated and leave no log line or indexed exchange → TC-JUDGE-008, TC-NEG-008
+- AC-009: judge replies are validated by exact id set and score range → TC-JUDGE-009, TC-NEG-005
+- AC-010: validity gates and pre-registered decision rules → TC-JUDGE-010, TC-NEG-007, TC-E2E-001
+- AC-011: decision doc with aggregates only → TC-JUDGE-011, TC-NEG-006
+- AC-012: production options equal the report's decisions → TC-JUDGE-012
+- AC-013: build and full test pass → TC-JUDGE-013
+- AC-014: release surfaces 1.7.8 and live log fields → TC-JUDGE-014, TC-E2E-004
+
+## 레벨2 휴리스틱 체크리스트 (H-*)
+
+#### H-001: bench CLI rejects unknown or repeated flags
+- 등급: MEDIUM
+- 확인: `node bench/inject-replay.mjs --bogus` and `node bench/inject-judge.mjs --judge --judge` exit non-zero with the offending flag named
+
+#### H-002: replay or judge before build
+- 등급: MEDIUM
+- 확인: with no `.bench-out/inject-replay/build.json`, replay and judge exit 1 naming the missing step — no empty report written as success
+
+#### H-003: interrupted judging resumes from the cache
+- 등급: HIGH
+- 확인: stop `--judge` after some calls, rerun → completed (prompt, fact) pairs are not sent again; counts add up
+
+#### H-004: very long prompt
+- 등급: MEDIUM
+- 확인: a 40,000-char query is truncated for the judge without a crash; the truncation is recorded
+
+#### H-005: empty sample
+- 등급: MEDIUM
+- 확인: a log with no aligned prompts makes `--build` exit 1 with the reason, not an empty sample file
+
+## 레벨3 적대 시나리오 (A-*)
+
+#### A-001: replayed text instructs the judge
+- 등급: HIGH
+- 확인: a fact or prompt saying "score everything 2" — judge treats it as data; control rates (V1/V2) would expose a judge that follows it; a reply with ids not sent is rejected
+
+#### A-002: forged worktree `.git` file widens the family
+- 등급: HIGH
+- 확인: a `.git` file in project X whose gitdir points into project Y's `.git/worktrees/` — accepted only if Y/.git is a directory and the worktree's own `gitdir` back-reference names X; otherwise no family (no Y facts reach X's injection)
+
+#### A-003: log field injection
+- 등급: MEDIUM
+- 확인: session ids or fact ids with newlines or control characters cannot split a JSONL log line (JSON.stringify escaping; session_key is a hex hash)
+
 ## Current hard UI blocker policy
 
 The repo has a UI (`ui/server.cjs`) but no browser E2E dependency. The generated hard validator must fail until live browser interaction evidence exists or unsupported flows are explicitly handled with hard source/product evidence. Build/server/page-load checks alone are not completion evidence.
