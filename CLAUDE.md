@@ -35,6 +35,9 @@ The build is two-step: `tsc` compiles `src/` → `dist/`, then `esbuild` bundles
 | `mcp-server.ts` | MCP server entry point — registers `search`, `read`, `search_facts` tools |
 | `db.ts` | SQLite schema init, migrations, CRUD for exchanges |
 | `fact-db.ts` | CRUD and vector search for facts table |
+| `inject-select.ts` | Which facts a prompt's block carries (KNN → baseline gate → 1-hop) — shared by the live hook and the replay bench; `PRODUCTION_SELECT_OPTIONS` is the bench's decision |
+| `project-family.ts` | Repository family of a cwd (git top-level + linked worktree's main repo, fs only) and the scope predicate both searches use |
+| `inject-log.ts` | `inject-context.jsonl` lines: status, timings, margins, gated/injected ids, session_key, plugin_version, SessionStart lines |
 | `embeddings.ts` | Local embedding generation using `@xenova/transformers` |
 | `llm.ts` | Anthropic API wrapper for Haiku calls (fact extraction/consolidation) |
 | `parser.ts` | JSONL conversation file parser |
@@ -44,6 +47,14 @@ The build is two-step: `tsc` compiles `src/` → `dist/`, then `esbuild` bundles
 | `cli-args.ts` | Strict argument parsing for scripts that write the live DB |
 | `paths.ts` | Config/data directory resolution (supports `MEMORY_BANK_CONFIG_DIR` override) |
 | `sync.ts` | File sync + incremental indexing + summary generation |
+
+### Injection replay bench
+
+`bench/inject-replay.mjs` (sample from the inject log ∩ indexed prompts, read-only snapshot, replay of selection
+variants) and `bench/inject-judge.mjs` (isolated `callHaiku` judge, random-fact controls, bootstrap CIs,
+pre-registered decisions). Private text stays in `.bench-out/` (gitignored); `docs/bench/` holds aggregates only and
+its decisions block pins `PRODUCTION_SELECT_OPTIONS` (test/inject-select.test.ts). Plan:
+`docs/plans/2026-10-19-memorilla-applicability.md`.
 
 ### Plugin Structure
 

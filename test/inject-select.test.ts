@@ -194,6 +194,22 @@ describe('selectInjectFacts', () => {
     expect(Object.isFrozen(sel.PRODUCTION_SELECT_OPTIONS)).toBe(true);
   });
 
+  it('visibleFactId is applied before the overfetch cut: hidden rows cannot crowd out a visible match', async () => {
+    const hidden = new Set<string>();
+    for (let i = 0; i < 55; i++) {
+      await add(`aq${i}`, `The office aquarium filter is cleaned every Tuesday morning before standup (note ${i})`);
+      hidden.add(ids[`aq${i}`]);
+    }
+    await add('aqTarget', 'Aquarium water in the office is partly changed once a month on the first Monday');
+    const e = await embed.generateEmbedding('How often do we clean the office aquarium filter?', 'query');
+    // Precondition: without the filter the target sits below the 50-row cut (a post-cut filter would lose it).
+    const unfiltered = factDb.searchSimilarFacts(db, e, PROJECT, 60, 0).map((r) => r.fact.id);
+    expect(unfiltered.slice(0, 50).includes(ids.aqTarget), 'scenario: 50 hidden rows outrank the target').toBe(false);
+    const got = factDb.searchSimilarFacts(db, e, PROJECT, 5, 0, { visibleId: (id) => !hidden.has(id) });
+    expect(got.map((r) => r.fact.id)).toContain(ids.aqTarget);
+    expect(got.some((r) => hidden.has(r.fact.id))).toBe(false);
+  }, 120_000);
+
   it('formatInjectBlock keeps the first line, cuts the tail at the budget, reports how many made it', () => {
     const fact = (n: number) => ({ id: `f${n}`, fact: 'x'.repeat(300), category: 'decision', created_at: '2026-10-19T00:00:00Z' }) as never;
     const { lines, shown } = sel.formatInjectBlock(Array.from({ length: 8 }, (_, i) => ({ fact: fact(i), note: '' })));

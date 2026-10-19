@@ -111,6 +111,7 @@ Every user prompt (≥20 chars) triggers the `UserPromptSubmit` hook, which vect
 
 - **Relevance gate** — a fact is injected only when its similarity to the query exceeds the query's own background baseline by a margin (absolute thresholds cannot separate relevant from irrelevant on compressed e5 scores)
 - **1-hop expansion** — top matches pull in related facts via typed ontology relations (max 8 facts total)
+- **Repository family scope (v1.7.8)** — a prompt in a worktree (`<repo>/.auto-issue-worktrees/…`) or a sub-folder (`<repo>/docs`) also sees the project facts of the same repository, and the repository sees what its worktrees learned. Roots come from `.git` on disk (a linked worktree counts only when its `gitdir` back-reference matches); `$HOME` and its ancestors never become a root; matching is on a `/` boundary, so `memory-bank` never sees `memory-bank-cloud`. Chosen by the replay bench below; the SessionStart key-facts block is unchanged
 - **Session dedup ledger (v1.4.0)** — a fact already injected in this session is never re-injected (it is already in the conversation context); repeated topics cost 0 extra tokens. Ledger is per-session, bounded (400 ids), TTL-pruned (7 days), and fail-open
 - **Token budget (v1.4.0)** — each fact is truncated to 160 chars and the whole block capped at 1,000 chars (lowest-relevance dropped first); repeated-prompt detection is skipped when injection has already spent >700ms (the sync sqlite search cannot be preempted once started)
 - **Observability (v1.2.1, extended v1.4.0)** — every run appends one JSONL line to `~/.config/superpowers/conversation-index/logs/inject-context.jsonl`:
@@ -120,7 +121,20 @@ Every user prompt (≥20 chars) triggers the `UserPromptSubmit` hook, which vect
   {"ts":"2026-07-12T07:36:41Z","status":"deduped","prompt_len":67,"candidates":5,"injected":0,"deduped":8,"duration_ms":476,"via":"fallback"}
   ```
 
+  Since v1.7.8 a line also carries `top_margins` (each candidate's similarity minus the baseline), `gated_ids` (ids that cleared the gate before the session ledger), `injected_ids`, `session_key` (sha256 prefix of the session id) and `plugin_version`, and the SessionStart key-facts block writes its own `"via":"session-start"` line (count, chars, ids, `source`).
+
   Node-level crashes (missing `node_modules`, import failures) land in `logs/inject-context.err.log` instead of being discarded.
+
+**Injection replay bench (v1.7.8)** — replays prompts the hook really saw (inject log ∩ indexed conversation, as of each prompt's moment) through selection variants and has an isolated LLM judge score each injected line 0/1/2 against random-fact controls:
+
+```bash
+npm run build
+node bench/inject-replay.mjs --build && node bench/inject-replay.mjs --check-determinism && node bench/inject-replay.mjs --replay
+node bench/inject-judge.mjs --smoke && node bench/inject-judge.mjs --judge
+node bench/inject-judge.mjs --report --doc docs/bench/<date>-inject-replay.md && node bench/inject-judge.mjs --leak-check docs/bench/<date>-inject-replay.md
+```
+
+Prompt and fact text stay in `.bench-out/`; the report holds aggregates only. 2026-10-19 result (`docs/bench/2026-10-19-inject-replay.md`, 303 prompts): 55.7% of injected lines judged at least related, 20.8% directly useful; repository family scope kept, a query gate on relation neighbours rejected.
 
 **Troubleshooting**: if injection never fires, check those two files — an empty/absent JSONL log means the hook isn't running at all (stale plugin install, restart pending), while `"status":"error"` entries or err.log content pinpoint the failure.
 
@@ -202,7 +216,7 @@ graph TB
     FA1 x--x FB1
 ```
 
-Project A sees: Project A facts + Global facts (never Project B).
+Project A sees: Project A facts + Global facts (never Project B). Since v1.7.8 the per-prompt injection also sees the facts of Project A's own worktrees and sub-folders (repository family — see Context Injection); a different repository stays out.
 
 ## MCP Tools
 

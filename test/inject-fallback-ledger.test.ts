@@ -70,6 +70,14 @@ describe('대체 경로의 원장 기록', () => {
   it('데몬이 없으면 직접 계산해 블록을 출력하고, 그 fact 를 원장에 기록한다', async () => {
     const out = await runClient('sess-fb-deliver');
     expect(lastLogLine(), '데몬 없이 대체 경로로 계산했다').toMatchObject({ via: 'fallback', fallback_reason: 'no-daemon', status: 'injected' });
+    // 훅 프로세스가 남기는 판정 필드(1.7.8): margin·게이트 통과 id·주입 id·세션 키·버전
+    const line = lastLogLine();
+    const { createHash } = await import('node:crypto');
+    expect(line.injected_ids).toContain(factId.slice(0, 12));
+    expect(line.gated_ids).toContain(factId.slice(0, 12));
+    expect((line.top_margins as number[]).length).toBe(line.candidates);
+    expect(line.session_key).toBe(createHash('sha256').update('sess-fb-deliver').digest('hex').slice(0, 12));
+    expect(line.plugin_version).toBe(JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8')).version);
     expect(out).toContain('deploy pipeline publishes a Vercel preview');
     expect(fs.existsSync(ledgerFile('sess-fb-deliver')), '출력한 블록의 원장').toBe(true);
     expect(JSON.parse(fs.readFileSync(ledgerFile('sess-fb-deliver'), 'utf8'))).toContain(factId);
