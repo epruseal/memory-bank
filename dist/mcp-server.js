@@ -53196,11 +53196,58 @@ function factTextKey(fact) {
   return "t:" + createHash("sha1").update(norm).digest("hex").slice(0, 16);
 }
 
-// src/inject-core.ts
+// src/inject-select.ts
 var TOP_K = 5;
 var BASELINE_MARGIN = 0.045;
 var MAX_CONTEXT_FACTS = 8;
 var BLOCK_CHAR_BUDGET = 1e3;
+var BLOCK_HEADER = "\u{1F4CC} \uAD00\uB828 \uACFC\uAC70 \uACB0\uC815:";
+function selectInjectFacts(db, embedding, baseline, project) {
+  let tStage = Date.now();
+  const candidates = searchSimilarFacts(db, embedding, project, TOP_K, 0);
+  const search_ms = Date.now() - tStage;
+  const scored = candidates.map((r) => ({ fact: r.fact, margin: l2DistanceToSimilarity(r.distance) - baseline }));
+  const gated = scored.filter((r) => r.margin >= BASELINE_MARGIN);
+  const topMargins = scored.map((r) => r.margin);
+  if (gated.length === 0) {
+    return { candidates: candidates.length, topMargins, gated, lines: [], timings: { search_ms } };
+  }
+  tStage = Date.now();
+  const seenIds = new Set(gated.map((r) => r.fact.id));
+  const lines = gated.map((r) => ({ fact: r.fact, note: "", origin: "vec", margin: r.margin }));
+  for (const { fact } of gated.slice(0, 3)) {
+    const related = getRelatedFacts(db, fact.id, 1, 0.6, 0.2, project);
+    for (const { fact: relFact, relation } of related) {
+      if (!seenIds.has(relFact.id) && lines.length < MAX_CONTEXT_FACTS) {
+        seenIds.add(relFact.id);
+        lines.push({ fact: relFact, note: `[${relation.relation_type}]`, origin: "rel", margin: null });
+      }
+    }
+  }
+  return {
+    candidates: candidates.length,
+    topMargins,
+    gated,
+    lines,
+    timings: { search_ms, related_ms: Date.now() - tStage }
+  };
+}
+function formatInjectBlock(items) {
+  const lines = [BLOCK_HEADER];
+  let blockChars = BLOCK_HEADER.length;
+  let shown = 0;
+  for (const { fact, note } of items) {
+    const dateStr = fact.created_at.slice(0, 10);
+    const line = `- ${note ? note + " " : ""}[${fact.category}] ${truncateFact(fact.fact)} (${dateStr})`;
+    if (blockChars + line.length > BLOCK_CHAR_BUDGET && shown > 0) break;
+    lines.push(line);
+    blockChars += line.length + 1;
+    shown++;
+  }
+  return { lines, shown };
+}
+
+// src/inject-core.ts
 var REPEAT_ELAPSED_BUDGET_MS = 700;
 function repeatDetectEnabled() {
   return process.env.MEMORY_BANK_REPEAT_DETECT === "1";
@@ -53233,44 +53280,28 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
     timings.embed_ms = Date.now() - tStage;
     const db = getSearchDb();
     {
-      tStage = Date.now();
-      const candidates = searchSimilarFacts(db, embedding, project, TOP_K, 0);
-      timings.search_ms = Date.now() - tStage;
-      const results = candidates.filter((r) => {
-        const similarity = l2DistanceToSimilarity(r.distance);
-        return similarity - baseline >= BASELINE_MARGIN;
-      });
-      if (results.length === 0) {
+      const selection = selectInjectFacts(db, embedding, baseline, project);
+      timings.search_ms = selection.timings.search_ms;
+      const candidates = selection.candidates;
+      if (selection.gated.length === 0) {
         appendInjectLog({
           ...base,
           ...queryLen,
           ...timings,
           status: "no-match",
-          candidates: candidates.length,
+          candidates,
           injected: 0,
           duration_ms: Date.now() - t0
         });
         return { context: "", ledgerKeys: [] };
       }
-      tStage = Date.now();
-      const seenIds = new Set(results.map((r) => r.fact.id));
-      const expandedFacts = [...results.map((r) => ({ fact: r.fact, note: "" }))];
-      for (const { fact } of results.slice(0, 3)) {
-        const related = getRelatedFacts(db, fact.id, 1, 0.6, 0.2, project);
-        for (const { fact: relFact, relation } of related) {
-          if (!seenIds.has(relFact.id) && expandedFacts.length < MAX_CONTEXT_FACTS) {
-            seenIds.add(relFact.id);
-            expandedFacts.push({ fact: relFact, note: `[${relation.relation_type}]` });
-          }
-        }
-      }
-      timings.related_ms = Date.now() - tStage;
+      timings.related_ms = selection.timings.related_ms;
       const ledger = loadLedger(sessionId);
       const fresh = [];
       const blockTextKeys = /* @__PURE__ */ new Set();
       let dedupedCount = 0;
       let textDeduped = 0;
-      for (const item of expandedFacts) {
+      for (const item of selection.lines) {
         if (ledger.has(item.fact.id)) {
           dedupedCount++;
           continue;
@@ -53289,7 +53320,7 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
           ...queryLen,
           ...timings,
           status: "deduped",
-          candidates: candidates.length,
+          candidates,
           injected: 0,
           deduped: dedupedCount,
           text_deduped: textDeduped,
@@ -53297,23 +53328,12 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
         });
         return { context: "", ledgerKeys: [] };
       }
-      const lines = ["\u{1F4CC} \uAD00\uB828 \uACFC\uAC70 \uACB0\uC815:"];
-      let blockChars = lines[0].length;
-      const ledgerKeys = [];
-      let injectedCount = 0;
-      let fromVec = 0;
-      let fromRel = 0;
-      for (const { fact, note, textKey } of fresh) {
-        const dateStr = fact.created_at.slice(0, 10);
-        const line = `- ${note ? note + " " : ""}[${fact.category}] ${truncateFact(fact.fact)} (${dateStr})`;
-        if (blockChars + line.length > BLOCK_CHAR_BUDGET && injectedCount > 0) break;
-        lines.push(line);
-        blockChars += line.length + 1;
-        ledgerKeys.push(fact.id, textKey);
-        injectedCount++;
-        if (note) fromRel++;
-        else fromVec++;
-      }
+      const { lines, shown } = formatInjectBlock(fresh);
+      const injectedItems = fresh.slice(0, shown);
+      const ledgerKeys = injectedItems.flatMap(({ fact, textKey }) => [fact.id, textKey]);
+      const injectedCount = injectedItems.length;
+      const fromRel = injectedItems.filter((item) => item.origin === "rel").length;
+      const fromVec = injectedCount - fromRel;
       if (repeatDetectEnabled() && Date.now() - t0 < REPEAT_ELAPSED_BUDGET_MS) {
         tStage = Date.now();
         try {
@@ -53333,7 +53353,7 @@ async function computeInjectResult(userPrompt, project, via, sessionId, meta3 = 
         ...queryLen,
         ...timings,
         status: "injected",
-        candidates: candidates.length,
+        candidates,
         injected: injectedCount,
         deduped: dedupedCount,
         text_deduped: textDeduped,

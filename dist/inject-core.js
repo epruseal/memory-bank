@@ -1,25 +1,11 @@
 import { getSearchDb } from './search.js';
-import { l2DistanceToSimilarity } from './db.js';
-import { searchSimilarFacts } from './fact-db.js';
 import { generateEmbedding, initEmbeddings, queryBaseline } from './embeddings.js';
-import { getRelatedFacts } from './ontology-db.js';
 import { detectRepeat, formatRepeatContext } from './repeat-detector.js';
 import { appendInjectLog } from './inject-log.js';
 import { loadLedger } from './inject-ledger.js';
 import { injectionQuery } from './prompt-gate.js';
-import { factTextKey, truncateFact } from './fact-text.js';
-const TOP_K = 5;
-// Probe-baseline relevance gate (e5 scores are compressed, so absolute
-// thresholds cannot separate relevant from irrelevant). A fact is injected
-// only when sim(query, fact) exceeds the query's own background baseline by
-// this margin. Measured on KR/EN real-DB pairs: related +0.047~+0.123,
-// unrelated -0.028~-0.091; long compound "memory" facts can leak in at
-// +0.04~+0.045, so the margin sits just above that noise band.
-const BASELINE_MARGIN = 0.045;
-const MAX_CONTEXT_FACTS = 8;
-// Token budget: fact 평균 140자·p90 207자 실측 — 절단 없이 8건이면 ~470 tok/프롬프트.
-// fact 당 160자(fact-text.ts FACT_CHAR_CAP) + 블록 1,000자 예산으로 상한. 잘린 내용이 필요하면 search_facts 로 조회.
-const BLOCK_CHAR_BUDGET = 1000;
+import { factTextKey } from './fact-text.js';
+import { formatInjectBlock, selectInjectFacts } from './inject-select.js';
 // detectRepeat 는 exchanges 전체(335k) 벡터검색이다. OS 페이지 캐시가 식은 상태에서
 // 583~844ms 가 걸려 주입 지연의 대부분을 차지했다(2026-10-03 실측: 데몬 웜 24ms).
 // 게다가 cwd 와 슬러그를 비교하던 버그로 2,686회 주입 동안 결과를 한 번도 내지
@@ -80,35 +66,17 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
         // warm daemon. NOT closed here: getSearchDb owns its lifecycle.
         const db = getSearchDb();
         {
-            // threshold 0: take top-k by distance, then gate by baseline margin below
-            tStage = Date.now();
-            const candidates = searchSimilarFacts(db, embedding, project, TOP_K, 0);
-            timings.search_ms = Date.now() - tStage;
-            const results = candidates.filter((r) => {
-                const similarity = l2DistanceToSimilarity(r.distance);
-                return similarity - baseline >= BASELINE_MARGIN;
-            });
-            if (results.length === 0) {
+            const selection = selectInjectFacts(db, embedding, baseline, project);
+            timings.search_ms = selection.timings.search_ms;
+            const candidates = selection.candidates;
+            if (selection.gated.length === 0) {
                 appendInjectLog({
                     ...base, ...queryLen, ...timings, status: 'no-match',
-                    candidates: candidates.length, injected: 0, duration_ms: Date.now() - t0,
+                    candidates, injected: 0, duration_ms: Date.now() - t0,
                 });
                 return { context: '', ledgerKeys: [] };
             }
-            // Expand with 1-hop relations
-            tStage = Date.now();
-            const seenIds = new Set(results.map((r) => r.fact.id));
-            const expandedFacts = [...results.map((r) => ({ fact: r.fact, note: '' }))];
-            for (const { fact } of results.slice(0, 3)) {
-                const related = getRelatedFacts(db, fact.id, 1, 0.6, 0.2, project);
-                for (const { fact: relFact, relation } of related) {
-                    if (!seenIds.has(relFact.id) && expandedFacts.length < MAX_CONTEXT_FACTS) {
-                        seenIds.add(relFact.id);
-                        expandedFacts.push({ fact: relFact, note: `[${relation.relation_type}]` });
-                    }
-                }
-            }
-            timings.related_ms = Date.now() - tStage;
+            timings.related_ms = selection.timings.related_ms;
             // 세션 dedup: 이 세션에서 이미 주입한 fact 는 대화 컨텍스트에 이미 있다 —
             // 재주입은 순수 토큰 낭비. 원장에 id 도 본문 키도 없는 fact 만 주입한다.
             // 본문 키는 블록 안에서도 적용한다 — id 만 다른 같은 문장이 한 블록에 두 번 실리지 않게.
@@ -117,7 +85,7 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
             const blockTextKeys = new Set();
             let dedupedCount = 0;
             let textDeduped = 0;
-            for (const item of expandedFacts) {
+            for (const item of selection.lines) {
                 if (ledger.has(item.fact.id)) {
                     dedupedCount++;
                     continue;
@@ -133,33 +101,17 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
             if (fresh.length === 0) {
                 appendInjectLog({
                     ...base, ...queryLen, ...timings, status: 'deduped',
-                    candidates: candidates.length, injected: 0, deduped: dedupedCount,
+                    candidates, injected: 0, deduped: dedupedCount,
                     text_deduped: textDeduped, duration_ms: Date.now() - t0,
                 });
                 return { context: '', ledgerKeys: [] };
             }
-            // Format context block — fact 당 160자 절단 + 블록 1,000자 예산
-            // (하위 관련도부터 탈락: fresh 는 관련도순이므로 뒤에서 끊긴다)
-            const lines = ['📌 관련 과거 결정:'];
-            let blockChars = lines[0].length;
-            const ledgerKeys = [];
-            let injectedCount = 0;
-            let fromVec = 0;
-            let fromRel = 0;
-            for (const { fact, note, textKey } of fresh) {
-                const dateStr = fact.created_at.slice(0, 10);
-                const line = `- ${note ? note + ' ' : ''}[${fact.category}] ${truncateFact(fact.fact)} (${dateStr})`;
-                if (blockChars + line.length > BLOCK_CHAR_BUDGET && injectedCount > 0)
-                    break;
-                lines.push(line);
-                blockChars += line.length + 1;
-                ledgerKeys.push(fact.id, textKey);
-                injectedCount++;
-                if (note)
-                    fromRel++;
-                else
-                    fromVec++;
-            }
+            const { lines, shown } = formatInjectBlock(fresh);
+            const injectedItems = fresh.slice(0, shown);
+            const ledgerKeys = injectedItems.flatMap(({ fact, textKey }) => [fact.id, textKey]);
+            const injectedCount = injectedItems.length;
+            const fromRel = injectedItems.filter((item) => item.origin === 'rel').length;
+            const fromVec = injectedCount - fromRel;
             // Detect repeated prompts — opt-in (see REPEAT_ELAPSED_BUDGET_MS). 동기
             // sqlite 검색이라 시작 후엔 선점 불가 — 예산을 이미 썼으면 시작 자체를 생략.
             if (repeatDetectEnabled() && Date.now() - t0 < REPEAT_ELAPSED_BUDGET_MS) {
@@ -178,7 +130,7 @@ export async function computeInjectResult(userPrompt, project, via, sessionId, m
             const block = lines.join('\n') + '\n';
             appendInjectLog({
                 ...base, ...queryLen, ...timings, status: 'injected',
-                candidates: candidates.length, injected: injectedCount,
+                candidates, injected: injectedCount,
                 deduped: dedupedCount, text_deduped: textDeduped,
                 from_vec: fromVec, from_rel: fromRel, chars: block.length,
                 duration_ms: Date.now() - t0,
