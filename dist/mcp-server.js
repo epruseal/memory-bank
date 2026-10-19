@@ -52068,7 +52068,8 @@ function mainRootOf(worktreeTop, adminDir) {
   const parts = /^(.*)\/\.git\/worktrees\/[^/]+$/.exec(adminDir);
   if (!parts) return null;
   const root = parts[1];
-  if (!isRepoRoot(root)) return null;
+  const rootSt = lstat(root);
+  if (rootSt === null || rootSt === UNREADABLE || rootSt.isSymbolicLink() || !isRepoRoot(root)) return null;
   const backFile = path3.join(adminDir, "gitdir");
   if (stat(backFile)?.isFile() !== true) return null;
   let back;
@@ -52102,17 +52103,7 @@ function resolveUncached(cwd) {
   if (!path3.isAbsolute(cwd)) return [];
   const start = path3.resolve(cwd);
   const own2 = lstat(start);
-  if (own2 !== null && (own2 === UNREADABLE || !own2.isDirectory())) return [];
-  if (own2 === null) {
-    for (const marker of WORKTREE_CONTAINERS) {
-      const i = start.indexOf(marker);
-      if (i > 0) {
-        const root = start.slice(0, i);
-        return !tooBroad(root) && isRepoRoot(root) && !excludedUnderRoot(root, start, [root]) ? [root] : [];
-      }
-    }
-    return [];
-  }
+  if (own2 === null || own2 === UNREADABLE || !own2.isDirectory()) return [];
   for (let dir = start; ; dir = path3.dirname(dir)) {
     const st = dir === start ? own2 : lstat(dir);
     if (st === UNREADABLE || st !== null && st.isSymbolicLink()) return [];
@@ -52134,38 +52125,18 @@ function resolveRepoRoots(cwd) {
   cache.set(cwd, { roots, at: now });
   return roots;
 }
-function ownContainer(root, container) {
-  let entries;
-  try {
-    entries = fs3.readdirSync(container, { withFileTypes: true });
-  } catch {
-    return false;
-  }
-  return entries.every((e) => {
-    if (e.isSymbolicLink()) return false;
-    if (!e.isDirectory()) return true;
-    const g = dotGitOf(path3.join(container, e.name));
-    return g.kind === "linked" && g.main === root;
-  });
-}
-function deletedWorktreeOf(root, scopeProject, missing) {
-  return WORKTREE_CONTAINERS.some((c) => {
-    const base = root + c;
-    return scopeProject === missing && path3.dirname(missing) + "/" === base && ownContainer(root, base.slice(0, -1));
-  });
-}
 function excludedUnderRoot(root, scopeProject, roots) {
   let dir = root;
   for (const seg of scopeProject.slice(root.length + 1).split("/")) {
     if (!seg) continue;
+    const parent = dir;
     dir = path3.join(dir, seg);
     const st = lstat(dir);
-    if (st === UNREADABLE) return true;
-    if (!st) return !deletedWorktreeOf(root, scopeProject, dir);
-    if (st.isSymbolicLink()) return true;
+    if (st === null || st === UNREADABLE || st.isSymbolicLink()) return true;
     const g = dotGitOf(dir);
-    if (g.kind === "none") continue;
-    if (g.kind === "linked" && g.main !== null && roots.includes(g.main)) continue;
+    const familyWorktree = g.kind === "linked" && g.main !== null && roots.includes(g.main);
+    if (WORKTREE_CONTAINERS.some((c) => parent + "/" === root + c) && !familyWorktree) return true;
+    if (g.kind === "none" || familyWorktree) continue;
     return true;
   }
   return false;

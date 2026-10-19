@@ -50,7 +50,14 @@ beforeAll(async () => {
     fs.writeFileSync(path.join(repo, '.git', 'HEAD'), 'ref: refs/heads/main\n');
   }
   fs.mkdirSync(PROJECT, { recursive: true });
-  fs.mkdirSync(path.join(REPO, '.auto-issue-worktrees'), { recursive: true });   // the container a deleted worktree was in
+  // a linked worktree of REPO in its own container (a deleted path would have no family)
+  const wt = path.join(REPO, '.auto-issue-worktrees', 'issue-7');
+  const admin = path.join(REPO, '.git', 'worktrees', 'issue-7');
+  fs.mkdirSync(admin, { recursive: true });
+  fs.writeFileSync(path.join(admin, 'HEAD'), 'ref: refs/heads/wt\n');
+  fs.mkdirSync(wt, { recursive: true });
+  fs.writeFileSync(path.join(wt, '.git'), `gitdir: ${admin}\n`);
+  fs.writeFileSync(path.join(admin, 'gitdir'), `${path.join(wt, '.git')}\n`);
   sel = await import('../src/inject-select.js');
   embed = await import('../src/embeddings.js');
   factDb = await import('../src/fact-db.js');
@@ -204,7 +211,7 @@ describe('selectInjectFacts', () => {
     await add('relseed', 'Container images for this service are built with Buildah on the self-hosted runner');
     await add('relfam', 'Every published tag is signed off by the release manager before the changelog goes out', { scope: REPO });
     await add('relfamIn', 'Nightly smoke tests must pass before anyone tags a release candidate',
-      { scope: path.join(REPO, '.auto-issue-worktrees', 'issue-7') });   // a deleted worktree in the repository's container
+      { scope: path.join(REPO, '.auto-issue-worktrees', 'issue-7') });   // a linked worktree in the repository's container
     await add('relsib', 'The cloud repository publishes its tags from the office build server', { scope: `${REPO}-cloud` });
     await add('relother', 'Another project keeps its tags in a separate mirror', { scope: path.join(tmp, 'other-project') });
     onto.createRelation(db, ids.relseed, 'SUPPORTS', ids.relfam);      // outgoing

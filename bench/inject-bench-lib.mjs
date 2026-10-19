@@ -316,13 +316,15 @@ export function replyGivesRowScores(row, seed, reply, textOf, parse) {
  * The judge call behind a judgment row written before rows carried a binding: a recorded call
  * (`callsByFirst`: indexCalls) whose first attempt equals the row's message rebuilt from the current texts
  * with some candidate seed, answered by the row's model with exactly the row's scores — { seed, message, call }
- * or null. A message alone only shows that it was sent; the reply shows these scores are its answer.
+ * or null; a call whose `file` is in `used` already answers another row. A message alone only shows that it
+ * was sent; the reply shows these scores are its answer.
  */
-export function legacyBinding(row, prompt, textOf, callsByFirst, maxItems, parse) {
+export function legacyBinding(row, prompt, textOf, callsByFirst, maxItems, parse, used = new Set()) {
   if (!row.scores || !row.items) return null;
   for (const seed of judgeSeedCandidates(row, maxItems)) {
     const message = judgeMessageSha(prompt, row.items, seed, textOf);
     for (const call of callsByFirst.get(message) ?? []) {
+      if (used.has(call.file)) continue;   // one call answers one row
       if (call.model === row.model && replyGivesRowScores(row, seed, call.reply, textOf, parse)) return { seed, message, call };
     }
   }
@@ -646,8 +648,9 @@ export function embeddingModelFiles(repo, model) {
 const NATIVE_RE = /\.(node|dylib|so|dll)(\.\d+)*$/;
 
 /**
- * Installed packages `roots` pull in — dependencies and installed optional ones, transitively (a package's
- * own node_modules first, then the top level) — with their versions and the sha256 of their native binaries.
+ * Installed packages `roots` pull in — dependencies and installed optional ones, transitively, each resolved
+ * the way Node resolves it (own node_modules, then each enclosing one) — with their versions and the sha256 of
+ * their native binaries (the packages' JavaScript is bound by version only).
  * A required dependency that is not installed is recorded as missing.
  */
 export function dependencyDigest(repo, roots) {
@@ -668,8 +671,14 @@ export function dependencyDigest(repo, roots) {
     for (const f of filesUnder(repo, dir, (n) => NATIVE_RE.test(n))) out[`native:${f}`] = sha256File(path.join(repo, f));
     const deps = [...Object.keys(pkg.dependencies ?? {}).map((d) => [d, true]), ...Object.keys(pkg.optionalDependencies ?? {}).map((d) => [d, false])];
     for (const [dep, req] of deps) {
-      const nested = path.join(dir, 'node_modules', dep);
-      queue.push({ name: dep, dir: fs.existsSync(path.join(nested, 'package.json')) ? nested : path.join(repo, 'node_modules', dep), required: req });
+      // Node's lookup: the package's own node_modules, then every enclosing folder's node_modules up to the repository.
+      let found = null;
+      for (let cur = dir; cur.startsWith(repo); cur = path.dirname(cur)) {
+        const candidate = path.join(cur, 'node_modules', dep);
+        if (fs.existsSync(path.join(candidate, 'package.json'))) { found = candidate; break; }
+        if (cur === repo) break;
+      }
+      queue.push({ name: dep, dir: found ?? path.join(repo, 'node_modules', dep), required: req });
     }
   }
   return out;

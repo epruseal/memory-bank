@@ -90,7 +90,7 @@ async function judgeCall(prompt, labeled) {
       continue;
     }
     const v = validateJudgeReply(parseJsonResponse(text), labels);
-    if (v.ok) return { ...v, retried: attempt > 0 };
+    if (v.ok) return { ...v, retried: attempt > 0, reply: text };
     if (attempt === 1) return { ok: false, reason: v.reason };
     user = `${judgeUserMessage(prompt, labeled)}\n\nYour previous answer was invalid (${v.reason}). Answer again with only the JSON array, every id exactly once.`;
   }
@@ -255,7 +255,7 @@ async function judgeAll() {
     const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };
     const reply = await judgeCall(task.prompt, labeled);
     if (reply.ok) {
-      append({ qid: task.prompt.qid, pass: task.pass, model: MODEL, at: new Date().toISOString(), items: task.want, bound, retried: reply.retried,
+      append({ qid: task.prompt.qid, pass: task.pass, model: MODEL, at: new Date().toISOString(), items: task.want, bound, retried: reply.retried, reply: reply.reply,
         scores: Object.fromEntries(labeled.map((it) => [it.factId, reply.scores.get(it.label)])) });
     } else {
       failed++;
@@ -296,35 +296,58 @@ async function judgedTextOf() {
   return (id) => { const f = facts.get(id); return f ? `[${f.category}] ${truncateFact(f.fact)}` : `\0missing fact ${id}`; };
 }
 
-/**
- * The isolated LLM sessions' calls (memory-bank-llm transcripts — one SDK query per file): the message
- * each sent and the reply it got (assistant text) with the answering model.
- */
-async function llmCalls() {
+/** One recorded call of the isolated LLM sessions (a transcript file — one SDK query): its message, reply and model. */
+function readCall(file) {
+  let message = null;
+  let reply = '';
+  let model = null;
+  let unreadable = 0;
+  for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    let o;
+    try { o = JSON.parse(line); } catch { unreadable++; continue; }
+    const c = o.message?.content;
+    const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b?.type === 'text').map((b) => b.text).join('') : '';
+    if (o.type === 'user' && message === null && text) message = text;
+    else if (o.type === 'assistant' && message !== null) { reply += text; model ??= o.message?.model ?? null; }
+  }
+  return { message, reply, model, unreadable };
+}
+
+/** The isolated LLM sessions' transcript folders (memory-bank-llm), and the path of a recorded call named `<folder>/<file>.jsonl`, or null. */
+async function llmFolders() {
   const { getProjectsDir, LLM_WORKDIR_BASENAME } = await import(dist('paths.js'));
   const projectsDir = getProjectsDir();
+  const isLlm = (entry) => entry === LLM_WORKDIR_BASENAME || entry.endsWith(`-${LLM_WORKDIR_BASENAME}`);
+  const callPath = (name) => {
+    const m = /^([^/]+)\/([^/]+\.jsonl)$/.exec(name ?? '');
+    return m && isLlm(m[1]) && m[1] !== '..' ? path.join(projectsDir, m[1], m[2]) : null;
+  };
+  return { projectsDir, isLlm, callPath };
+}
+
+/** Every recorded call of the isolated LLM sessions: `<folder>/<file>.jsonl`, message, reply and answering model. */
+async function llmCalls() {
+  const { projectsDir, isLlm } = await llmFolders();
   const calls = [];
   let unreadable = 0;
   for (const entry of fs.readdirSync(projectsDir)) {
-    if (entry !== LLM_WORKDIR_BASENAME && !entry.endsWith(`-${LLM_WORKDIR_BASENAME}`)) continue;
+    if (!isLlm(entry)) continue;
     for (const f of fs.readdirSync(path.join(projectsDir, entry))) {
       if (!f.endsWith('.jsonl')) continue;
-      let message = null;
-      let reply = '';
-      let model = null;
-      for (const line of fs.readFileSync(path.join(projectsDir, entry, f), 'utf8').split('\n')) {
-        if (!line.trim()) continue;
-        let o;
-        try { o = JSON.parse(line); } catch { unreadable++; continue; }
-        const c = o.message?.content;
-        const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b?.type === 'text').map((b) => b.text).join('') : '';
-        if (o.type === 'user' && message === null && text) message = text;
-        else if (o.type === 'assistant' && message !== null) { reply += text; model ??= o.message?.model ?? null; }
-      }
-      if (message !== null) calls.push({ file: `${entry}/${f}`, message, reply, model });
+      const c = readCall(path.join(projectsDir, entry, f));
+      unreadable += c.unreadable;
+      if (c.message !== null) calls.push({ file: `${entry}/${f}`, message: c.message, reply: c.reply, model: c.model });
     }
   }
   return { calls, unreadable };
+}
+
+/** Whether a kept judge call (judge-calls.jsonl) is the one `b` binds row `j` to and gives the row's scores. */
+function keptCallHolds(j, b, c, textOf, parse) {
+  const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
+  return Boolean(c) && c.key === j.key && c.file === b.call?.file && sha(c.message) === b.call?.messageSha && sha(c.reply) === b.call?.replySha && firstAttemptSha(c.message) === b.message
+    && c.model === j.model && c.model === b.call?.model && replyGivesRowScores(j, b.seed, c.reply, textOf, parse);
 }
 
 /**
@@ -345,19 +368,40 @@ async function bindLegacy() {
   for (const j of rows) if (j.pass === 'main' && j.items) itemCount.set(j.qid, (itemCount.get(j.qid) ?? 0) + j.items.length);
   const bindings = {};
   const evidence = [];
-  const counts = { rows: rows.length, boundInline: 0, matched: 0, retried: 0, unmatchedScored: 0, failedRows: 0 };
+  const counts = { rows: rows.length, boundInline: 0, kept: 0, matched: 0, retried: 0, unmatchedScored: 0, failedRows: 0 };
   const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
+  // A binding made before, whose kept call still holds, stays — even once its transcript is gone (transcripts expire).
+  const before = fs.existsSync(BINDINGS) ? JSON.parse(fs.readFileSync(BINDINGS, 'utf8')).rows ?? {} : {};
+  const keptBefore = new Map(fs.existsSync(JUDGE_CALLS)
+    ? fs.readFileSync(JUDGE_CALLS, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).map((c) => [c.key, c]) : []);
+  const used = new Set();
   for (const j of rows) {
     if (j.bound) { counts.boundInline++; continue; }
     if (!j.scores) { counts.failedRows++; continue; }   // nothing to bind: a failed row counts toward V6 only
     const p = promptOf.get(j.qid);
-    const found = p ? legacyBinding(j, p, textOf, callsByFirst, itemCount.get(j.qid) ?? 0, parseJsonResponse) : null;
+    const old = before[j.key];
+    const oldCall = keptBefore.get(j.key);
+    if (p && old && !used.has(old.call?.file) && judgeMessageSha(p, j.items, old.seed, textOf) === old.message && keptCallHolds(j, old, oldCall, textOf, parseJsonResponse)) {
+      bindings[j.key] = old;
+      evidence.push(JSON.stringify(oldCall));
+      used.add(old.call.file);
+      if (old.call.retried) counts.retried++;
+      counts.kept++;
+      continue;
+    }
+    const found = p ? legacyBinding(j, p, textOf, callsByFirst, itemCount.get(j.qid) ?? 0, parseJsonResponse, used) : null;
     if (!found) { counts.unmatchedScored++; continue; }
+    used.add(found.call.file);
     const retried = found.call.message.includes(JUDGE_RETRY_MARK);
     if (retried) counts.retried++;
     bindings[j.key] = { seed: found.seed, message: found.message, via: 'transcript', call: { file: found.call.file, messageSha: sha(found.call.message), replySha: sha(found.call.reply), model: found.call.model, retried } };
     evidence.push(JSON.stringify({ key: j.key, file: found.call.file, message: found.call.message, reply: found.call.reply, model: found.call.model }));
     counts.matched++;
+  }
+  if (counts.unmatchedScored && Object.keys(before).length) {
+    // Never trade kept evidence for less: write nothing, so the bindings that held stay as they were.
+    console.log(JSON.stringify({ transcripts: calls.length, ...counts, written: false }));
+    process.exit(1);
   }
   const write = (file, body) => { const tmp = `${file}.tmp-${process.pid}`; fs.writeFileSync(tmp, body); fs.renameSync(tmp, file); };
   write(JUDGE_CALLS, evidence.join('\n') + (evidence.length ? '\n' : ''));
@@ -401,27 +445,51 @@ async function report() {
   const promptOf = new Map(sample.map((p) => [p.qid, p]));
   // A legacy binding counts only with its judge call kept in judge-calls.jsonl: that call's message is the
   // row's message and its reply gives exactly the row's scores, from the row's model.
-  const legacy = fs.existsSync(BINDINGS) ? JSON.parse(fs.readFileSync(BINDINGS, 'utf8')).rows ?? {} : {};
+  const bindingsDoc = fs.existsSync(BINDINGS) ? JSON.parse(fs.readFileSync(BINDINGS, 'utf8')) : null;
+  const legacy = bindingsDoc?.rows ?? {};
   const keptCalls = new Map(fs.existsSync(JUDGE_CALLS)
     ? fs.readFileSync(JUDGE_CALLS, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).map((c) => [c.key, c]) : []);
   const sha = (t) => crypto.createHash('sha256').update(t).digest('hex');
   const { parseJsonResponse } = await import(dist('llm.js'));
-  const binding = { inline: 0, transcript: 0, unbound: 0, drifted: 0, noCall: 0, retried: 0 };
+  const { callPath } = await llmFolders();
+  const shownIds = (q) => new Set(VARIANTS.flatMap((v) => (lines[v].get(q) ?? []).map((l) => l.id)));
+  const binding = {
+    inline: 0, transcript: 0, unbound: 0, drifted: 0, noReply: 0, noCall: 0, badItems: 0, callReused: 0, retried: 0,
+    transcriptChecked: 0, transcriptGone: 0, transcriptMismatch: 0,
+    evidenceDrift: Object.keys(legacy).length > 0 && (!fs.existsSync(JUDGE_CALLS) || bindingsDoc?.evidence?.sha256 !== fileSha(JUDGE_CALLS)),
+  };
+  const usedCalls = new Set();
   for (const j of judgments.filter((x) => x.scores)) {
+    // the row's items are what it scored; its lines are lines shown for the prompt, its controls are not
+    const ids = new Set(j.items.map((it) => it.factId));
+    const shown = shownIds(j.qid);
+    if (Object.keys(j.scores).some((k) => !ids.has(k)) || j.items.some((it) => !(it.factId in j.scores) || (it.kind === 'line') !== shown.has(it.factId))) { binding.badItems++; continue; }
     const b = j.bound ?? legacy[j.key];
     if (!b) { binding.unbound++; continue; }
     if (judgeMessageSha(promptOf.get(j.qid), j.items, b.seed, textOf) !== b.message) { binding.drifted++; continue; }
-    if (!j.bound) {
-      const c = keptCalls.get(j.key);
-      const ok = c && sha(c.message) === b.call?.messageSha && sha(c.reply) === b.call?.replySha && firstAttemptSha(c.message) === b.message
-        && c.model === j.model && replyGivesRowScores(j, b.seed, c.reply, textOf, parseJsonResponse);
-      if (!ok) { binding.noCall++; continue; }
-      if (c.message.includes(JUDGE_RETRY_MARK)) binding.retried++;
-    } else if (j.retried) binding.retried++;
-    binding[j.bound ? 'inline' : 'transcript']++;
+    if (j.bound) {
+      // a row the judge wrote carries the reply it got: the scores must be that reply's
+      if (typeof j.reply !== 'string' || !replyGivesRowScores(j, b.seed, j.reply, textOf, parseJsonResponse)) { binding.noReply++; continue; }
+      if (j.retried) binding.retried++;
+      binding.inline++;
+      continue;
+    }
+    const c = keptCalls.get(j.key);
+    if (!keptCallHolds(j, b, c, textOf, parseJsonResponse)) { binding.noCall++; continue; }
+    if (usedCalls.has(b.call.file)) { binding.callReused++; continue; }
+    usedCalls.add(b.call.file);
+    if (b.call.retried) binding.retried++;
+    // the original transcript, while it is still there, must be the call that was kept
+    const orig = callPath(b.call.file);
+    if (orig && fs.existsSync(orig)) {
+      const o = readCall(orig);
+      if (o.message !== null && sha(o.message) === b.call.messageSha && sha(o.reply) === b.call.replySha && o.model === b.call.model) binding.transcriptChecked++;
+      else binding.transcriptMismatch++;
+    } else binding.transcriptGone++;
+    binding.transcript++;
   }
-  if (binding.unbound || binding.drifted || binding.noCall) {
-    fail(`judgment rows not bound to what the judge received: ${binding.unbound} without a binding, ${binding.drifted} whose message no longer matches (fact text, prompt or judge text changed), ${binding.noCall} whose kept judge call is missing or does not give the row's scores — run --bind-legacy, or --judge again`);
+  if (binding.unbound || binding.drifted || binding.noReply || binding.noCall || binding.badItems || binding.callReused || binding.transcriptMismatch || binding.evidenceDrift) {
+    fail(`judgment rows not bound to what the judge received: ${binding.unbound} without a binding, ${binding.drifted} whose message no longer matches (fact text, prompt or judge text changed), ${binding.noReply} judged rows without the reply that gives their scores, ${binding.noCall} whose kept judge call is missing or does not give the row's scores, ${binding.badItems} whose items or scores do not fit the shown lines, ${binding.callReused} binding a call another row binds, ${binding.transcriptMismatch} whose transcript differs from the kept call${binding.evidenceDrift ? ', and judge-calls.jsonl is not the file the bindings name' : ''} — run --bind-legacy, or --judge again`);
   }
   // Main rows that re-asked only the lines a prompt was missing (no controls) — counted, read like any main row.
   const fillRows = judgments.filter((j) => j.pass === 'main' && j.scores && !j.items.some((it) => it.kind !== 'line')).length;
@@ -479,7 +547,9 @@ async function report() {
   // The code that made the lines must be the code on disk now (the report names one code version):
   // every module the replay loads, the packages they import, the embedding model and its files.
   const { EMBEDDING_MODEL } = await import(dist('embedding-version.js'));
-  const codeChanged = driftedCode(meta.code?.files, codeDigest(REPO, EMBEDDING_MODEL));
+  // The Node version is the replay's (the report makes no lines) — recorded, shown, not compared.
+  const withoutNode = ({ node: _node, ...rest } = {}) => rest;
+  const codeChanged = driftedCode(withoutNode(meta.code?.files), withoutNode(codeDigest(REPO, EMBEDDING_MODEL)));
   if (codeChanged.length) fail(`code changed since --replay (${codeChanged.slice(0, 5).join(', ')}${codeChanged.length > 5 ? ', …' : ''}) — re-run --replay and --check-determinism`);
   const missingRoots = [...new Set(sample.map((p) => p.project))].filter((p) => !Array.isArray(meta.roots?.[p]));
   if (missingRoots.length) fail(`replay-meta.json has no family roots for ${missingRoots.length} cwd(s) — re-run --replay`);
@@ -494,6 +564,7 @@ async function report() {
         native: codeKeys.filter((k) => k.startsWith('native:')).length,
         modelFiles: codeKeys.filter((k) => k.startsWith('node_modules/@xenova/transformers/')).length,
         model: meta.code.files['embedding-model'],
+        node: meta.code.files.node,
       },
       report: gitState(REPO),
     },
@@ -676,7 +747,7 @@ function writeDoc(file, r, reportSha) {
     `판정 호출 ${r.judge.calls}회, 실패 ${r.judge.failures}회, 끊긴 마지막 줄 ${r.judge.tornTail}개, 표본 밖 판정 행 ${r.judge.outsideSample}개(집계 제외). 대조군 판정 2: 같은 scope ${r.judge.controls.same[0]}/${r.judge.controls.same[1]}, 다른 프로젝트 ${r.judge.controls.other[0]}/${r.judge.controls.other[1]}. 재채점 일치 ${r.judge.agreement.agree}/${r.judge.agreement.pairs}(재채점 프롬프트 ${r.judge.agreement.prompts}개).`,
     `참고(판정 규칙 밖): 대조군을 뺀 줄만의 재채점 일치 ${r.judge.agreement.lines[0]}/${r.judge.agreement.lines[1]}. 판정 2 의 재현성은 처음 판정 ${r.judge.agreement.j2.main}개·재채점 ${r.judge.agreement.j2.rejudge}개·양쪽 ${r.judge.agreement.j2.both}개(양성 일치 ${fmt(r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge ? (2 * r.judge.agreement.j2.both) / (r.judge.agreement.j2.main + r.judge.agreement.j2.rejudge) : null)}). 부트스트랩 구간은 판정 잡음을 담지 않는다.`,
     `V4 는 두 번의 재생이 이 보고가 읽은 줄 파일과 바이트 단위로 같아야 통과한다(줄 파일 sha256 앞 12자: ${VARIANTS.map((vn) => `${vn} ${r.lineSha[vn].slice(0, 12)}`).join(' · ')}).`,
-    `결속: 이 보고는 재생이 시작할 때 기록한(끝날 때 다시 재어 같았던) 표본·스냅샷(WAL 포함) 해시와, 재생이 불러온 모듈 ${r.inputs.code.bound.modules}개·패키지 ${r.inputs.code.bound.packages}개(하위 의존 포함, 버전)·네이티브 바이너리 ${r.inputs.code.bound.native}개·Node 버전·임베딩 모델(\`${r.inputs.code.bound.model}\`) 파일 ${r.inputs.code.bound.modelFiles}개의 해시를 지금 다시 계산해 같을 때만 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)}). 표시된 줄은 모두 판정돼 있어야 하고, 판정 행은 판정기가 받은 메시지(판정 지시문·프롬프트·사실 문장)를 지금 스냅샷으로 다시 만든 것과 바이트가 같아야 한다 — 판정 때 기록한 행 ${r.judge.binding.inline}개, 판정 호출 기록에서 찾은 행 ${r.judge.binding.transcript}개(그 호출의 메시지와 답을 \`judge-calls.jsonl\` 에 보존하고, 보고가 답의 점수·모델이 행과 같은지 다시 본다). 재생 코드 \`${r.inputs.code.replay?.git ? r.inputs.code.replay.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.replay?.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.replay?.dirty === false ? '(src·bench·dist 깨끗함)' : ''}. 기록만 하는 값: 판정 파일 ${r.inputs.judgments.slice(0, 12)}, 보고를 낸 코드 \`${r.inputs.code.report.git ? r.inputs.code.report.git.slice(0, 7) : '확인 불가'}\`.`,
+    `결속: 이 보고는 재생이 시작할 때 기록한(끝날 때 다시 재어 같았던) 표본·스냅샷(WAL 포함) 해시와, 재생이 불러온 모듈 ${r.inputs.code.bound.modules}개·패키지 ${r.inputs.code.bound.packages}개(하위 의존 포함, 버전)·네이티브 바이너리 ${r.inputs.code.bound.native}개·임베딩 모델(\`${r.inputs.code.bound.model}\`) 파일 ${r.inputs.code.bound.modelFiles}개의 해시를 지금 다시 계산해 같을 때만 낸다(표본 ${r.inputs.sample.slice(0, 12)} · 스냅샷 ${r.inputs.snapshot.slice(0, 12)}). 재생의 Node 버전(\`${r.inputs.code.bound.node ?? '기록 없음'}\`)은 재생이 시작과 끝에 같았는지만 보고, 보고는 다시 비교하지 않는다(보고는 줄을 만들지 않는다). 표시된 줄은 모두 판정돼 있어야 하고, 판정 행은 판정기가 받은 메시지(판정 지시문·프롬프트·사실 문장)를 지금 스냅샷으로 다시 만든 것과 바이트가 같아야 한다 — 판정 때 기록한 행 ${r.judge.binding.inline}개(받은 답 원문을 행에 싣고, 보고가 그 답의 점수가 행 점수와 같은지 다시 본다), 판정 호출 기록에서 찾은 행 ${r.judge.binding.transcript}개(그 호출의 메시지와 답을 \`judge-calls.jsonl\` 에 보존하고, 보고가 그 파일이 결속 파일이 가리키는 해시인지와 답의 점수·모델이 행과 같은지 다시 보며, 원래 대화 기록이 남아 있으면 그것과도 대조한다 — 대조 ${r.judge.binding.transcriptChecked}개·원본 없음 ${r.judge.binding.transcriptGone}개). 한 호출은 한 행만 결속하고, 행의 항목은 점수 키와 같아야 하며 줄로 적힌 항목은 표시된 줄, 대조군은 표시되지 않은 사실이어야 한다. 재생 코드 \`${r.inputs.code.replay?.git ? r.inputs.code.replay.git.slice(0, 7) : '확인 불가'}\`${r.inputs.code.replay?.dirty === true ? '(src·bench·dist 에 커밋 안 된 변경 있음)' : r.inputs.code.replay?.dirty === false ? '(src·bench·dist 깨끗함)' : ''}. 기록만 하는 값: 판정 파일 ${r.inputs.judgments.slice(0, 12)}, 보고를 낸 코드 \`${r.inputs.code.report.git ? r.inputs.code.report.git.slice(0, 7) : '확인 불가'}\`.`,
     `보충 판정 행(대조군 없이 빠진 줄만 다시 부른 main 행) ${r.judge.fillRows}개 — 다른 main 행과 같이 읽는다. 대조군이 하나도 판정되지 않은 프롬프트 ${r.judge.promptsWithoutControls}개. 한 번 다시 물어 점수를 얻은 판정 행 ${r.judge.binding.retried}개(결속은 첫 메시지 — 다시 묻기는 형식 지적 한 줄만 덧붙인다).`,
     '',
     ...['train', 'heldout', 'all'].flatMap((split) => [
@@ -722,7 +793,9 @@ function writeDoc(file, r, reportSha) {
     '- 판정기는 LLM 이다. 사람 라벨이 아니고, 길이·언어 편향이 있을 수 있다. 대조군(V1·V2)과 재채점(V3)으로만 보정했다.',
     '- 판정 메시지 결속은 Agent SDK 경로의 바이트(판정 지시문 + 빈 줄 + 사용자 메시지)다. SDK 가 실패해 API 키 경로로 가면 같은 내용이 system 과 user 로 나뉘어 간다 — 내용은 같고 나뉜 자리만 다르다. 판정 호출 기록이 없는 그 경로의 행은 판정 때 기록한 결속만 있다.',
     '- 재생은 세션 원장(이미 보여 준 사실)을 재현하지 않는다. 비활성 전환은 복원하지 못한다(지금 상태로 읽음). 프롬프트 뒤에 문장이 바뀐 사실은 숨긴다 — 통합의 재작성은 벡터를 바꾸지 않아 행에는 그때의 벡터와 나중 문장이 짝지어 있고, 판정할 문장이 그때 보인 문장이 아니기 때문이다. 대상: 통합의 EVOLUTION(개정 행의 사실), CONTRADICTION 병합(개정 행의 새 문장을 지금 가진 다른 사실 — 병합 없이 새 사실 문장을 그대로 쓴 경우까지 숨겨 보수적).',
-    '- 지워진 경로(cwd·사실 경로 모두)는 저장소 루트의 worktree 보관 폴더(`.claude/worktrees/`·`.auto-issue-worktrees/`) 바로 아래 worktree 폴더 그 자체이고, 그 보관 폴더가 지금 있으며 그 안의 폴더가 모두 그 루트의 연결 worktree 일 때만 그 저장소의 가족이다. 지워진 worktree 안의 더 깊은 경로, 보관 폴더째 지워진 경로, 다른 폴더도 담은 보관 폴더(여러 저장소의 worktree 를 담는 층일 수 있다), 살아 있는 worktree 안에서 지워진 경로는 가족이 없다(다른 저장소였을 수 있다) — 그런 프롬프트의 가족 효과는 재지 못한다. 심링크를 거쳐 저장소에 닿는 경로(루트로 가는 링크 포함)도 가족 밖이다. bare 저장소(`.bare/worktrees/…`)의 worktree 끼리는 묶지 않는다(각자 한 가족).',
+    '- 지워진 경로(cwd·사실 경로 모두)는 어느 저장소의 가족도 아니다 — 지워진 경로가 어느 저장소에 속했는지는 지금 디스크로 알 수 없어서다(다른 저장소였을 수 있다). 그래서 지운 worktree 에서 쓴 사실은 가족으로 들어오지 않고, cwd 가 지워진 프롬프트의 가족 효과는 재지 못한다. worktree 보관 폴더(`.claude/worktrees/`·`.auto-issue-worktrees/`) 안에서는 그 저장소의 연결 worktree 만 가족이다(보관 폴더가 다른 저장소의 worktree 를 담을 수 있다). 심링크를 거쳐 저장소에 닿는 경로(루트로 가는 링크 포함)도 가족 밖이다. bare 저장소(`.bare/worktrees/…`)의 worktree 끼리는 묶지 않는다(각자 한 가족).',
+    '- 가족 판정은 재생할 때의 디스크(폴더·`.git`)를 읽고, 보고는 그 디스크 상태를 결속하지 않는다 — 재생 뒤 worktree 를 지우거나 만들면 같은 입력으로 다시 재생한 줄이 달라질 수 있다(재생이 cwd 마다 찾은 루트는 \`replay-meta.json\` 의 roots 에 남는다).',
+    '- 판정 결속은 위조를 막는 서명이 아니다: 판정 파일·결속 파일·보존 호출 파일 셋을 맞춰 고치면 보고는 알아채지 못한다. 원래 대화 기록이 남아 있는 행만 그것과 대조된다.',
     '- 정렬은 ±180초 안의 가장 이른 행을 고르고 여러 행이 맞는 경우를 세지 않는다. 프롬프트 길이 비교는 UTF-16 길이(JS)와 코드포인트 수(SQLite)가 달라 이모지가 든 프롬프트는 빠진다.',
     '- 누출 검사는 정규화(NFC·소문자·공백 접기·마크다운 이스케이프 제거)한 원문 전체에서 20자 간격으로 뽑은 40자 창을 이 문서에서 찾는다 — 59자 이상 그대로 옮긴 인용은 반드시 잡는다. 더 짧은 인용·의역은 잡지 못한다.',
     '- 표본은 대화 색인에 남은 사람의 프롬프트다. 색인되지 않는 자동화 세션에 대한 결론이 아니다.',

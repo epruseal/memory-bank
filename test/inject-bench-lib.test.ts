@@ -300,7 +300,7 @@ describe('decision', () => {
     expect(replay, 'bound before the sample is read').toMatch(/const bound = replayBinding\(REPO, OUT, EMBEDDING_MODEL\);\n  const sample = JSON\.parse/);
     expect(replay, 'and checked again at the end').toContain('const drift = bindingDrift(bound, replayBinding(REPO, OUT, EMBEDDING_MODEL));\n  if (drift.length) fail(');
     expect(replay).toContain('const { inputs, code } = bound;');
-    expect(judge, 'the report compares the whole code digest').toContain('const codeChanged = driftedCode(meta.code?.files, codeDigest(REPO, EMBEDDING_MODEL));');
+    expect(judge, 'the report compares the whole code digest but the Node version').toContain('const codeChanged = driftedCode(withoutNode(meta.code?.files), withoutNode(codeDigest(REPO, EMBEDDING_MODEL)));');
     expect(judge, 'every scored judgment row is bound').toContain('if (judgeMessageSha(promptOf.get(j.qid), j.items, b.seed, textOf) !== b.message) { binding.drifted++; continue; }');
     expect(judge, 'the judge records what it sends with the function the report checks with').toContain('const bound = { seed: task.seed, message: judgeMessageSha(task.prompt, task.want, task.seed, text) };');
     expect(judge, 'and labels the call with the same seed').toContain('const labeled = labelItems(task.want.map((w) => ({ ...w, text: text(w.factId) })), task.seed);');
@@ -430,16 +430,20 @@ describe('decision', () => {
     try {
       pkg('node_modules/a', '1.0.0', { b: '^1', gone: '^1' }, { 'opt-here': '1', 'opt-absent': '1' });
       pkg('node_modules/b', '1.0.0');
-      pkg('node_modules/a/node_modules/b', '2.0.0', { c: '1' });   // a's own b wins over the top-level one
+      pkg('node_modules/a/node_modules/b', '2.0.0', { c: '1', d: '1' });   // a's own b wins over the top-level one
       pkg('node_modules/c', '3.0.0');
+      pkg('node_modules/a/node_modules/d', '4.1.0');   // b needs d: found in the enclosing a/node_modules, not the top level
+      pkg('node_modules/d', '4.0.0');
+      put('node_modules/c/lib/libc.so.1', 'versioned shared object');
       pkg('node_modules/opt-here', '0.1.0');
       put('node_modules/opt-here/bin/lib.dylib', 'native-1');
       put('node_modules/opt-here/bin/readme.txt', 'not native');
       put('node_modules/opt-here/node_modules/x/x.node', 'nested package — not opt-here\'s own binary');
       const d = dependencyDigest(dir, ['a']);
       expect(d).toEqual({
-        'package:a': '1.0.0', 'package:a/node_modules/b': '2.0.0', 'package:c': '3.0.0', 'package:gone': 'missing', 'package:opt-here': '0.1.0',
+        'package:a': '1.0.0', 'package:a/node_modules/b': '2.0.0', 'package:c': '3.0.0', 'package:a/node_modules/d': '4.1.0', 'package:gone': 'missing', 'package:opt-here': '0.1.0',
         'native:node_modules/opt-here/bin/lib.dylib': crypto.createHash('sha256').update('native-1').digest('hex'),
+        'native:node_modules/c/lib/libc.so.1': crypto.createHash('sha256').update('versioned shared object').digest('hex'),
       });
       put('node_modules/opt-here/bin/lib.dylib', 'native-2');
       expect(driftedCode(d, dependencyDigest(dir, ['a']))).toEqual(['native:node_modules/opt-here/bin/lib.dylib']);
@@ -546,6 +550,12 @@ describe('decision', () => {
     const retry = { ...call, message: `${call.message}${JUDGE_RETRY_MARK}missing id f1). Answer again` };
     const failedFirst = { ...call, reply: 'not json' };
     expect(legacyBinding(row, prompt, textOf, indexCalls([failedFirst, retry]), 5, parse)?.call, 'the retry that answered, not the first attempt').toBe(retry);
+    expect(legacyBinding(row, prompt, textOf, indexCalls([retry, failedFirst]), 5, parse)?.call, 'in either order').toBe(retry);
+    // one call answers one row: a call already binding another row is passed over
+    const filed = { ...call, file: 'llm/one.jsonl' };
+    expect(legacyBinding(row, prompt, textOf, indexCalls([filed]), 5, parse, new Set(['llm/one.jsonl'])), 'the only call is taken').toBeNull();
+    const second = { ...call, file: 'llm/two.jsonl' };
+    expect(legacyBinding(row, prompt, textOf, indexCalls([filed, second]), 5, parse, new Set(['llm/one.jsonl']))?.call, 'the other recording of the same call').toBe(second);
   });
   it('repoOf groups a linked worktree with its repository; unboundMeta names variants whose meta hash differs', () => {
     expect(repoOf(['/r/.wt/a', '/r'], '/r/.wt/a/src')).toBe('/r');

@@ -58,9 +58,10 @@ export interface InjectSelectOptions {
  *  - scopeFamily true: on the 127 prompts whose cwd the family widens (the
  *    registered reading), judged-useful lines per prompt rose +0.13 (95% CI
  *    0.05–0.23), precision(=2) Δ +0.03 (CI −0.02–0.07). Limit: the whole gain
- *    (16 lines) came from ONE repository — its main folder and linked worktrees;
- *    the 22 affected prompts of the other repositories gained nothing and are
- *    too few (< 30) to judge on their own.
+ *    (16 lines) was on prompts of ONE repository — by where the prompt's cwd
+ *    was: worktrees placed inside its folder +12, linked worktrees outside it
+ *    +4, the repository folder itself 0; the 22 affected prompts of the other
+ *    repositories gained nothing and are too few (< 30) to judge on their own.
  */
 export const PRODUCTION_SELECT_OPTIONS: Readonly<InjectSelectOptions> = Object.freeze({
   relMargin: null,
