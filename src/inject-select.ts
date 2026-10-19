@@ -98,6 +98,39 @@ export function neighbourMargin(db: Database.Database, factId: string, embedding
 const isSafetyEdge = (relation: OntologyRelation) =>
   relation.relation_type === 'CONTRADICTS' || relation.relation_type === 'SUPERSEDES';
 
+type Neighbour = { fact: Fact; relation: OntologyRelation; margin: number | null };
+
+/**
+ * The relation gate over one seed's neighbours: affirmative neighbours that
+ * clear relMargin, best margin first, then the exempt safety edges in their
+ * usual order — getRelatedFacts already ranks affirmative edges (weight 1.0)
+ * ahead of safety edges (0.7). At most REL_SCORE_CAP neighbours are scored.
+ */
+function gateNeighbours(
+  db: Database.Database,
+  related: Array<{ fact: Fact; relation: OntologyRelation }>,
+  embedding: number[],
+  baseline: number,
+  relMargin: number,
+): { keep: Neighbour[]; gatedOut: number; unscored: number } {
+  const passed: Array<Neighbour & { margin: number }> = [];
+  const safety: Neighbour[] = [];
+  let gatedOut = 0;
+  let unscored = 0;
+  let scoredCount = 0;
+  for (const r of related) {
+    if (isSafetyEdge(r.relation)) { safety.push({ fact: r.fact, relation: r.relation, margin: null }); continue; }
+    if (scoredCount >= REL_SCORE_CAP) { unscored++; continue; }
+    scoredCount++;
+    const margin = neighbourMargin(db, r.fact.id, embedding, baseline);
+    if (margin === null) unscored++;
+    else if (margin < relMargin) gatedOut++;
+    else passed.push({ fact: r.fact, relation: r.relation, margin });
+  }
+  passed.sort((a, b) => b.margin - a.margin);
+  return { keep: [...passed, ...safety], gatedOut, unscored };
+}
+
 /**
  * Top-K similar facts gated by the probe baseline, expanded with 1-hop ontology
  * relations of the first three hits.
@@ -132,27 +165,14 @@ export function selectInjectFacts(
     const related = getRelatedFacts(db, fact.id, 1, 0.6, 0.2, project, {
       scopeFamily: opts.scopeFamily, visibleFact: opts.visibleFactId, visibleRelation: opts.visibleRelation,
     }).filter((r) => !seenIds.has(r.fact.id));
-    let keep: Array<{ fact: Fact; relation: OntologyRelation; margin: number | null }>;
+    let keep: Neighbour[];
     if (opts.relMargin === null) {
       keep = related.map((r) => ({ fact: r.fact, relation: r.relation, margin: null }));
     } else {
-      // Affirmative neighbours that clear the gate, best margin first, then the
-      // exempt safety edges in their usual order — getRelatedFacts already ranks
-      // affirmative edges (weight 1.0) ahead of safety edges (0.7).
-      const passed: Array<{ fact: Fact; relation: OntologyRelation; margin: number }> = [];
-      const safety: Array<{ fact: Fact; relation: OntologyRelation; margin: null }> = [];
-      let scoredCount = 0;
-      for (const r of related) {
-        if (isSafetyEdge(r.relation)) { safety.push({ fact: r.fact, relation: r.relation, margin: null }); continue; }
-        if (scoredCount >= REL_SCORE_CAP) { relUnscored++; continue; }
-        scoredCount++;
-        const margin = neighbourMargin(db, r.fact.id, embedding, baseline);
-        if (margin === null) relUnscored++;
-        else if (margin < opts.relMargin) relGatedOut++;
-        else passed.push({ fact: r.fact, relation: r.relation, margin });
-      }
-      passed.sort((a, b) => b.margin - a.margin);
-      keep = [...passed, ...safety];
+      const gated = gateNeighbours(db, related, embedding, baseline, opts.relMargin);
+      keep = gated.keep;
+      relGatedOut += gated.gatedOut;
+      relUnscored += gated.unscored;
     }
     for (const { fact: relFact, relation, margin } of keep) {
       if (!seenIds.has(relFact.id) && lines.length < MAX_CONTEXT_FACTS) {

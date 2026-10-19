@@ -97,6 +97,18 @@ export function foldSample(aligned, gate) {
   return { sample, dropped };
 }
 
+/** As-of index from the snapshot: fact id → created (epoch ms), fact id → sessions it was extracted in. */
+export function buildFactIndex(db) {
+  const factCreated = new Map();
+  for (const f of db.prepare('SELECT id, created_at FROM facts').iterate()) factCreated.set(f.id, toEpoch(f.created_at));
+  const factSessions = new Map();
+  for (const r of db.prepare('SELECT fact_id, session_id FROM bench_fact_sessions').iterate()) {
+    const s = factSessions.get(r.fact_id);
+    if (s) s.add(r.session_id); else factSessions.set(r.fact_id, new Set([r.session_id]));
+  }
+  return { factCreated, factSessions };
+}
+
 /**
  * Visibility at a replayed prompt's moment. A fact is visible when it was
  * created no later than the prompt and was not extracted from the prompt's own

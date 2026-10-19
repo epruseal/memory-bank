@@ -18,7 +18,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  VARIANTS, REL_VARIANTS, alignWindow, extractIdentifiers, foldSample, kwLines, makeAsOf, searchedLogRows,
+  VARIANTS, REL_VARIANTS, alignWindow, buildFactIndex, extractIdentifiers, foldSample, kwLines, makeAsOf, searchedLogRows,
 } from './inject-bench-lib.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -217,16 +217,7 @@ async function replay() {
   const { selectInjectFacts, formatInjectBlock } = await import(dist('inject-select.js'));
   const { scopeMatcher, resolveRepoRoots } = await import(dist('project-family.js'));
   const { generateEmbedding, initEmbeddings, queryBaseline } = await import(dist('embeddings.js'));
-  const { toEpoch } = await import('./inject-bench-lib.mjs');
-
-  const factCreated = new Map();
-  for (const f of db.prepare('SELECT id, created_at FROM facts').iterate()) factCreated.set(f.id, toEpoch(f.created_at));
-  const factSessions = new Map();
-  for (const r of db.prepare('SELECT fact_id, session_id FROM bench_fact_sessions').iterate()) {
-    const s = factSessions.get(r.fact_id);
-    if (s) s.add(r.session_id); else factSessions.set(r.fact_id, new Set([r.session_id]));
-  }
-  const index = { factCreated, factSessions };
+  const index = buildFactIndex(db);
 
   // kw lane: identifier → active facts containing it (as-of + scope filtered per prompt)
   const kwScan = db.prepare("SELECT id, fact, category, created_at, scope_type, scope_project FROM facts WHERE is_active = 1 AND instr(lower(fact), ?) > 0");

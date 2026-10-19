@@ -53348,6 +53348,30 @@ function neighbourMargin(db, factId, embedding, baseline) {
   return distance === null ? null : l2DistanceToSimilarity(distance) - baseline;
 }
 var isSafetyEdge = (relation) => relation.relation_type === "CONTRADICTS" || relation.relation_type === "SUPERSEDES";
+function gateNeighbours(db, related, embedding, baseline, relMargin) {
+  const passed = [];
+  const safety = [];
+  let gatedOut = 0;
+  let unscored = 0;
+  let scoredCount = 0;
+  for (const r of related) {
+    if (isSafetyEdge(r.relation)) {
+      safety.push({ fact: r.fact, relation: r.relation, margin: null });
+      continue;
+    }
+    if (scoredCount >= REL_SCORE_CAP) {
+      unscored++;
+      continue;
+    }
+    scoredCount++;
+    const margin = neighbourMargin(db, r.fact.id, embedding, baseline);
+    if (margin === null) unscored++;
+    else if (margin < relMargin) gatedOut++;
+    else passed.push({ fact: r.fact, relation: r.relation, margin });
+  }
+  passed.sort((a, b2) => b2.margin - a.margin);
+  return { keep: [...passed, ...safety], gatedOut, unscored };
+}
 function selectInjectFacts(db, embedding, baseline, project, opts = PRODUCTION_SELECT_OPTIONS) {
   let tStage = Date.now();
   const candidates = searchSimilarFacts(db, embedding, project, TOP_K, 0, {
@@ -53377,26 +53401,10 @@ function selectInjectFacts(db, embedding, baseline, project, opts = PRODUCTION_S
     if (opts.relMargin === null) {
       keep = related.map((r) => ({ fact: r.fact, relation: r.relation, margin: null }));
     } else {
-      const passed = [];
-      const safety = [];
-      let scoredCount = 0;
-      for (const r of related) {
-        if (isSafetyEdge(r.relation)) {
-          safety.push({ fact: r.fact, relation: r.relation, margin: null });
-          continue;
-        }
-        if (scoredCount >= REL_SCORE_CAP) {
-          relUnscored++;
-          continue;
-        }
-        scoredCount++;
-        const margin = neighbourMargin(db, r.fact.id, embedding, baseline);
-        if (margin === null) relUnscored++;
-        else if (margin < opts.relMargin) relGatedOut++;
-        else passed.push({ fact: r.fact, relation: r.relation, margin });
-      }
-      passed.sort((a, b2) => b2.margin - a.margin);
-      keep = [...passed, ...safety];
+      const gated2 = gateNeighbours(db, related, embedding, baseline, opts.relMargin);
+      keep = gated2.keep;
+      relGatedOut += gated2.gatedOut;
+      relUnscored += gated2.unscored;
     }
     for (const { fact: relFact, relation, margin } of keep) {
       if (!seenIds.has(relFact.id) && lines.length < MAX_CONTEXT_FACTS) {

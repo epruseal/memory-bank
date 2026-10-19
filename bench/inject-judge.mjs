@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import {
   CONTROL_PER_KIND, JUDGE_SYSTEM, REJUDGE_PROMPTS, VARIANTS, aggregate, bootstrapDelta, decide, decideC2,
   decideC3, decisionsBlock, judgeUserMessage, labelItems, leakProbes, lostJ2Rel, meanDelta, perPromptCounts, ratioDelta,
-  seededRandom, toEpoch, validateJudgeReply, validity, makeAsOf, isBypassFact,
+  seededRandom, validateJudgeReply, validity, makeAsOf, isBypassFact, buildFactIndex,
 } from './inject-bench-lib.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -177,13 +177,8 @@ async function judgeAll() {
   const facts = db.prepare('SELECT id, fact, category, created_at, scope_type, scope_project, is_active FROM facts').all();
   const factById = new Map(facts.map((f) => [f.id, f]));
   const active = facts.filter((f) => f.is_active === 1);
-  const factSessions = new Map();
-  for (const r of db.prepare('SELECT fact_id, session_id FROM bench_fact_sessions').iterate()) {
-    const s = factSessions.get(r.fact_id);
-    if (s) s.add(r.session_id); else factSessions.set(r.fact_id, new Set([r.session_id]));
-  }
+  const index = buildFactIndex(db);
   db.close();
-  const index = { factCreated: new Map(facts.map((f) => [f.id, toEpoch(f.created_at)])), factSessions };
   const text = (id) => { const f = factById.get(id); return `[${f.category}] ${truncateFact(f.fact)}`; };
 
   const pick = (pool, n, seed, ok) => {
